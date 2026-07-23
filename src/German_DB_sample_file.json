@@ -1,0 +1,278 @@
+{
+  "abarbeiten": {
+    "success": true,
+    "data": {
+      "PRASENS": {
+        "S1": ["abarbeite"],
+        "S2": ["abarbeitest"],
+        "S3": ["abarbeitet"],
+        "P1": ["abarbeiten"],
+        "P2": ["abarbeitet"],
+        "P3": ["abarbeiten"]
+      },
+      "PRATERITUM": {
+        "S1": ["abarbeitete"],
+        "S2": ["abarbeitetest"],
+        "S3": ["abarbeitete"],
+        "P1": ["abarbeiteten"],
+        "P2": ["abarbeitetet"],
+        "P3": ["abarbeiteten"]
+      },
+      "FUTUR1": {
+        "S1": ["werde", "abarbeiten"],
+        "S2": ["wirst", "abarbeiten"],
+        "S3": ["wird", "abarbeiten"],
+        "P1": ["werden", "abarbeiten"],
+        "P2": ["werdet", "abarbeiten"],
+        "P3": ["werden", "abarbeiten"]
+      },
+      "FUTUR2": {
+        "S1": ["werde", "abgearbeitet haben"],
+        "S2": ["wirst", "abgearbeitet haben"],
+        "S3": ["wird", "abgearbeitet haben"],
+        "P1": ["werden", "abgearbeitet haben"],
+        "P2": ["werdet", "abgearbeitet haben"],
+        "P3": ["werden", "abgearbeitet haben"]
+      },
+      "PERFEKT": {
+        "S1": ["habe", "abgearbeitet"],
+        "S2": ["hast", "abgearbeitet"],
+        "S3": ["hat", "abgearbeitet"],
+        "P1": ["haben", "abgearbeitet"],
+        "P2": ["habt", "abgearbeitet"],
+        "P3": ["haben", "abgearbeitet"]
+      },
+      "PLUSQUAMPERFEKT": {
+        "S1": ["hatte", "abgearbeitet"],
+        "S2": ["hattest", "abgearbeitet"],
+        "S3": ["hatte", "abgearbeitet"],
+        "P1": ["hatten", "abgearbeitet"],
+        "P2": ["hattet", "abgearbeitet"],
+        "P3": ["hatten", "abgearbeitet"]
+      },
+      "KONJUNKTIV1_PRASENS": {
+        "S1": ["abarbeite"],
+        "S2": ["abarbeitest"],
+        "S3": ["abarbeite"],
+        "P1": ["abarbeiten"],
+        "P2": ["abarbeitet"],
+        "P3": ["abarbeiten"]
+      },
+      "KONJUNKTIV2_PRATERITUM": {
+        "S1": ["abarbeitete"],
+        "S2": ["abarbeitetest"],
+        "S3": ["abarbeitete"],
+        "P1": ["abarbeiteten"],
+        "P2": ["abarbeitetet"],
+        "P3": ["abarbeiteten"]
+      }
+    }
+  },
+  "abbalgen": {
+    "success": true,
+    "data": {
+      "PRASENS": {
+        "S1": ["abbalge"],
+        "S2": ["abbalgst"],
+        "S3": ["abbalgt"],
+        "P1": ["abbalgen"],
+        "P2": ["abbalgt"],
+        "P3": ["abbalgen"]
+      },
+      "PRATERITUM": {
+        "S1": ["abbalgte"],
+        "S2": ["abbalgtest"],
+        "S3": ["abbalgte"],
+        "P1": ["abbalgten"],
+        "P2": ["abbalgtet"],
+        "P3": ["abbalgten"]
+      },
+      "FUTUR1": {
+        "S1": ["werde", "abbalgen"],
+        "S2": ["wirst", "abbalgen"],
+        "S3": ["wird", "abbalgen"],
+        "P1": ["werden", "abbalgen"],
+        "P2": ["werdet", "abbalgen"],
+        "P3": ["werden", "abbalgen"]
+      },
+      "FUTUR2": {
+        "S1": ["werde", "abgebalgt haben"],
+        "S2": ["wirst", "abgebalgt haben"],
+        "S3": ["wird", "abgebalgt haben"],
+        "P1": ["werden", "abgebalgt haben"],
+        "P2": ["werdet", "abgebalgt haben"],
+        "P3": ["werden", "abgebalgt haben"]
+      },
+      "PERFEKT": {
+        "S1": ["habe", "abgebalgt"],
+        "S2": ["hast", "abgebalgt"],
+        "S3": ["hat", "abgebalgt"],
+        "P1": ["haben", "abgebalgt"],
+        "P2": ["habt", "abgebalgt"],
+        "P3": ["haben", "abgebalgt"]
+      },
+      "PLUSQUAMPERFEKT": {
+        "S1": ["hatte", "abgebalgt"],
+        "S2": ["hattest", "abgebalgt"],
+        "S3": ["hatte", "abgebalgt"],
+        "P1": ["hatten", "abgebalgt"],
+        "P2": ["hattet", "abgebalgt"],
+        "P3": ["hatten", "abgebalgt"]
+      },
+      "KONJUNKTIV1_PRASENS": {
+        "S1": ["abbalge"],
+        "S2": ["abbalgest"],
+        "S3": ["abbalge"],
+        "P1": ["abbalgen"],
+        "P2": ["abbalget"],
+        "P3": ["abbalgen"]
+      },
+      "KONJUNKTIV2_PRATERITUM": {
+        "S1": ["abbalgte"],
+        "S2": ["abbalgtest"],
+        "S3": ["abbalgte"],
+        "P1": ["abbalgten"],
+        "P2": ["abbalgtet"],
+        "P3": ["abbalgten"]
+      }
+    }
+  },
+  "gehen": {
+    "success": true,
+    "data": {
+      "PRASENS": {
+        "S1": ["gehe"],
+        "S2": ["gehst"],
+        "S3": ["geht"],
+        "P1": ["gehen"],
+        "P2": ["geht"],
+        "P3": ["gehen"]
+      },
+      "PRATERITUM": {
+        "S1": ["ging"],
+        "S2": ["gingst"],
+        "S3": ["ging"],
+        "P1": ["gingen"],
+        "P2": ["gingt"],
+        "P3": ["gingen"]
+      },
+      "FUTUR1": {
+        "S1": ["werde", "gehen"],
+        "S2": ["wirst", "gehen"],
+        "S3": ["wird", "gehen"],
+        "P1": ["werden", "gehen"],
+        "P2": ["werdet", "gehen"],
+        "P3": ["werden", "gehen"]
+      },
+      "FUTUR2": {
+        "S1": ["werde", "gegangen sein"],
+        "S2": ["wirst", "gegangen sein"],
+        "S3": ["wird", "gegangen sein"],
+        "P1": ["werden", "gegangen sein"],
+        "P2": ["werdet", "gegangen sein"],
+        "P3": ["werden", "gegangen sein"]
+      },
+      "PERFEKT": {
+        "S1": ["bin", "gegangen"],
+        "S2": ["bist", "gegangen"],
+        "S3": ["ist", "gegangen"],
+        "P1": ["sind", "gegangen"],
+        "P2": ["seid", "gegangen"],
+        "P3": ["sind", "gegangen"]
+      },
+      "PLUSQUAMPERFEKT": {
+        "S1": ["war", "gegangen"],
+        "S2": ["warst", "gegangen"],
+        "S3": ["war", "gegangen"],
+        "P1": ["waren", "gegangen"],
+        "P2": ["wart", "gegangen"],
+        "P3": ["waren", "gegangen"]
+      },
+      "KONJUNKTIV1_PRASENS": {
+        "S1": ["gehe"],
+        "S2": ["gehest"],
+        "S3": ["gehe"],
+        "P1": ["gehen"],
+        "P2": ["gehet"],
+        "P3": ["gehen"]
+      },
+      "KONJUNKTIV2_PRATERITUM": {
+        "S1": ["ginge"],
+        "S2": ["gingest"],
+        "S3": ["ginge"],
+        "P1": ["gingen"],
+        "P2": ["ginget"],
+        "P3": ["gingen"]
+      }
+    }
+  },
+  "lernen": {
+    "success": true,
+    "data": {
+      "PRASENS": {
+        "S1": ["lerne"],
+        "S2": ["lernst"],
+        "S3": ["lernt"],
+        "P1": ["lernen"],
+        "P2": ["lernt"],
+        "P3": ["lernen"]
+      },
+      "PRATERITUM": {
+        "S1": ["lernte"],
+        "S2": ["lerntest"],
+        "S3": ["lernte"],
+        "P1": ["lernten"],
+        "P2": ["lerntet"],
+        "P3": ["lernten"]
+      },
+      "FUTUR1": {
+        "S1": ["werde", "lernen"],
+        "S2": ["wirst", "lernen"],
+        "S3": ["wird", "lernen"],
+        "P1": ["werden", "lernen"],
+        "P2": ["werdet", "lernen"],
+        "P3": ["werden", "lernen"]
+      },
+      "FUTUR2": {
+        "S1": ["werde", "gelernt haben"],
+        "S2": ["wirst", "gelernt haben"],
+        "S3": ["wird", "gelernt haben"],
+        "P1": ["werden", "gelernt haben"],
+        "P2": ["werdet", "gelernt haben"],
+        "P3": ["werden", "gelernt haben"]
+      },
+      "PERFEKT": {
+        "S1": ["habe", "gelernt"],
+        "S2": ["hast", "gelernt"],
+        "S3": ["hat", "gelernt"],
+        "P1": ["haben", "gelernt"],
+        "P2": ["habt", "gelernt"],
+        "P3": ["haben", "gelernt"]
+      },
+      "PLUSQUAMPERFEKT": {
+        "S1": ["hatte", "gelernt"],
+        "S2": ["hattest", "gelernt"],
+        "S3": ["hatte", "gelernt"],
+        "P1": ["hatten", "gelernt"],
+        "P2": ["hattet", "gelernt"],
+        "P3": ["hatten", "gelernt"]
+      },
+      "KONJUNKTIV1_PRASENS": {
+        "S1": ["lerne"],
+        "S2": ["lernest"],
+        "S3": ["lerne"],
+        "P1": ["lernen"],
+        "P2": ["lernet"],
+        "P3": ["lernen"]
+      },
+      "KONJUNKTIV2_PRATERITUM": {
+        "S1": ["lernte"],
+        "S2": ["lerntest"],
+        "S3": ["lernte"],
+        "P1": ["lernten"],
+        "P2": ["lerntet"],
+        "P3": ["lernten"]
+      }
+    }
+  }
+}

@@ -1472,7 +1472,10 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
               {/* Example */}
               <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-700">جمله نمونه (Beispielsatz)</label>
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-semibold text-slate-700">جمله نمونه (فقط آلمانی / Beispielsatz)</label>
+                  <span className="text-[11px] text-slate-400 font-vazir">بدون ترجمه فارسی</span>
+                </div>
                 <input
                   type="text"
                   value={formExample}

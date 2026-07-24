@@ -180,7 +180,7 @@ app.post("/api/gemini/batch-vocab-fill", async (req, res) => {
 
     const ai = getGeminiClient();
     const prompt = `You are a German lexicographer.
-Fill in any missing or incomplete fields (article, meaning in Persian listing all major meanings, plural, partOfSpeech, example sentence with Persian translation, usage notes in Persian) for each of the following vocabulary items:
+Fill in any missing or incomplete fields (article, meaning in Persian listing all major meanings, plural, partOfSpeech, German-only example sentence without Persian translation, usage notes in Persian) for each of the following vocabulary items:
 ${JSON.stringify(items, null, 2)}
 
 Return a JSON object with key "items" containing the completed list of objects.
@@ -190,7 +190,7 @@ Each object must have:
 - meaning: Persian translations (all major meanings)
 - plural: Plural form
 - partOfSpeech: "noun" | "verb_phrase" | "adjective" | "adverb" | "preposition" | "pronoun" | "conjunction" | "expression"
-- example: German example sentence + Persian translation
+- example: German example sentence ONLY (GERMAN ONLY - DO NOT include any Persian translation in the example string!)
 - notes: Concise usage notes in Persian
 `;
 
@@ -244,7 +244,7 @@ app.post("/api/gemini/synonyms-generate", async (req, res) => {
     } else if (groupType === "word_family") {
       groupDescription = "German Word Family (هم‌خانواده / Wortfamilie - words derived from a common root word using prefixes/suffixes like fahren -> abfahren, Erfahung, Fahrt)";
     } else if (groupType === "semantic_field") {
-      groupDescription = "German Semantic Field / Word Field (جهان معانی مشترک / Wortfeld - words sharing a common conceptual area e.g. time domain: Uhr, Tag, Monat, Jahr, Minute)";
+      groupDescription = "German Semantic Field / Word Field (میدان معنایی / Wortfeld - words sharing a common conceptual area e.g. time domain: Uhr, Tag, Monat, Jahr, Minute)";
     } else if (groupType === "idiom") {
       groupDescription = "German Idioms / Expressions (اصطلاحات و تعابیر کاربردی / Redewendungen - real-life expressions used in specific contexts e.g. greetings, shopping, express agreement/disagreement)";
     }

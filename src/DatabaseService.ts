@@ -1,5 +1,5 @@
 import Dexie, { type Table } from "dexie";
-import { Tense, type UserOverride, type Category, type TenseConjugations, type VerbItem, type ConjugationPerson, type AppChangeLog, type VocabularyItem, type ArticleType, type PartOfSpeech, type VocabularyCategory, type SynonymAntonymGroup } from "./types";
+import { Tense, type UserOverride, type Category, type TenseConjugations, type VerbItem, type ConjugationPerson, type AppChangeLog, type VocabChangeLog, type VocabularyItem, type ArticleType, type PartOfSpeech, type VocabularyCategory, type SynonymAntonymGroup } from "./types";
 import sampleDb from "./German_DB_sample_file.json";
 
 // ----------------------------------------------------
@@ -800,6 +800,77 @@ export class DatabaseService {
     await this.saveSetting("change_history_log", updatedLogs);
   }
 
+  // ----------------------------------------------------
+  // Vocabulary History & Change Logs
+  // ----------------------------------------------------
+  public async getVocabChangeLogs(): Promise<VocabChangeLog[]> {
+    return (await this.getSetting<VocabChangeLog[]>("vocab_change_history_log")) || [];
+  }
+
+  public async logVocabChange(
+    word: string,
+    type: "vocab_add" | "vocab_delete" | "vocab_edit",
+    previousItem: VocabularyItem | null
+  ): Promise<void> {
+    let descEn = "";
+    let descFa = "";
+    let descDe = "";
+
+    const displayWord = word.trim();
+
+    if (type === "vocab_add") {
+      descEn = `Added vocabulary item "${displayWord}"`;
+      descFa = `واژه جدید "${displayWord}" اضافه شد`;
+      descDe = `Neues Wort "${displayWord}" hinzugefügt`;
+    } else if (type === "vocab_delete") {
+      descEn = `Deleted vocabulary item "${displayWord}"`;
+      descFa = `واژه "${displayWord}" حذف شد`;
+      descDe = `Wort "${displayWord}" gelöscht`;
+    } else {
+      descEn = `Updated vocabulary item "${displayWord}"`;
+      descFa = `واژه "${displayWord}" ویرایش شد`;
+      descDe = `Wort "${displayWord}" bearbeitet`;
+    }
+
+    const newLog: VocabChangeLog = {
+      id: "vlog_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now(),
+      timestamp: Date.now(),
+      word: displayWord,
+      type,
+      descFa,
+      descEn,
+      descDe,
+      previousItem
+    };
+
+    const currentLogs = await this.getVocabChangeLogs();
+    const updatedLogs = [newLog, ...currentLogs].slice(0, 20);
+    await this.saveSetting("vocab_change_history_log", updatedLogs);
+  }
+
+  public async undoVocabChange(logId: string): Promise<void> {
+    const logs = await this.getVocabChangeLogs();
+    const targetLog = logs.find(l => l.id === logId);
+    if (!targetLog) return;
+
+    if (targetLog.type === "vocab_add") {
+      // Undo add = delete item if exists
+      const allVocabs = await this.getVocabularies();
+      const existing = allVocabs.find(v => v.word.toLowerCase().trim() === targetLog.word.toLowerCase().trim());
+      if (existing) {
+        await this.deleteVocabularyDirect(existing.id);
+      }
+    } else if (targetLog.type === "vocab_delete" || targetLog.type === "vocab_edit") {
+      // Undo delete/edit = restore previous item state
+      if (targetLog.previousItem) {
+        await this.saveVocabularyDirect(targetLog.previousItem);
+      }
+    }
+
+    const updatedLogs = logs.filter(l => l.id !== logId);
+    await this.saveSetting("vocab_change_history_log", updatedLogs);
+  }
+
 
   /**
    * Rename/edit the spelling of a verb infinitive
@@ -1247,7 +1318,7 @@ export class DatabaseService {
     }
   }
 
-  public async saveVocabulary(item: VocabularyItem): Promise<void> {
+  public async saveVocabularyDirect(item: VocabularyItem): Promise<void> {
     const now = Date.now();
     const preparedItem: VocabularyItem = {
       ...item,
@@ -1266,10 +1337,14 @@ export class DatabaseService {
       try {
         localStorage.setItem("g_verb_vocabularies", JSON.stringify(this.inMemoryVocabularies));
       } catch (e) {}
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("vocab-data-changed"));
+      }
       return;
     }
 
     try {
+      await db.open();
       await db.vocabularies.put(preparedItem);
       if (this.inMemoryVocabularies) {
         const idx = this.inMemoryVocabularies.findIndex(v => v.id === preparedItem.id);
@@ -1278,15 +1353,37 @@ export class DatabaseService {
         } else {
           this.inMemoryVocabularies.unshift(preparedItem);
         }
+        try {
+          localStorage.setItem("g_verb_vocabularies", JSON.stringify(this.inMemoryVocabularies));
+        } catch (e) {}
+      }
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("vocab-data-changed"));
       }
     } catch (e) {
       console.warn("Failed saving vocabulary to DB, using memory fallback", e);
       this.useInMemoryFallback = true;
-      await this.saveVocabulary(preparedItem);
+      await this.saveVocabularyDirect(preparedItem);
     }
   }
 
-  public async deleteVocabulary(id: string): Promise<void> {
+  public async saveVocabulary(item: VocabularyItem): Promise<void> {
+    // Check if previous item exists to determine if add vs edit and capture state for undo
+    const existingList = await this.getVocabularies();
+    const prevItem = existingList.find(v => v.id === item.id) || null;
+    const isNew = !prevItem;
+
+    await this.saveVocabularyDirect(item);
+
+    // Log change
+    await this.logVocabChange(
+      item.word,
+      isNew ? "vocab_add" : "vocab_edit",
+      prevItem
+    );
+  }
+
+  public async deleteVocabularyDirect(id: string): Promise<void> {
     if (this.useInMemoryFallback) {
       if (this.inMemoryVocabularies) {
         this.inMemoryVocabularies = this.inMemoryVocabularies.filter(v => v.id !== id);
@@ -1294,19 +1391,52 @@ export class DatabaseService {
           localStorage.setItem("g_verb_vocabularies", JSON.stringify(this.inMemoryVocabularies));
         } catch (e) {}
       }
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("vocab-data-changed"));
+      }
       return;
     }
 
     try {
+      await db.open();
       await db.vocabularies.delete(id);
       if (this.inMemoryVocabularies) {
         this.inMemoryVocabularies = this.inMemoryVocabularies.filter(v => v.id !== id);
+        try {
+          localStorage.setItem("g_verb_vocabularies", JSON.stringify(this.inMemoryVocabularies));
+        } catch (e) {}
+      }
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("vocab-data-changed"));
       }
     } catch (e) {
       console.warn("Failed deleting vocabulary from DB", e);
       this.useInMemoryFallback = true;
-      await this.deleteVocabulary(id);
+      await this.deleteVocabularyDirect(id);
     }
+  }
+
+  public async deleteVocabulary(id: string): Promise<void> {
+    const existingList = await this.getVocabularies();
+    const prevItem = existingList.find(v => v.id === id) || null;
+    const wordToDelete = prevItem ? prevItem.word : id;
+
+    await this.deleteVocabularyDirect(id);
+
+    // Always log deletion so history tab can undo it!
+    await this.logVocabChange(
+      wordToDelete,
+      "vocab_delete",
+      prevItem || {
+        id,
+        article: "none",
+        word: wordToDelete,
+        meaning: "",
+        partOfSpeech: "noun",
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      }
+    );
   }
 
   public async getCustomVocabOrder(): Promise<string[]> {
@@ -1555,19 +1685,61 @@ export class DatabaseService {
       synonymAntonymGroups = await this.getSynonymAntonymGroups();
     }
 
+    // Ensure fallback data is pulled if IndexedDB was empty for vocab / groups
+    if (vocabularies.length === 0) {
+      vocabularies = await this.getVocabularies();
+    }
+    if (vocabCategories.length === 0) {
+      vocabCategories = await this.getVocabCategories();
+    }
+    if (synonymAntonymGroups.length === 0) {
+      synonymAntonymGroups = await this.getSynonymAntonymGroups();
+    }
+
+    let allVerbs: VerbItem[] = [];
+    try {
+      allVerbs = await this.getAllVerbs();
+    } catch (e) {
+      console.warn("Failed to get all verbs for backup:", e);
+    }
+
+    let appHistory: any[] = [];
+    let vocabHistory: any[] = [];
+    try {
+      const ah = localStorage.getItem("g_verb_app_history");
+      if (ah) appHistory = JSON.parse(ah);
+      const vh = localStorage.getItem("g_verb_vocab_history");
+      if (vh) vocabHistory = JSON.parse(vh);
+    } catch (e) {}
+
     const backupPayload = {
-      appName: "GermanLearningApp",
-      version: "2.0",
-      exportDate: new Date().toISOString(),
-      timestamp: Date.now(),
+      metadata: {
+        appName: "GermanLanguageManager",
+        version: "2.0",
+        exportDate: new Date().toISOString(),
+        timestamp: Date.now(),
+        schemaVersion: 2,
+        description: "Complete database backup including verbs with all conjugations, vocabulary bank with articles and examples, categories, tags, lexical network groups (Synonyms, Antonyms, Word Families, Semantic Fields, Idioms), and user preferences.",
+        totalVerbs: allVerbs.length,
+        totalVocabularies: vocabularies.length,
+        totalVerbCategories: categories.length,
+        totalVocabCategories: vocabCategories.length,
+        totalLexicalNetworkGroups: synonymAntonymGroups.length
+      },
       data: {
+        verbs: allVerbs,
+        verbsCache: this.verbsCache,
+        verbCategories: categories,
         overrides,
-        categories,
         vocabularies,
         vocabCategories,
+        lexicalNetworkGroups: synonymAntonymGroups,
         synonymAntonymGroups,
+        customVerbOrder: await this.getCustomOrder(),
+        customVocabOrder: await this.getCustomVocabOrder(),
         settings,
-        customVerbOrder: await this.getCustomOrder()
+        appHistory,
+        vocabHistory
       }
     };
 
@@ -1577,60 +1749,125 @@ export class DatabaseService {
   public async importFullBackupJSON(jsonString: string): Promise<boolean> {
     try {
       const parsed = JSON.parse(jsonString);
+
+      // Support direct raw array of vocabulary items or verb items
+      if (Array.isArray(parsed)) {
+        if (parsed.length > 0 && parsed[0].word !== undefined) {
+          await db.open();
+          await db.vocabularies.clear();
+          await db.vocabularies.bulkPut(parsed);
+          this.inMemoryVocabularies = parsed;
+          localStorage.setItem("g_verb_vocabularies", JSON.stringify(parsed));
+          if (typeof window !== "undefined") {
+            window.dispatchEvent(new CustomEvent("vocab-data-changed"));
+          }
+          return true;
+        }
+      }
+
       const data = parsed.data || parsed; // Support both wrapped and direct json
 
       if (!data) throw new Error("Invalid backup JSON structure.");
 
       await db.open();
 
-      // 1. Overrides
+      // 1. Verbs Cache / Raw Conjugations
+      if (data.verbsCache && typeof data.verbsCache === "object" && Object.keys(data.verbsCache).length > 0) {
+        this.cacheJsonDatabase(data.verbsCache);
+        await this.saveSetting("cached_base_json", JSON.stringify(data.verbsCache));
+      } else if (Array.isArray(data.verbs) && data.verbs.length > 0) {
+        const constructedCache: Record<string, TenseConjugations> = {};
+        for (const verb of data.verbs) {
+          if (verb.infinitive) {
+            constructedCache[verb.infinitive.toLowerCase().trim()] = verb.conjugations || {};
+          }
+        }
+        if (Object.keys(constructedCache).length > 0) {
+          this.cacheJsonDatabase(constructedCache);
+          await this.saveSetting("cached_base_json", JSON.stringify(constructedCache));
+        }
+      }
+
+      // 2. Overrides
       if (Array.isArray(data.overrides)) {
         await db.overrides.clear();
-        await db.overrides.bulkPut(data.overrides);
+        if (data.overrides.length > 0) {
+          await db.overrides.bulkPut(data.overrides);
+        }
         this.inMemoryOverrides = {};
         data.overrides.forEach((o: UserOverride) => {
           if (o.infinitive) this.inMemoryOverrides[o.infinitive.toLowerCase()] = o;
         });
       }
 
-      // 2. Categories
-      if (Array.isArray(data.categories) && data.categories.length > 0) {
+      // 3. Verb Categories
+      const catList = data.verbCategories || data.categories;
+      if (Array.isArray(catList) && catList.length > 0) {
         await db.categories.clear();
-        await db.categories.bulkPut(data.categories);
-        this.inMemoryCategories = data.categories;
+        await db.categories.bulkPut(catList);
+        this.inMemoryCategories = catList;
       }
 
-      // 3. Vocabularies
+      // 4. Vocabularies
       if (Array.isArray(data.vocabularies)) {
         await db.vocabularies.clear();
-        await db.vocabularies.bulkPut(data.vocabularies);
+        if (data.vocabularies.length > 0) {
+          await db.vocabularies.bulkPut(data.vocabularies);
+        }
         this.inMemoryVocabularies = data.vocabularies;
         localStorage.setItem("g_verb_vocabularies", JSON.stringify(data.vocabularies));
       }
 
-      // 4. Vocab Categories
+      // 5. Vocab Categories
       if (Array.isArray(data.vocabCategories)) {
         await db.vocabCategories.clear();
-        await db.vocabCategories.bulkPut(data.vocabCategories);
+        if (data.vocabCategories.length > 0) {
+          await db.vocabCategories.bulkPut(data.vocabCategories);
+        }
         localStorage.setItem("g_verb_vocab_categories", JSON.stringify(data.vocabCategories));
       }
 
-      // 5. Synonym / Antonym / Vocab Networks Groups
-      if (Array.isArray(data.synonymAntonymGroups)) {
+      // 6. Lexical Networks Groups (Synonyms, Antonyms, Word Families, Semantic Fields, Idioms)
+      const lexGroups = data.lexicalNetworkGroups || data.synonymAntonymGroups;
+      if (Array.isArray(lexGroups)) {
         await db.synonymAntonymGroups.clear();
-        await db.synonymAntonymGroups.bulkPut(data.synonymAntonymGroups);
-        localStorage.setItem("g_verb_syn_ant_groups", JSON.stringify(data.synonymAntonymGroups));
+        if (lexGroups.length > 0) {
+          await db.synonymAntonymGroups.bulkPut(lexGroups);
+        }
+        localStorage.setItem("g_verb_syn_ant_groups", JSON.stringify(lexGroups));
       }
 
-      // 6. Settings
+      // 7. Settings
       if (Array.isArray(data.settings)) {
         await db.settings.clear();
-        await db.settings.bulkPut(data.settings);
+        if (data.settings.length > 0) {
+          await db.settings.bulkPut(data.settings);
+        }
       }
 
-      // 7. Custom verb order
+      // 8. Custom verb order
       if (Array.isArray(data.customVerbOrder)) {
         await this.saveCustomOrder(data.customVerbOrder);
+      }
+
+      // 9. Custom vocab order
+      if (Array.isArray(data.customVocabOrder)) {
+        await this.saveCustomVocabOrder(data.customVocabOrder);
+      }
+
+      // 10. History logs
+      if (Array.isArray(data.appHistory)) {
+        localStorage.setItem("g_verb_app_history", JSON.stringify(data.appHistory));
+      }
+      if (Array.isArray(data.vocabHistory)) {
+        localStorage.setItem("g_verb_vocab_history", JSON.stringify(data.vocabHistory));
+      }
+
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("vocab-data-changed"));
+        window.dispatchEvent(new CustomEvent("app-data-changed"));
+        window.dispatchEvent(new CustomEvent("vocab-categories-changed"));
+        window.dispatchEvent(new CustomEvent("synonym-antonym-changed"));
       }
 
       return true;

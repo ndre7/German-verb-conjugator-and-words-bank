@@ -33,6 +33,18 @@ import { translations, Locale } from "../translations";
 import VocabularyCategoryManager from "./VocabularyCategoryManager";
 import SynonymAntonymManager from "./SynonymAntonymManager";
 
+export function cleanGermanExample(text: string): string {
+  if (!text) return "";
+  // Strip parenthesized or bracketed Persian explanations e.g. (میز است) or [معنی]
+  let cleaned = text.replace(/[\(\[\{][^\)\]\}]*[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+[^\)\]\}]*[\)\]\}]/g, "");
+  // Strip hyphen/dash or colon followed by Persian text e.g. " - میز روی زمین است"
+  cleaned = cleaned.replace(/[-–—:]\s*[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF].*$/g, "");
+  // Remove any remaining Persian characters
+  cleaned = cleaned.replace(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+/g, "");
+  // Clean up double spaces
+  return cleaned.replace(/\s+/g, " ").trim();
+}
+
 interface VocabularyManagerProps {
   locale: Locale;
   defaultSubTab?: "bank" | "synonym_antonym" | "categories";
@@ -83,9 +95,27 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
   // Pagination
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 12;
+  const [pageInput, setPageInput] = useState("1");
+  const [itemsPerPage, setItemsPerPage] = useState(20);
 
-  // Quick Add State
+  // Custom Delete/Reset Modal Confirmation (bypasses iframe window.confirm block)
+  const [itemToDelete, setItemToDelete] = useState<VocabularyItem | null>(null);
+  const [showResetConfirmModal, setShowResetConfirmModal] = useState(false);
+
+  useEffect(() => {
+    setPageInput(String(currentPage));
+  }, [currentPage]);
+
+  useEffect(() => {
+    loadData();
+    const handleVocabChanged = () => {
+      loadData();
+    };
+    window.addEventListener("vocab-data-changed", handleVocabChanged);
+    return () => {
+      window.removeEventListener("vocab-data-changed", handleVocabChanged);
+    };
+  }, []);
   const [quickInput, setQuickInput] = useState("");
 
   // Modal State for Add / Edit Word
@@ -139,7 +169,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         if (d.meaning) setFormMeaning(d.meaning);
         if (d.plural !== undefined) setFormPlural(d.plural);
         if (d.partOfSpeech) setFormPos(d.partOfSpeech as PartOfSpeech);
-        if (d.example) setFormExample(d.example);
+        if (d.example) setFormExample(cleanGermanExample(d.example));
         if (d.notes) setFormNotes(d.notes);
         showToast(
           locale === "fa"
@@ -179,7 +209,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
           meaning: d.meaning || item.meaning,
           plural: d.plural !== undefined ? d.plural : (item.plural || ""),
           partOfSpeech: (d.partOfSpeech as PartOfSpeech) || item.partOfSpeech,
-          example: d.example || item.example || "",
+          example: cleanGermanExample(d.example || item.example || ""),
           notes: d.notes || item.notes || "",
           updatedAt: Date.now()
         };
@@ -296,6 +326,19 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     const rawWord = formWord.trim();
     if (!rawWord) return;
 
+    // Check duplicate if adding new item
+    if (!editingItem) {
+      const exists = vocabularies.some(v => v.word.toLowerCase().trim() === rawWord.toLowerCase());
+      if (exists) {
+        showToast(
+          locale === "fa"
+            ? `واژه "${rawWord}" از قبل در بانک واژگان وجود دارد و اضافه نشد.`
+            : `Word "${rawWord}" already exists in database.`
+        );
+        return;
+      }
+    }
+
     const newItem: VocabularyItem = {
       id: editingItem ? editingItem.id : `vocab_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       article: formArticle,
@@ -303,7 +346,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       meaning: formMeaning.trim(),
       plural: formPlural.trim(),
       partOfSpeech: formPos,
-      example: formExample.trim(),
+      example: cleanGermanExample(formExample),
       notes: formNotes.trim(),
       tags: formTags,
       createdAt: editingItem ? editingItem.createdAt : Date.now(),
@@ -344,10 +387,23 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       cleanWord = word.replace(/^das\s+/i, "");
     }
 
+    const cleanWordTrimmed = cleanWord.trim();
+
+    // Check duplicate
+    const exists = vocabularies.some(v => v.word.toLowerCase().trim() === cleanWordTrimmed.toLowerCase());
+    if (exists) {
+      showToast(
+        locale === "fa"
+          ? `واژه "${cleanWordTrimmed}" از قبل در بانک واژگان وجود دارد و اضافه نشد.`
+          : `Word "${cleanWordTrimmed}" already exists.`
+      );
+      return;
+    }
+
     const newItem: VocabularyItem = {
       id: `vocab_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       article,
-      word: cleanWord,
+      word: cleanWordTrimmed,
       meaning,
       plural: "",
       partOfSpeech: article !== "none" ? "noun" : "expression",
@@ -358,44 +414,47 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     await dbService.saveVocabulary(newItem);
     setQuickInput("");
     await loadData();
-    showToast(locale === "fa" ? `واژه "${cleanWord}" سریع اضافه شد!` : `Word "${cleanWord}" added quickly!`);
+    showToast(locale === "fa" ? `واژه "${cleanWordTrimmed}" اضافه شد!` : `Word "${cleanWordTrimmed}" added!`);
   };
 
-  const handleDelete = async (item: VocabularyItem) => {
-    const confirmMsg = locale === "fa"
-      ? `آیا از حذف واژه "${item.word}" اطمینان دارید؟`
-      : `Delete "${item.word}"?`;
-
-    if (window.confirm(confirmMsg)) {
-      await dbService.deleteVocabulary(item.id);
-      await loadData();
-      showToast(locale === "fa" ? `واژه "${item.word}" حذف شد.` : `Word deleted.`);
-    }
+  const handleDelete = (item: VocabularyItem) => {
+    setItemToDelete(item);
   };
 
-  const handleResetVocabularies = async () => {
-    const confirmMsg = locale === "fa"
-      ? "آیا مایلید لیست واژگان به حالت نمونه اولیه بازیابی شود؟"
-      : "Reset vocabulary list to default sample words?";
-
-    if (window.confirm(confirmMsg)) {
-      await dbService.resetVocabulariesToDefault();
-      await loadData();
-      showToast(locale === "fa" ? "واژگان با موفقیت بازیابی شدند." : "Vocabulary restored to defaults.");
-    }
+  const handleConfirmDelete = async () => {
+    if (!itemToDelete) return;
+    const word = itemToDelete.word;
+    await dbService.deleteVocabulary(itemToDelete.id);
+    setItemToDelete(null);
+    await loadData();
+    showToast(
+      locale === "fa"
+        ? `واژه "${word}" با موفقیت حذف شد.`
+        : locale === "de"
+        ? `Wort "${word}" gelöscht.`
+        : `Word "${word}" deleted.`
+    );
   };
 
-  const handleExportJSON = () => {
-    const dataStr = JSON.stringify(vocabularies, null, 2);
-    const blob = new Blob([dataStr], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `German_Vocabulary_Backup_${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+  const handleResetVocabularies = () => {
+    setShowResetConfirmModal(true);
+  };
+
+  const handleConfirmReset = async () => {
+    await dbService.resetVocabulariesToDefault();
+    setShowResetConfirmModal(false);
+    await loadData();
+    showToast(
+      locale === "fa"
+        ? "واژگان با موفقیت بازیابی شدند."
+        : locale === "de"
+        ? "Wortschatz auf Standard zurückgesetzt."
+        : "Vocabulary restored to defaults."
+    );
+  };
+
+  const handleExportJSON = async () => {
+    await handleExportFullBackup();
   };
 
   const handleExportFullBackup = async () => {
@@ -463,12 +522,44 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         return;
       }
 
+      // Existing word set for fast duplicate check
+      const existingWordSet = new Set(vocabularies.map(v => v.word.toLowerCase().trim()));
+
+      const newCandidates: any[] = [];
+      const duplicateWords: string[] = [];
+
+      for (const raw of itemsArray) {
+        if (!raw || typeof raw !== "object" || !raw.word) continue;
+        const cleanWord = String(raw.word).replace(/^(der|die|das)\s+/i, "").trim();
+        if (!cleanWord) continue;
+
+        if (existingWordSet.has(cleanWord.toLowerCase())) {
+          duplicateWords.push(cleanWord);
+        } else {
+          // Avoid duplicates within the input list itself
+          existingWordSet.add(cleanWord.toLowerCase());
+          newCandidates.push(raw);
+        }
+      }
+
+      if (newCandidates.length === 0) {
+        const dupStr = duplicateWords.slice(0, 10).join(", ") + (duplicateWords.length > 10 ? "..." : "");
+        setJsonImportError(
+          locale === "fa"
+            ? `تمام واژگان موجود در فایل از قبل در بانک واژگان وجود دارند (${duplicateWords.length} واژه تکراری: ${dupStr}). هیچ واژه جدیدی اضافه نشد.`
+            : `All imported words already exist (${duplicateWords.length} duplicates: ${dupStr}). No new words added.`
+        );
+        return;
+      }
+
+      itemsArray = newCandidates;
+
       // If AI enrich is enabled, send to Gemini API
       if (enableAiJsonImport && itemsArray.length > 0) {
         setJsonImportSuccess(
           locale === "fa"
-            ? "در حال تحلیل و تکمیل تمامی فیلدهای واژگان با هوش مصنوعی... (لطفاً چند لحظه شکیبا باشید)"
-            : "Enriching vocabulary items with AI..."
+            ? `در حال تحلیل و تکمیل ${itemsArray.length} واژه جدید با هوش مصنوعی... (لطفاً چند لحظه شکیبا باشید)`
+            : "Enriching new vocabulary items with AI..."
         );
         try {
           const aiRes = await fetch("/api/gemini/batch-vocab-fill", {
@@ -510,7 +601,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
           meaning: raw.meaning ? String(raw.meaning).trim() : "",
           plural: raw.plural ? String(raw.plural).trim() : "",
           partOfSpeech: raw.partOfSpeech || (art !== "none" ? "noun" : "expression"),
-          example: raw.example ? String(raw.example).trim() : "",
+          example: cleanGermanExample(raw.example ? String(raw.example) : ""),
           notes: raw.notes ? String(raw.notes).trim() : "",
           tags: Array.isArray(raw.tags) ? raw.tags : [],
           createdAt: raw.createdAt || Date.now(),
@@ -522,12 +613,20 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       }
 
       await loadData();
-      setJsonImportSuccess(
-        locale === "fa"
-          ? `${countSuccess} واژه با موفقیت وارد دیتابیس شد!`
-          : `${countSuccess} words imported successfully!`
-      );
-      showToast(locale === "fa" ? `${countSuccess} واژه جدید درون‌ریزی شد.` : `${countSuccess} words imported.`);
+
+      let msg = locale === "fa"
+        ? `تعداد ${countSuccess} واژه جدید با موفقیت اضافه شد!`
+        : `${countSuccess} new words imported successfully!`;
+
+      if (duplicateWords.length > 0) {
+        const dupStr = duplicateWords.slice(0, 5).join(", ") + (duplicateWords.length > 5 ? "..." : "");
+        msg += locale === "fa"
+          ? ` (${duplicateWords.length} واژه به دلیل تکراری بودن نادیده گرفته شدند: ${dupStr})`
+          : ` (${duplicateWords.length} duplicate words skipped: ${dupStr})`;
+      }
+
+      setJsonImportSuccess(msg);
+      showToast(locale === "fa" ? `${countSuccess} واژه جدید درون‌ریزی شد.` : `${countSuccess} new words imported.`);
       setTimeout(() => setShowJsonImportModal(false), 2000);
     } catch (err: any) {
       console.error("JSON parse error:", err);
@@ -570,10 +669,10 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     if (articleFilter !== "all" && item.article !== articleFilter) return false;
     if (posFilter !== "all" && item.partOfSpeech !== posFilter) return false;
 
-    // Filter by selected tags
+    // Filter by selected tags (AND logic: word must contain ALL selected tags)
     if (selectedTagFilters.length > 0) {
-      const hasMatchingTag = item.tags && item.tags.some(t => selectedTagFilters.includes(t));
-      if (!hasMatchingTag) return false;
+      const hasAllTags = item.tags && selectedTagFilters.every(t => item.tags!.includes(t));
+      if (!hasAllTags) return false;
     }
 
     if (searchQuery.trim()) {
@@ -1021,19 +1120,19 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
             </div>
           ) : viewMode === "table" ? (
             <div className="bg-white border border-slate-200 rounded-3xl overflow-hidden shadow-xs">
-              <div className="overflow-x-auto">
+              <div className="overflow-x-auto max-h-[70vh] overflow-y-auto">
                 <table className="w-full text-xs sm:text-sm text-right border-collapse">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-vazir text-xs">
-                      <th className="py-3 px-3 text-center font-bold w-16"># / ترتیب</th>
-                      <th className="py-3 px-3 text-center font-bold w-20">آرتیکل</th>
-                      <th className="py-3 px-3 font-bold">واژه / کلمه</th>
-                      <th className="py-3 px-3 font-bold">معنی / ترجمه</th>
-                      <th className="py-3 px-3 font-bold">حالت جمع (Plural)</th>
-                      <th className="py-3 px-3 font-bold">نقش واژه</th>
-                      <th className="py-3 px-3 font-bold">تگ‌ها</th>
-                      <th className="py-3 px-3 font-bold">جمله نمونه</th>
-                      <th className="py-3 px-3 text-center font-bold w-20">عملیات</th>
+                  <thead className="sticky top-0 z-20 bg-slate-50 border-b border-slate-200 shadow-2xs">
+                    <tr className="text-slate-600 font-vazir text-xs">
+                      <th className="py-3 px-3 text-center font-bold w-16 bg-slate-50 sticky top-0 z-20"># / ترتیب</th>
+                      <th className="py-3 px-3 text-center font-bold w-20 bg-slate-50 sticky top-0 z-20">آرتیکل</th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">واژه / کلمه</th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">معنی / ترجمه</th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">حالت جمع (Plural)</th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">نقش واژه</th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">تگ‌ها</th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20 min-w-[280px] sm:min-w-[340px] max-w-[500px]">جمله نمونه (Beispielsatz)</th>
+                      <th className="py-3 px-3 text-center font-bold w-20 bg-slate-50 sticky top-0 z-20">عملیات</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -1103,13 +1202,13 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                               )}
                             </div>
                           </td>
-                          <td className="py-3.5 px-3 text-xs text-slate-600 max-w-xs truncate font-vazir">
+                          <td className="py-3.5 px-3 text-xs text-slate-700 min-w-[280px] sm:min-w-[340px] max-w-[500px]">
                             {item.example ? (
-                              <span title={item.example} className="text-slate-700 italic font-sans block truncate">
+                              <div title={item.example} className="leading-relaxed bg-slate-50/80 p-2 rounded-xl border border-slate-200/60 font-sans italic text-slate-800 break-words line-clamp-3">
                                 "{highlightMatch(item.example, searchQuery)}"
-                              </span>
+                              </div>
                             ) : (
-                              <span className="text-slate-300">–</span>
+                              <span className="text-slate-300 font-mono text-xs">–</span>
                             )}
                           </td>
                           <td className="py-3.5 px-4 text-center">
@@ -1190,29 +1289,121 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
             </div>
           )}
 
-          {/* Pagination */}
+          {/* Pagination Controls */}
           {totalPages > 1 && (
-            <div className="flex justify-between items-center bg-white border border-slate-200 rounded-2xl px-5 py-3 shadow-xs">
-              <span className="text-xs text-slate-500 font-vazir">
-                صفحه {currentPage} از {totalPages} (کل: {filteredVocabularies.length} واژه)
-              </span>
-              <div className="flex gap-2 font-vazir">
-                <button
-                  disabled={currentPage <= 1}
-                  onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
-                  className="px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-semibold disabled:opacity-40 hover:bg-slate-50 flex items-center gap-1 cursor-pointer"
-                >
-                  <ChevronRight className="w-4 h-4" />
-                  قبلی
-                </button>
-                <button
-                  disabled={currentPage >= totalPages}
-                  onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
-                  className="px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-semibold disabled:opacity-40 hover:bg-slate-50 flex items-center gap-1 cursor-pointer"
-                >
-                  بعدی
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mt-6 bg-white p-4 rounded-2xl border border-slate-200/80 no-print">
+              <div className={`text-xs text-slate-500 font-vazir ${isRtl ? "text-right" : "text-left"}`}>
+                {locale === "fa" 
+                  ? `نمایش ${(currentPage - 1) * itemsPerPage + 1} تا ${Math.min(currentPage * itemsPerPage, filteredVocabularies.length)} از ${filteredVocabularies.length} واژه` 
+                  : locale === "de"
+                  ? `Zeige ${(currentPage - 1) * itemsPerPage + 1} bis ${Math.min(currentPage * itemsPerPage, filteredVocabularies.length)} von ${filteredVocabularies.length} Wörter`
+                  : `Showing ${(currentPage - 1) * itemsPerPage + 1} to ${Math.min(currentPage * itemsPerPage, filteredVocabularies.length)} of ${filteredVocabularies.length} words`}
+              </div>
+
+              <div className="flex flex-col md:flex-row items-center gap-4">
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+                    disabled={currentPage === 1}
+                    className="w-9 h-9 flex items-center justify-center border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-30 rounded-xl transition-all shadow-2xs shrink-0 cursor-pointer disabled:pointer-events-none"
+                  >
+                    {isRtl ? <ChevronRight className="w-4 h-4 text-slate-600" /> : <ChevronLeft className="w-4 h-4 text-slate-600" />}
+                  </button>
+                  
+                  {/* Page number buttons */}
+                  {(() => {
+                    const pages = [];
+                    const maxButtons = 5;
+                    let startPage = Math.max(1, currentPage - 2);
+                    let endPage = Math.min(totalPages, startPage + maxButtons - 1);
+                    
+                    if (endPage - startPage < maxButtons - 1) {
+                      startPage = Math.max(1, endPage - maxButtons + 1);
+                    }
+                    
+                    for (let i = startPage; i <= endPage; i++) {
+                      pages.push(
+                        <button
+                          key={i}
+                          onClick={() => setCurrentPage(i)}
+                          className={`w-9 h-9 flex items-center justify-center rounded-xl text-xs font-semibold transition-all cursor-pointer font-mono ${
+                            currentPage === i
+                              ? "bg-purple-600 text-white shadow-md shadow-purple-100"
+                              : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                          }`}
+                        >
+                          {i}
+                        </button>
+                      );
+                    }
+                    return pages;
+                  })()}
+
+                  <button
+                    onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
+                    disabled={currentPage === totalPages}
+                    className="w-9 h-9 flex items-center justify-center border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-30 rounded-xl transition-all shadow-2xs shrink-0 cursor-pointer disabled:pointer-events-none"
+                  >
+                    {isRtl ? <ChevronLeft className="w-4 h-4 text-slate-600" /> : <ChevronRight className="w-4 h-4 text-slate-600" />}
+                  </button>
+                </div>
+
+                {/* Vertical Divider */}
+                <div className="hidden md:block h-6 w-px bg-slate-200" />
+
+                {/* Page Size Selector */}
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium text-slate-500 font-vazir">
+                    {locale === "fa" ? "تعداد در صفحه:" : locale === "de" ? "Pro Seite:" : "Per page:"}
+                  </span>
+                  <select
+                    value={itemsPerPage}
+                    onChange={(e) => {
+                      setItemsPerPage(Number(e.target.value));
+                      setCurrentPage(1);
+                    }}
+                    className="h-9 px-2.5 border border-slate-200 bg-white rounded-xl text-xs font-bold text-slate-700 shadow-2xs cursor-pointer focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono"
+                  >
+                    <option value={10}>10</option>
+                    <option value={20}>20</option>
+                    <option value={30}>30</option>
+                    <option value={50}>50</option>
+                    <option value={100}>100</option>
+                  </select>
+                </div>
+
+                {/* Vertical Divider */}
+                <div className="hidden md:block h-6 w-px bg-slate-200" />
+
+                {/* Jump to Page Input */}
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium text-slate-500 font-vazir">
+                    {locale === "fa" ? "برو به صفحه:" : locale === "de" ? "Gehe zu Seite:" : "Go to page:"}
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      value={pageInput}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === "" || /^\d+$/.test(val)) {
+                          setPageInput(val);
+                          if (val !== "") {
+                            const num = parseInt(val, 10);
+                            if (num >= 1 && num <= totalPages) {
+                              setCurrentPage(num);
+                            }
+                          }
+                        }
+                      }}
+                      onBlur={() => {
+                        setPageInput(String(currentPage));
+                      }}
+                      className="w-12 h-9 text-center border border-slate-200 bg-white rounded-xl text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono shadow-2xs"
+                    />
+                    <span className="text-xs text-slate-400 font-mono">/ {totalPages}</span>
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -1502,6 +1693,90 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Custom Delete Confirmation Modal */}
+      {itemToDelete && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto no-print font-vazir">
+          <div className={`bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-md p-6 space-y-4 animate-in fade-in zoom-in-95 duration-200 ${isRtl ? "text-right" : "text-left"}`}>
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-red-600 flex items-center gap-2">
+                <Trash2 className="w-5 h-5 text-red-600" />
+                {locale === "fa" ? "تایید حذف واژه" : locale === "de" ? "Wort löschen" : "Confirm Word Deletion"}
+              </h3>
+              <button onClick={() => setItemToDelete(null)} className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-slate-700 leading-relaxed">
+              {locale === "fa"
+                ? `آیا از حذف واژه "${itemToDelete.word}" اطمینان دارید؟ این عمل غیرقابل بازگشت است.`
+                : locale === "de"
+                ? `Möchten Sie das Wort "${itemToDelete.word}" wirklich löschen?`
+                : `Are you sure you want to delete "${itemToDelete.word}"?`}
+            </p>
+
+            <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
+              <button
+                type="button"
+                onClick={() => setItemToDelete(null)}
+                className="px-4 py-2 border border-slate-200 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-50 cursor-pointer"
+              >
+                {locale === "fa" ? "انصراف" : locale === "de" ? "Abbrechen" : "Cancel"}
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                className="px-5 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
+              >
+                {locale === "fa" ? "حذف واژه" : locale === "de" ? "Löschen" : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Custom Reset Confirm Modal */}
+      {showResetConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto no-print font-vazir">
+          <div className={`bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-md p-6 space-y-4 animate-in fade-in zoom-in-95 duration-200 ${isRtl ? "text-right" : "text-left"}`}>
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-amber-600 flex items-center gap-2">
+                <RotateCcw className="w-5 h-5 text-amber-600" />
+                {locale === "fa" ? "بازنشانی دیتابیس واژگان" : locale === "de" ? "Wortschatz zurücksetzen" : "Reset Vocabulary"}
+              </h3>
+              <button onClick={() => setShowResetConfirmModal(false)} className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-slate-700 leading-relaxed">
+              {locale === "fa"
+                ? "آیا مایلید لیست واژگان به حالت پیش‌فرض اولیه بازیابی شود؟"
+                : locale === "de"
+                ? "Möchten Sie die Wortschatzliste auf die Standardwerte zurücksetzen?"
+                : "Reset vocabulary list to default sample words?"}
+            </p>
+
+            <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
+              <button
+                type="button"
+                onClick={() => setShowResetConfirmModal(false)}
+                className="px-4 py-2 border border-slate-200 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-50 cursor-pointer"
+              >
+                {locale === "fa" ? "انصراف" : locale === "de" ? "Abbrechen" : "Cancel"}
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmReset}
+                className="px-5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
+              >
+                {locale === "fa" ? "بازنشانی" : locale === "de" ? "Zurücksetzen" : "Reset"}
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -291,10 +291,27 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
   // Add Item from group card to main Vocabulary Bank
   const handleAddToVocabBank = async (item: { word: string; article?: ArticleType; partOfSpeech?: PartOfSpeech; meaning?: string }) => {
     try {
+      const cleanWord = item.word.replace(/^(der|die|das)\s+/i, "").trim();
+      if (!cleanWord) return;
+
+      const existingVocabs = await dbService.getVocabularies();
+      const duplicate = existingVocabs.find(
+        v => v.word.trim().toLowerCase() === cleanWord.toLowerCase()
+      );
+
+      if (duplicate) {
+        showToast(
+          locale === "fa"
+            ? `واژه "${cleanWord}" از قبل در جدول واژگان وجود دارد.`
+            : `Word "${cleanWord}" already exists in the vocabulary table.`
+        );
+        return;
+      }
+
       const newItem: VocabularyItem = {
         id: `vocab_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
         article: item.article || "none",
-        word: item.word,
+        word: cleanWord,
         meaning: item.meaning || "",
         partOfSpeech: item.partOfSpeech || "noun",
         createdAt: Date.now(),
@@ -303,8 +320,8 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
       await dbService.saveVocabulary(newItem);
       showToast(
         locale === "fa"
-          ? `واژه "${item.word}" به بانک اصلی واژگان اضافه شد ✨`
-          : `Word "${item.word}" added to main Vocabulary Bank ✨`
+          ? `واژه "${cleanWord}" به بانک اصلی واژگان اضافه شد ✨`
+          : `Word "${cleanWord}" added to main Vocabulary Bank ✨`
       );
     } catch (err: any) {
       alert("خطا در افزودن واژه: " + err.message);
@@ -674,11 +691,11 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
 
       {/* Add / Edit Group Modal */}
       {showModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto no-print">
-          <div className={`bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-xl p-6 space-y-5 animate-in fade-in zoom-in-95 duration-200 ${isRtl ? "text-right" : "text-left"}`}>
-            <div className="flex justify-between items-center border-b border-slate-100 pb-4">
-              <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2 font-vazir">
-                <ArrowRightLeft className="w-5 h-5 text-purple-600" />
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 overflow-y-auto no-print">
+          <div className={`bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-2xl p-4 sm:p-6 space-y-4 my-auto max-h-[90vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-200 ${isRtl ? "text-right" : "text-left"}`}>
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <h3 className="text-base sm:text-lg font-bold text-slate-800 flex items-center gap-2 font-vazir">
+                <ArrowRightLeft className="w-5 h-5 text-purple-600 shrink-0" />
                 {editingGroup
                   ? (locale === "fa" ? "ویرایش گروه در شبکه واژگانی" : "Edit Group")
                   : (locale === "fa" ? "ایجاد گروه جدید در شبکه واژگانی" : "Create New Group")}
@@ -807,19 +824,19 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                   </button>
                 </div>
 
-                <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
                   {formItems.map((item, idx) => (
-                    <div key={idx} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 bg-slate-50 p-2.5 rounded-2xl border border-slate-200">
-                      <div className="flex items-center gap-1.5 flex-1">
-                        <span className="text-xs font-mono text-slate-400 w-4 text-center shrink-0">{idx + 1}.</span>
+                    <div key={idx} className="bg-slate-50 p-3 rounded-2xl border border-slate-200/90 space-y-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-mono font-bold text-slate-400 w-5 text-center shrink-0">{idx + 1}.</span>
 
                         {/* Article Dropdown */}
                         <select
                           value={item.article || "none"}
                           onChange={(e) => handleItemChange(idx, "article", e.target.value)}
-                          className="py-1 px-1.5 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 focus:outline-none cursor-pointer shrink-0"
+                          className="py-1 px-2 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-purple-500 cursor-pointer shrink-0"
                         >
-                          <option value="none">– بدون –</option>
+                          <option value="none">– آرتیکل –</option>
                           <option value="der">der</option>
                           <option value="die">die</option>
                           <option value="das">das</option>
@@ -829,7 +846,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                         <select
                           value={item.partOfSpeech || "noun"}
                           onChange={(e) => handleItemChange(idx, "partOfSpeech", e.target.value)}
-                          className="py-1 px-1.5 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 focus:outline-none cursor-pointer shrink-0"
+                          className="py-1 px-2 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-purple-500 cursor-pointer shrink-0"
                         >
                           <option value="noun">اسم</option>
                           <option value="verb_phrase">فعل</option>
@@ -839,35 +856,32 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                           <option value="expression">اصطلاح</option>
                         </select>
 
-                        {/* Word */}
-                        <input
-                          type="text"
-                          value={item.word}
-                          onChange={(e) => handleItemChange(idx, "word", e.target.value)}
-                          placeholder="واژه آلمانی"
-                          className="w-full py-1 px-2.5 bg-white border border-slate-200 rounded-lg text-xs font-sans focus:outline-none"
-                        />
-                      </div>
-
-                      <div className="flex items-center gap-1.5">
-                        {/* Meaning */}
-                        <input
-                          type="text"
-                          value={item.meaning || ""}
-                          onChange={(e) => handleItemChange(idx, "meaning", e.target.value)}
-                          placeholder="معنی فارسی"
-                          className="flex-1 py-1 px-2.5 bg-white border border-slate-200 rounded-lg text-xs font-vazir focus:outline-none"
-                        />
-
-                        {/* Remove Item Row Button */}
+                        {/* Remove Row Button */}
                         <button
                           type="button"
                           onClick={() => handleRemoveItemRow(idx)}
                           title={locale === "fa" ? "حذف این واژه از سطر" : "Remove item"}
-                          className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer shrink-0"
+                          className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer mr-auto"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <input
+                          type="text"
+                          value={item.word}
+                          onChange={(e) => handleItemChange(idx, "word", e.target.value)}
+                          placeholder="واژه آلمانی (مثلاً: schön)"
+                          className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-sans focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        />
+                        <input
+                          type="text"
+                          value={item.meaning || ""}
+                          onChange={(e) => handleItemChange(idx, "meaning", e.target.value)}
+                          placeholder="معنی فارسی (مثلاً: زیبا)"
+                          className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-vazir focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        />
                       </div>
                     </div>
                   ))}
@@ -880,7 +894,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                   <span>توضیحات و نکات کاربردی (موقعیت‌های استفاده)</span>
                 </label>
                 <textarea
-                  rows={4}
+                  rows={3}
                   value={formNotes}
                   onChange={(e) => setFormNotes(e.target.value)}
                   placeholder={
@@ -888,12 +902,12 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                       ? "• موقعیت استفاده: در خریدهای روزمره و مغازه\n• نکته کاربردی: تفاوت با اصطلاحات رسمی..."
                       : "Key bullet points and usage nuances..."
                   }
-                  className="w-full p-3.5 border border-slate-300 rounded-2xl text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 bg-slate-50 font-vazir leading-relaxed"
+                  className="w-full p-3 border border-slate-300 rounded-2xl text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 bg-slate-50 font-vazir leading-relaxed"
                 />
               </div>
 
               {/* Submit Buttons */}
-              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 font-vazir">
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-3 font-vazir">
                 <button
                   type="button"
                   onClick={() => setShowModal(false)}

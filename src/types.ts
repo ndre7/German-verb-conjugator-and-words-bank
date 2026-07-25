@@ -87,6 +87,17 @@ export interface AppChangeLog {
   previousOverride: UserOverride | null;
 }
 
+export interface VocabChangeLog {
+  id: string;
+  timestamp: number;
+  word: string;
+  type: "vocab_add" | "vocab_delete" | "vocab_edit";
+  descFa: string;
+  descEn: string;
+  descDe: string;
+  previousItem: VocabularyItem | null;
+}
+
 export type ArticleType = "der" | "die" | "das" | "none";
 
 export type PartOfSpeech =

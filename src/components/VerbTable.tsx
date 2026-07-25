@@ -20,7 +20,9 @@ import {
   BookOpen,
   Star,
   HelpCircle,
-  Sparkles
+  Sparkles,
+  FileCode,
+  Upload
 } from "lucide-react";
 import { dbService, db } from "../DatabaseService";
 import { Tense, TENSE_ORDER, type VerbItem, type Category } from "../types";
@@ -44,7 +46,8 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
   const [viewMode, setViewMode] = useState<"table" | "cards">("table");
   const [currentPage, setCurrentPage] = useState(1);
   const [pageInput, setPageInput] = useState(String(currentPage));
-  const ITEMS_PER_PAGE = 30;
+  const [itemsPerPage, setItemsPerPage] = useState(30);
+  const ITEMS_PER_PAGE = itemsPerPage;
 
   // Debounce localSearchQuery into searchQuery for high performance
   useEffect(() => {
@@ -226,6 +229,14 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
   });
   const [addVerbToastMessage, setAddVerbToastMessage] = useState<string | null>(null);
 
+  // Verb JSON Import Modal State
+  const [showVerbJsonModal, setShowVerbJsonModal] = useState(false);
+  const [verbJsonInputText, setVerbJsonInputText] = useState("");
+  const [enableAiVerbJsonImport, setEnableAiVerbJsonImport] = useState(true);
+  const [verbJsonImportError, setVerbJsonImportError] = useState<string | null>(null);
+  const [verbJsonImportSuccess, setVerbJsonImportSuccess] = useState<string | null>(null);
+  const verbFileInputRef = useRef<HTMLInputElement>(null);
+
   // AI State for Verbs
   const [verbAiLoading, setVerbAiLoading] = useState(false);
 
@@ -364,6 +375,18 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     const rawInf = newInfinitive.trim();
     if (!rawInf) return;
 
+    // Duplicate check for single verb creation
+    const exists = verbs.some(v => v.infinitive.toLowerCase().trim() === rawInf.toLowerCase());
+    if (exists) {
+      setAddVerbToastMessage(
+        locale === "fa"
+          ? `فعل "${rawInf}" از قبل در جدول افعال وجود دارد و اضافه نشد.`
+          : `Verb "${rawInf}" already exists in table.`
+      );
+      setTimeout(() => setAddVerbToastMessage(null), 4000);
+      return;
+    }
+
     // Build cell overrides for Präsens if entered
     const cellOverrides: Record<string, string> = {};
     if (newPrasens.S1.trim()) cellOverrides["PRASENS_S1"] = newPrasens.S1.trim();
@@ -457,9 +480,31 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
 
-    let addedCount = 0;
+    const existingVerbSet = new Set(verbs.map(v => v.infinitive.toLowerCase().trim()));
+    const newVerbsToSave: string[] = [];
+    const duplicateVerbs: string[] = [];
 
     for (const inf of list) {
+      if (existingVerbSet.has(inf.toLowerCase())) {
+        duplicateVerbs.push(inf);
+      } else {
+        existingVerbSet.add(inf.toLowerCase());
+        newVerbsToSave.push(inf);
+      }
+    }
+
+    if (newVerbsToSave.length === 0) {
+      const msg = locale === "fa"
+        ? `تمامی افعال وارد شده (${duplicateVerbs.join(", ")}) از قبل در جدول وجود دارند و هیچ فعل جدیدی اضافه نشد.`
+        : `All entered verbs already exist (${duplicateVerbs.join(", ")}).`;
+      setAddVerbToastMessage(msg);
+      setTimeout(() => setAddVerbToastMessage(null), 4000);
+      return;
+    }
+
+    let addedCount = 0;
+
+    for (const inf of newVerbsToSave) {
       await dbService.addVerb({
         infinitive: inf,
         bedeutung: t.customVerb || "فعل دلخواه",
@@ -479,12 +524,172 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     await loadVerbsList();
     setBulkInput("");
 
-    if (addedCount > 0) {
-      const msg = addedCount === 1
-        ? (t.verbAddedSuccess || "فعل \"{verb}\" با موفقیت اضافه شد.").replace("{verb}", list[0])
-        : (t.bulkVerbsAddedSuccess || "{count} فعل با موفقیت اضافه شد.").replace("{count}", addedCount.toString());
-      setAddVerbToastMessage(msg);
-      setTimeout(() => setAddVerbToastMessage(null), 4000);
+    let msg = addedCount === 1
+      ? (t.verbAddedSuccess || "فعل \"{verb}\" با موفقیت اضافه شد.").replace("{verb}", newVerbsToSave[0])
+      : (t.bulkVerbsAddedSuccess || "{count} فعل با موفقیت اضافه شد.").replace("{count}", addedCount.toString());
+
+    if (duplicateVerbs.length > 0) {
+      msg += locale === "fa"
+        ? ` (${duplicateVerbs.length} فعل به دلیل تکراری بودن نادیده گرفته شدند: ${duplicateVerbs.join(", ")})`
+        : ` (${duplicateVerbs.length} duplicates skipped)`;
+    }
+
+    setAddVerbToastMessage(msg);
+    setTimeout(() => setAddVerbToastMessage(null), 4000);
+  };
+
+  // Verb JSON File Upload Handler
+  const handleVerbFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const content = evt.target?.result as string;
+      if (content) {
+        setVerbJsonInputText(content);
+        processVerbJsonImport(content);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // Verb JSON Import Processing
+  const processVerbJsonImport = async (jsonText: string) => {
+    setVerbJsonImportError(null);
+    setVerbJsonImportSuccess(null);
+
+    try {
+      const parsed = JSON.parse(jsonText);
+      let itemsArray: any[] = [];
+
+      if (Array.isArray(parsed)) {
+        itemsArray = parsed;
+      } else if (parsed && typeof parsed === "object") {
+        if (Array.isArray(parsed.verbs)) itemsArray = parsed.verbs;
+        else if (Array.isArray(parsed.items)) itemsArray = parsed.items;
+        else itemsArray = [parsed];
+      }
+
+      if (!itemsArray || itemsArray.length === 0) {
+        setVerbJsonImportError(locale === "fa" ? "هیچ فعلی در فایل JSON پیدا نشد." : "No verbs found in JSON.");
+        return;
+      }
+
+      // Filter duplicates
+      const existingVerbSet = new Set(verbs.map(v => v.infinitive.toLowerCase().trim()));
+      const newCandidates: any[] = [];
+      const duplicateVerbs: string[] = [];
+
+      for (const raw of itemsArray) {
+        let inf = "";
+        if (typeof raw === "string") {
+          inf = raw.trim();
+        } else if (raw && typeof raw === "object" && raw.infinitive) {
+          inf = String(raw.infinitive).trim();
+        }
+        if (!inf) continue;
+
+        if (existingVerbSet.has(inf.toLowerCase())) {
+          duplicateVerbs.push(inf);
+        } else {
+          existingVerbSet.add(inf.toLowerCase());
+          newCandidates.push(typeof raw === "string" ? { infinitive: inf } : raw);
+        }
+      }
+
+      if (newCandidates.length === 0) {
+        const dupStr = duplicateVerbs.slice(0, 10).join(", ") + (duplicateVerbs.length > 10 ? "..." : "");
+        setVerbJsonImportError(
+          locale === "fa"
+            ? `تمام افعال موجود در فایل از قبل در دیتابیس وجود دارند (${duplicateVerbs.length} فعل تکراری: ${dupStr}). هیچ فعل جدیدی اضافه نشد.`
+            : `All imported verbs already exist (${duplicateVerbs.length} duplicates: ${dupStr}). No new verbs added.`
+        );
+        return;
+      }
+
+      itemsArray = newCandidates;
+
+      // AI Enrichment for verbs if checked
+      if (enableAiVerbJsonImport && itemsArray.length > 0) {
+        setVerbJsonImportSuccess(
+          locale === "fa"
+            ? `در حال تحلیل و استخراج صرف‌های کامل ${itemsArray.length} فعل با هوش مصنوعی... (لطفاً کمی شکیبا باشید)`
+            : "Enriching verb tenses and meanings with AI..."
+        );
+
+        try {
+          const aiRes = await fetch("/api/gemini/batch-verb-fill", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ items: itemsArray.slice(0, 30) }) // safety limit 30 items
+          });
+          const aiData = await aiRes.json();
+          if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
+            itemsArray = aiData.items;
+          }
+        } catch (err) {
+          console.error("Batch AI error during verb JSON import:", err);
+        }
+      }
+
+      let countSuccess = 0;
+
+      for (const raw of itemsArray) {
+        const inf = raw.infinitive || raw.word;
+        if (!inf) continue;
+
+        const cellOverrides: Record<string, string> = { ...raw.cellOverrides };
+
+        if (raw.conjugations) {
+          const tensesKeys = [
+            "PRASENS", "PERFEKT", "PRATERITUM", "KONJUNKTIV2_PRATERITUM",
+            "FUTUR1", "PLUSQUAMPERFEKT", "KONJUNKTIV1_PRASENS", "FUTUR2", "IMPERATIV"
+          ];
+          for (const tKey of tensesKeys) {
+            const tenseObj = raw.conjugations[tKey];
+            if (tenseObj) {
+              for (const pKey of ["S1", "S2", "S3", "P1", "P2", "P3"]) {
+                if (tenseObj[pKey]) {
+                  const val = Array.isArray(tenseObj[pKey]) ? tenseObj[pKey].join(", ") : tenseObj[pKey];
+                  if (val) {
+                    cellOverrides[`${tKey}_${pKey}`] = val;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        await dbService.addVerb({
+          infinitive: inf,
+          bedeutung: raw.bedeutung || raw.meaning || "",
+          hilfsverb: raw.hilfsverb === "sein" ? "sein" : "haben",
+          categories: Array.isArray(raw.categories) ? raw.categories : ["regular"],
+          cellOverrides
+        });
+        countSuccess++;
+      }
+
+      await loadVerbsList();
+
+      let msg = locale === "fa"
+        ? `تعداد ${countSuccess} فعل جدید با موفقیت به جدول اضافه شد!`
+        : `${countSuccess} new verbs imported successfully!`;
+
+      if (duplicateVerbs.length > 0) {
+        const dupStr = duplicateVerbs.slice(0, 5).join(", ") + (duplicateVerbs.length > 5 ? "..." : "");
+        msg += locale === "fa"
+          ? ` (${duplicateVerbs.length} فعل تکراری نادیده گرفته شدند: ${dupStr})`
+          : ` (${duplicateVerbs.length} duplicate verbs skipped: ${dupStr})`;
+      }
+
+      setVerbJsonImportSuccess(msg);
+      setAddVerbToastMessage(locale === "fa" ? `${countSuccess} فعل جدید درون‌ریزی شد.` : `${countSuccess} new verbs imported.`);
+      setTimeout(() => setShowVerbJsonModal(false), 2000);
+    } catch (err: any) {
+      console.error("Verb JSON parse error:", err);
+      setVerbJsonImportError(locale === "fa" ? "فرمت فایل JSON معتبر نیست." : "Invalid JSON file format.");
     }
   };
 
@@ -1404,19 +1609,34 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
 
         {/* Quick Add Verb & Modal Trigger */}
         <div className="lg:col-span-7 bg-white border border-slate-200 p-5 rounded-2xl shadow-sm space-y-3">
-          <div className="flex justify-between items-center gap-2">
+          <div className="flex flex-wrap justify-between items-center gap-2">
             <label className="text-sm font-semibold text-slate-800 flex items-center gap-2 font-vazir">
               <PlusCircle className="w-4 h-4 text-indigo-600" />
               {t.bulkLabel}
             </label>
-            <button
-              type="button"
-              onClick={handleOpenAddModal}
-              className="text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-semibold px-3 py-1.5 rounded-xl border border-indigo-200 transition-colors flex items-center gap-1 font-vazir shrink-0 cursor-pointer"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              {t.addVerbModalBtn || "+ افزودن فعل جدید"}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setVerbJsonInputText("");
+                  setVerbJsonImportError(null);
+                  setVerbJsonImportSuccess(null);
+                  setShowVerbJsonModal(true);
+                }}
+                className="text-xs bg-purple-50 hover:bg-purple-100 text-purple-700 font-semibold px-3 py-1.5 rounded-xl border border-purple-200 transition-colors flex items-center gap-1 font-vazir shrink-0 cursor-pointer"
+              >
+                <FileCode className="w-3.5 h-3.5" />
+                {locale === "fa" ? "+ ورود افعال از JSON" : "+ Import Verbs from JSON"}
+              </button>
+              <button
+                type="button"
+                onClick={handleOpenAddModal}
+                className="text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-semibold px-3 py-1.5 rounded-xl border border-indigo-200 transition-colors flex items-center gap-1 font-vazir shrink-0 cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                {t.addVerbModalBtn || "+ افزودن فعل جدید"}
+              </button>
+            </div>
           </div>
 
           <form onSubmit={handleBulkImport} className="flex flex-col sm:flex-row gap-2.5">
@@ -2511,6 +2731,30 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
             {/* Vertical Divider */}
             <div className="hidden md:block h-6 w-px bg-slate-200" />
 
+            {/* Page Size Selector */}
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-slate-500 font-vazir">
+                {locale === "fa" ? "تعداد در صفحه:" : locale === "de" ? "Pro Seite:" : "Per page:"}
+              </span>
+              <select
+                value={itemsPerPage}
+                onChange={(e) => {
+                  setItemsPerPage(Number(e.target.value));
+                  setCurrentPage(1);
+                }}
+                className="h-9 px-2.5 border border-slate-200 bg-white rounded-xl text-xs font-bold text-slate-700 shadow-2xs cursor-pointer focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
+              >
+                <option value={10}>10</option>
+                <option value={20}>20</option>
+                <option value={30}>30</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+            </div>
+
+            {/* Vertical Divider */}
+            <div className="hidden md:block h-6 w-px bg-slate-200" />
+
             {/* Jump to Page Input */}
             <div className="flex items-center gap-2">
               <span className="text-xs font-medium text-slate-500 font-vazir">
@@ -2566,6 +2810,112 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                 className="px-4 py-2 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 active:bg-red-800 rounded-xl transition-all shadow-sm shadow-red-100 font-vazir cursor-pointer"
               >
                 {locale === "fa" ? "حذف شود" : locale === "de" ? "Ja, löschen" : "Yes, delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Verb JSON Import Modal */}
+      {showVerbJsonModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto no-print">
+          <div className={`bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-xl p-6 space-y-5 animate-in fade-in zoom-in-95 duration-200 ${isRtl ? "text-right" : "text-left"}`}>
+            <div className="flex justify-between items-center border-b border-slate-100 pb-4">
+              <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2 font-vazir">
+                <FileCode className="w-5 h-5 text-purple-600" />
+                {locale === "fa" ? "ورود گروهی افعال از JSON" : "Bulk Import Verbs from JSON"}
+              </h3>
+              <button
+                onClick={() => setShowVerbJsonModal(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* AI Toggle */}
+            <div className="bg-purple-50 border border-purple-200 p-3.5 rounded-2xl flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-xs font-bold text-purple-900 font-vazir">
+                <Sparkles className="w-4 h-4 text-purple-600 shrink-0" />
+                <span>تکمیل خودکار معانی، نقش‌ها و تمام صرف‌ها با هوش مصنوعی</span>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                <input
+                  type="checkbox"
+                  checked={enableAiVerbJsonImport}
+                  onChange={(e) => setEnableAiVerbJsonImport(e.target.checked)}
+                  className="sr-only peer"
+                />
+                <div className="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-purple-600"></div>
+              </label>
+            </div>
+
+            {/* File Upload Option */}
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-700 font-vazir block">
+                {locale === "fa" ? "انتخاب فایل JSON از کامپیوتر / گوشی:" : "Choose JSON file:"}
+              </label>
+              <input
+                ref={verbFileInputRef}
+                type="file"
+                accept=".json,application/json"
+                onChange={handleVerbFileUpload}
+                className="hidden"
+              />
+              <button
+                type="button"
+                onClick={() => verbFileInputRef.current?.click()}
+                className="w-full py-2.5 px-4 bg-slate-50 hover:bg-slate-100 border border-dashed border-slate-300 rounded-xl text-xs font-semibold text-slate-700 flex items-center justify-center gap-2 transition-colors cursor-pointer font-vazir"
+              >
+                <Upload className="w-4 h-4 text-indigo-600" />
+                {locale === "fa" ? "بارگذاری فایل JSON" : "Upload JSON File"}
+              </button>
+            </div>
+
+            <div className="relative flex items-center justify-center">
+              <hr className="w-full border-slate-200" />
+              <span className="absolute bg-white px-3 text-[11px] text-slate-400 font-vazir">یا جای‌گذاری متن JSON</span>
+            </div>
+
+            {/* JSON Text Input */}
+            <div className="space-y-2">
+              <textarea
+                rows={6}
+                value={verbJsonInputText}
+                onChange={(e) => setVerbJsonInputText(e.target.value)}
+                placeholder={`[\n  "gehen",\n  "sprechen",\n  "kaufen"\n]`}
+                className="w-full p-3 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 bg-slate-50 dir-ltr text-left"
+              />
+            </div>
+
+            {/* Messages */}
+            {verbJsonImportError && (
+              <div className="p-3 bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl font-vazir">
+                {verbJsonImportError}
+              </div>
+            )}
+            {verbJsonImportSuccess && (
+              <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl font-vazir leading-relaxed">
+                {verbJsonImportSuccess}
+              </div>
+            )}
+
+            {/* Submit / Action Buttons */}
+            <div className="flex gap-3 justify-end pt-2">
+              <button
+                type="button"
+                onClick={() => setShowVerbJsonModal(false)}
+                className="px-4 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-all font-vazir cursor-pointer"
+              >
+                {locale === "fa" ? "انصراف" : "Cancel"}
+              </button>
+              <button
+                type="button"
+                disabled={!verbJsonInputText.trim()}
+                onClick={() => processVerbJsonImport(verbJsonInputText)}
+                className="px-5 py-2 text-xs font-bold text-white bg-purple-600 hover:bg-purple-700 rounded-xl transition-all shadow-md shadow-purple-100 font-vazir cursor-pointer disabled:opacity-40"
+              >
+                {locale === "fa" ? "پردازش و درون‌ریزی افعال" : "Import Verbs"}
               </button>
             </div>
           </div>

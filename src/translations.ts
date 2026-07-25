@@ -2,7 +2,7 @@ export type Locale = "en" | "fa" | "de";
 
 export const translations = {
   en: {
-    title: "German Verb Conjugation Manager",
+    title: "German Language Manager",
     subtitle: "German Language Center",
     heroTitle: "Learning and Managing German Verb Conjugations",
     heroDesc: "Add verbs, manage categories, and customize any conjugation cell directly in the table. Your changes are saved securely in your IndexedDB.",
@@ -104,7 +104,7 @@ export const translations = {
     undoSuccess: "Change successfully undone!",
   },
   fa: {
-    title: "مدیریت صرف افعال آلمانی",
+    title: "مدیریت زبان آلمانی",
     subtitle: "مرکز زبان آلمانی",
     heroTitle: "یادگیری و مدیریت صرف افعال آلمانی",
     heroDesc: "افعال را اضافه کنید، دسته‌بندی‌ها را مدیریت کنید و هر خانه جدول صرف را مستقیماً ویرایش کنید. تغییرات شما به صورت امن در مرورگر (IndexedDB) ذخیره می‌شود.",
@@ -206,7 +206,7 @@ export const translations = {
     undoSuccess: "تغییر با موفقیت بازگردانده شد!",
   },
   de: {
-    title: "Deutscher Verbkonjugations-Manager",
+    title: "Deutscher Sprachmanager",
     subtitle: "Deutsches Sprachenzentrum",
     heroTitle: "Lernen und Verwalten der deutschen Verbkonjugationen",
     heroDesc: "Fügen Sie Verben hinzu, verwalten Sie Kategorien und passen Sie jede beliebige Konjugationszelle direkt in der Tabelle an. Ihre Änderungen werden sicher in Ihrer IndexedDB gespeichert.",

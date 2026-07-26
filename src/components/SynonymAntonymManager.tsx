@@ -117,10 +117,10 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
         if (d.notes) setFormNotes(d.notes);
         showToast(locale === "fa" ? "اطلاعات گروه، آرتیکل‌ها، نوع واژه و نکات با AI تکمیل شدند ✨" : "Group filled with AI ✨");
       } else {
-        alert(result.error || "خطا در هوش مصنوعی");
+        alert(result.userMessage || result.error || "خطا در هوش مصنوعی");
       }
     } catch (err: any) {
-      alert("خطا: " + err.message);
+      alert("خطا: " + (err.message || err));
     } finally {
       setAiLoading(false);
     }
@@ -166,10 +166,10 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
         setAiTopicInput("");
         showToast(locale === "fa" ? `گروه جدید "${newGrp.title}" با هوش مصنوعی ساخته شد ✨` : `New group created with AI ✨`);
       } else {
-        alert(result.error || "خطا در ساخت گروه با هوش مصنوعی");
+        alert(result.userMessage || result.error || "خطا در ساخت گروه با هوش مصنوعی");
       }
     } catch (err: any) {
-      alert("خطا: " + err.message);
+      alert("خطا: " + (err.message || err));
     } finally {
       setAiLoading(false);
     }

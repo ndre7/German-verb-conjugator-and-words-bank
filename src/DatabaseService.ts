@@ -944,6 +944,10 @@ export class DatabaseService {
     }
   }
 
+  public async deleteVerb(infinitive: string): Promise<void> {
+    await this.resetVerb(infinitive);
+  }
+
   /**
    * Get custom order list from DB settings or memory
    */
@@ -1280,6 +1284,23 @@ export class DatabaseService {
 
   private inMemoryVocabularies: VocabularyItem[] | null = null;
 
+  private deduplicateVocabularies(list: VocabularyItem[]): VocabularyItem[] {
+    const seenIds = new Set<string>();
+    const seenWords = new Set<string>();
+    const result: VocabularyItem[] = [];
+
+    for (const item of list) {
+      if (!item || !item.id || !item.word) continue;
+      const normKey = `${item.word.toLowerCase().trim()}_${(item.article || "none").toLowerCase()}_${(item.partOfSpeech || "noun").toLowerCase()}`;
+      if (!seenIds.has(item.id) && !seenWords.has(normKey)) {
+        seenIds.add(item.id);
+        seenWords.add(normKey);
+        result.push(item);
+      }
+    }
+    return result;
+  }
+
   public async getVocabularies(): Promise<VocabularyItem[]> {
     if (this.useInMemoryFallback) {
       if (!this.inMemoryVocabularies) {
@@ -1294,6 +1315,7 @@ export class DatabaseService {
           this.inMemoryVocabularies = [...this.defaultSampleVocabularies];
         }
       }
+      this.inMemoryVocabularies = this.deduplicateVocabularies(this.inMemoryVocabularies);
       return [...this.inMemoryVocabularies];
     }
 
@@ -1306,14 +1328,16 @@ export class DatabaseService {
         this.inMemoryVocabularies = [...this.defaultSampleVocabularies];
         return [...this.defaultSampleVocabularies];
       }
-      this.inMemoryVocabularies = list;
-      return list;
+      const cleanList = this.deduplicateVocabularies(list);
+      this.inMemoryVocabularies = cleanList;
+      return cleanList;
     } catch (e) {
       console.warn("IndexedDB vocabularies fetch failed, falling back to memory", e);
       this.useInMemoryFallback = true;
       if (!this.inMemoryVocabularies) {
         this.inMemoryVocabularies = [...this.defaultSampleVocabularies];
       }
+      this.inMemoryVocabularies = this.deduplicateVocabularies(this.inMemoryVocabularies);
       return [...this.inMemoryVocabularies];
     }
   }

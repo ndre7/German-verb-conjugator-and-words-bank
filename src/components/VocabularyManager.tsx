@@ -131,16 +131,166 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
   const [formExample, setFormExample] = useState("");
   const [formNotes, setFormNotes] = useState("");
   const [formTags, setFormTags] = useState<string[]>([]);
+  const [newCustomTagInput, setNewCustomTagInput] = useState("");
 
   // Bulk JSON Import Modal
   const [showJsonImportModal, setShowJsonImportModal] = useState(false);
   const [jsonInputText, setJsonInputText] = useState("");
   const [jsonImportError, setJsonImportError] = useState<string | null>(null);
   const [jsonImportSuccess, setJsonImportSuccess] = useState<string | null>(null);
+  const [jsonImportTags, setJsonImportTags] = useState<string[]>([]);
+  const [jsonImportCustomTag, setJsonImportCustomTag] = useState("");
+
+  // Bulk Selection & Operations
+  const [selectedVocabIds, setSelectedVocabIds] = useState<Set<string>>(new Set());
+  const [showBulkDeleteVocabModal, setShowBulkDeleteVocabModal] = useState(false);
 
   // AI States
   const [aiLoading, setAiLoading] = useState(false);
   const [enableAiJsonImport, setEnableAiJsonImport] = useState(true);
+
+  // Custom Tag Helper for Form
+  const handleAddCustomTagToForm = async () => {
+    const tagName = newCustomTagInput.trim();
+    if (!tagName) return;
+
+    let cat = vocabCategories.find(c => c.name.toLowerCase() === tagName.toLowerCase() || c.id.toLowerCase() === tagName.toLowerCase());
+    let tagId = cat ? cat.id : "";
+
+    if (!cat) {
+      tagId = `vcat_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`;
+      const newCat: VocabularyCategory = {
+        id: tagId,
+        name: tagName,
+        color: "bg-indigo-100 text-indigo-800 border-indigo-300"
+      };
+      await dbService.saveVocabCategory(newCat);
+      await loadData();
+    }
+
+    if (!formTags.includes(tagId)) {
+      setFormTags(prev => [...prev, tagId]);
+    }
+    setNewCustomTagInput("");
+  };
+
+  // Custom Tag Helper for JSON Import
+  const handleAddCustomTagToJsonImport = async () => {
+    const tagName = jsonImportCustomTag.trim();
+    if (!tagName) return;
+
+    let cat = vocabCategories.find(c => c.name.toLowerCase() === tagName.toLowerCase() || c.id.toLowerCase() === tagName.toLowerCase());
+    let tagId = cat ? cat.id : "";
+
+    if (!cat) {
+      tagId = `vcat_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`;
+      const newCat: VocabularyCategory = {
+        id: tagId,
+        name: tagName,
+        color: "bg-purple-100 text-purple-800 border-purple-300"
+      };
+      await dbService.saveVocabCategory(newCat);
+      await loadData();
+    }
+
+    if (!jsonImportTags.includes(tagId)) {
+      setJsonImportTags(prev => [...prev, tagId]);
+    }
+    setJsonImportCustomTag("");
+  };
+
+  // Bulk Selection Handlers
+  const toggleSelectVocab = (id: string) => {
+    setSelectedVocabIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAllVocabs = () => {
+    if (selectedVocabIds.size === paginatedItems.length && paginatedItems.length > 0) {
+      setSelectedVocabIds(new Set());
+    } else {
+      setSelectedVocabIds(new Set(paginatedItems.map(item => item.id)));
+    }
+  };
+
+  const handleBulkDeleteVocabs = async () => {
+    if (selectedVocabIds.size === 0) return;
+    const count = selectedVocabIds.size;
+    for (const id of Array.from(selectedVocabIds) as string[]) {
+      await dbService.deleteVocabulary(id);
+    }
+    setSelectedVocabIds(new Set());
+    setShowBulkDeleteVocabModal(false);
+    await loadData();
+    showToast(locale === "fa" ? `${count} واژه با موفقیت حذف شدند.` : `${count} words deleted successfully.`);
+  };
+
+  const handleBulkAiEnrichVocabs = async () => {
+    if (selectedVocabIds.size === 0) return;
+    const selectedItems = vocabularies.filter(v => selectedVocabIds.has(v.id));
+    if (selectedItems.length === 0) return;
+
+    setAiLoading(true);
+    showToast(locale === "fa" ? `در حال تحلیل و تکمیل ${selectedItems.length} واژه با هوش مصنوعی...` : `Enriching ${selectedItems.length} words with AI...`);
+
+    try {
+      const CHUNK_SIZE = 10;
+      const BATCH_REQUEST_DELAY_MS = 2000;
+      const delayMs = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+      let updatedCount = 0;
+
+      for (let i = 0; i < selectedItems.length; i += CHUNK_SIZE) {
+        if (i > 0) await delayMs(BATCH_REQUEST_DELAY_MS);
+        const chunk = selectedItems.slice(i, i + CHUNK_SIZE);
+
+        const res = await fetch("/api/gemini/batch-vocab-fill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ items: chunk })
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && Array.isArray(data.items)) {
+            for (const enriched of data.items) {
+              const orig = chunk.find(c => c.word.toLowerCase() === (enriched.word || "").toLowerCase() || c.id === enriched.id);
+              if (orig) {
+                const updatedItem: VocabularyItem = {
+                  ...orig,
+                  article: (enriched.article && ["der","die","das","none"].includes(enriched.article)) ? enriched.article : orig.article,
+                  word: enriched.word || orig.word,
+                  meaning: enriched.meaning || orig.meaning,
+                  plural: enriched.plural !== undefined ? enriched.plural : orig.plural,
+                  partOfSpeech: enriched.partOfSpeech || orig.partOfSpeech,
+                  example: enriched.example ? cleanGermanExample(enriched.example) : orig.example,
+                  notes: enriched.notes || orig.notes,
+                  updatedAt: Date.now()
+                };
+                await dbService.saveVocabulary(updatedItem);
+                updatedCount++;
+              }
+            }
+          }
+        }
+      }
+
+      await loadData();
+      setSelectedVocabIds(new Set());
+      showToast(locale === "fa" ? `تعداد ${updatedCount} واژه با هوش مصنوعی بروزرسانی شدند ✨` : `${updatedCount} words enriched with AI ✨`);
+    } catch (err: any) {
+      alert("خطا در هوش مصنوعی: " + (err.message || err));
+    } finally {
+      setAiLoading(false);
+    }
+  };
 
   // AI Fill Single Word in Add/Edit Modal
   const handleAiFillSingleWord = async () => {
@@ -177,11 +327,11 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
             : "Word analyzed and filled with AI ✨"
         );
       } else {
-        alert(result.error || "خطا در فراخوانی هوش مصنوعی");
+        alert(result.userMessage || result.error || "خطا در فراخوانی هوش مصنوعی");
       }
     } catch (err: any) {
       console.error("AI Error:", err);
-      alert("خطا در ارتباط با سرور هوش مصنوعی: " + err.message);
+      alert("خطا در ارتباط با سرور: " + (err.message || err));
     } finally {
       setAiLoading(false);
     }
@@ -221,10 +371,10 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
             : `Word "${updated.word}" enriched with AI ✨`
         );
       } else {
-        alert(result.error || "خطا در هوش مصنوعی");
+        alert(result.userMessage || result.error || "خطا در هوش مصنوعی");
       }
     } catch (err: any) {
-      alert("خطا: " + err.message);
+      alert("خطا: " + (err.message || err));
     } finally {
       setAiLoading(false);
     }
@@ -514,6 +664,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         if (Array.isArray(parsed.words)) itemsArray = parsed.words;
         else if (Array.isArray(parsed.vocabularies)) itemsArray = parsed.vocabularies;
         else if (Array.isArray(parsed.items)) itemsArray = parsed.items;
+        else if (Array.isArray(parsed.data)) itemsArray = parsed.data;
         else itemsArray = [parsed];
       }
 
@@ -522,23 +673,86 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         return;
       }
 
-      // Existing word set for fast duplicate check
-      const existingWordSet = new Set(vocabularies.map(v => v.word.toLowerCase().trim()));
+      // Existing word set for fast duplicate check (normalized without article prefix)
+      const existingWordSet = new Set(
+        vocabularies
+          .map(v => (v.word || "").replace(/^(der|die|das)\s+/i, "").toLowerCase().trim())
+          .filter(Boolean)
+      );
 
       const newCandidates: any[] = [];
       const duplicateWords: string[] = [];
 
       for (const raw of itemsArray) {
-        if (!raw || typeof raw !== "object" || !raw.word) continue;
-        const cleanWord = String(raw.word).replace(/^(der|die|das)\s+/i, "").trim();
+        if (!raw) continue;
+
+        let rawWord = "";
+        let rawMeaning = "";
+        let rawArticle: ArticleType = "none";
+        let rawPlural = "";
+        let rawPartOfSpeech = "";
+        let rawExample = "";
+        let rawNotes = "";
+        let rawTags: string[] = [];
+
+        if (typeof raw === "string") {
+          const trimmed = raw.trim();
+          if (trimmed.includes("-")) {
+            const parts = trimmed.split("-");
+            rawWord = parts[0].trim();
+            rawMeaning = parts.slice(1).join("-").trim();
+          } else if (trimmed.includes(":")) {
+            const parts = trimmed.split(":");
+            rawWord = parts[0].trim();
+            rawMeaning = parts.slice(1).join(":").trim();
+          } else {
+            rawWord = trimmed;
+          }
+        } else if (typeof raw === "object") {
+          rawWord = String(
+            raw.word || raw.german || raw.term || raw.wort || raw.expression || raw.title || raw.text || raw.w || ""
+          ).trim();
+          rawMeaning = String(raw.meaning || raw.persian || raw.translation || raw.bedeutung || "").trim();
+          if (raw.article === "der" || raw.article === "die" || raw.article === "das") {
+            rawArticle = raw.article;
+          }
+          if (raw.plural) rawPlural = String(raw.plural).trim();
+          if (raw.partOfSpeech) rawPartOfSpeech = raw.partOfSpeech;
+          if (raw.example) rawExample = String(raw.example).trim();
+          if (raw.notes) rawNotes = String(raw.notes).trim();
+          if (Array.isArray(raw.tags)) rawTags = raw.tags;
+        }
+
+        if (!rawWord) continue;
+
+        let art: ArticleType = rawArticle;
+        if (art === "none") {
+          if (/^der\s+/i.test(rawWord)) art = "der";
+          else if (/^die\s+/i.test(rawWord)) art = "die";
+          else if (/^das\s+/i.test(rawWord)) art = "das";
+        }
+
+        const cleanWord = rawWord.replace(/^(der|die|das)\s+/i, "").trim();
         if (!cleanWord) continue;
 
-        if (existingWordSet.has(cleanWord.toLowerCase())) {
+        const normKey = cleanWord.toLowerCase();
+
+        if (existingWordSet.has(normKey)) {
           duplicateWords.push(cleanWord);
         } else {
           // Avoid duplicates within the input list itself
-          existingWordSet.add(cleanWord.toLowerCase());
-          newCandidates.push(raw);
+          existingWordSet.add(normKey);
+          const mergedTags = Array.from(new Set([...(Array.isArray(rawTags) ? rawTags : []), ...jsonImportTags]));
+          newCandidates.push({
+            word: cleanWord,
+            article: art,
+            meaning: rawMeaning,
+            plural: rawPlural,
+            partOfSpeech: rawPartOfSpeech,
+            example: rawExample,
+            notes: rawNotes,
+            tags: mergedTags,
+          });
         }
       }
 
@@ -561,18 +775,43 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
             ? `در حال تحلیل و تکمیل ${itemsArray.length} واژه جدید با هوش مصنوعی... (لطفاً چند لحظه شکیبا باشید)`
             : "Enriching new vocabulary items with AI..."
         );
-        try {
-          const aiRes = await fetch("/api/gemini/batch-vocab-fill", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ items: itemsArray.slice(0, 50) }) // safety limit 50 items
-          });
-          const aiData = await aiRes.json();
-          if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
-            itemsArray = aiData.items;
+
+        const enrichedList: any[] = [];
+        const CHUNK_SIZE = 10;
+        const BATCH_REQUEST_DELAY_MS = 2000;
+        const delayMs = (ms: number) => new Promise((res) => setTimeout(res, ms));
+
+        for (let i = 0; i < itemsArray.length; i += CHUNK_SIZE) {
+          if (i > 0) {
+            await delayMs(BATCH_REQUEST_DELAY_MS);
           }
-        } catch (err) {
-          console.error("Batch AI error during JSON import:", err);
+          const chunk = itemsArray.slice(i, i + CHUNK_SIZE);
+          try {
+            const aiRes = await fetch("/api/gemini/batch-vocab-fill", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ items: chunk })
+            });
+            if (aiRes.ok) {
+              const aiData = await aiRes.json();
+              if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
+                enrichedList.push(...aiData.items);
+                continue;
+              }
+            } else {
+              const errData = await aiRes.json().catch(() => null);
+              if (errData?.userMessage) {
+                console.warn("Batch AI vocab chunk warning:", errData.userMessage);
+              }
+            }
+          } catch (err) {
+            console.warn("Batch AI chunk error during JSON import, falling back to raw chunk items:", err);
+          }
+          enrichedList.push(...chunk);
+        }
+
+        if (enrichedList.length > 0) {
+          itemsArray = enrichedList;
         }
       }
 
@@ -595,7 +834,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         const cleanWord = raw.word.replace(/^(der|die|das)\s+/i, "").trim();
 
         const item: VocabularyItem = {
-          id: raw.id || `vocab_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          id: raw.id || `vocab_${Date.now()}_${Math.random().toString(36).substring(2, 7)}_${Math.random().toString(36).substring(2, 5)}`,
           article: art,
           word: cleanWord,
           meaning: raw.meaning ? String(raw.meaning).trim() : "",
@@ -603,7 +842,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
           partOfSpeech: raw.partOfSpeech || (art !== "none" ? "noun" : "expression"),
           example: cleanGermanExample(raw.example ? String(raw.example) : ""),
           notes: raw.notes ? String(raw.notes).trim() : "",
-          tags: Array.isArray(raw.tags) ? raw.tags : [],
+          tags: Array.from(new Set([...(Array.isArray(raw.tags) ? raw.tags : []), ...jsonImportTags])),
           createdAt: raw.createdAt || Date.now(),
           updatedAt: Date.now()
         };
@@ -734,16 +973,39 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     }
   };
 
+  const formatPluralDisplay = (pluralStr: string | undefined): string => {
+    if (!pluralStr) return "–";
+    const trimmed = pluralStr.trim();
+    const lower = trimmed.toLowerCase();
+    if (
+      !trimmed ||
+      trimmed === "-" ||
+      trimmed === "–" ||
+      lower === "ohne plural" ||
+      lower === "nur singular" ||
+      lower === "ohne plural/nur singular" ||
+      lower === "ohne plural / nur singular" ||
+      lower === "بدون جمع" ||
+      lower === "no plural"
+    ) {
+      return "–";
+    }
+    if (/^die\s+/i.test(trimmed)) {
+      return trimmed.replace(/^die\s+/i, "").trim();
+    }
+    return trimmed;
+  };
+
   const getPosLabel = (pos: PartOfSpeech) => {
     switch (pos) {
-      case "noun": return locale === "fa" ? "اسم (Nomen)" : "Noun";
-      case "adjective": return locale === "fa" ? "صفت (Adjektiv)" : "Adjective";
-      case "adverb": return locale === "fa" ? "قید (Adverb)" : "Adverb";
-      case "preposition": return locale === "fa" ? "حرف اضافه" : "Preposition";
-      case "expression": return locale === "fa" ? "اصطلاح / عبارت" : "Expression";
-      case "verb_phrase": return locale === "fa" ? "عبارت فعلی" : "Verb Phrase";
-      case "pronoun": return locale === "fa" ? "ضمیر" : "Pronoun";
-      case "conjunction": return locale === "fa" ? "حرف ربط" : "Conjunction";
+      case "noun": return locale === "fa" ? "اسم (Nomen)" : locale === "de" ? "Nomen" : "Noun";
+      case "adjective": return locale === "fa" ? "صفت (Adjektiv)" : locale === "de" ? "Adjektiv" : "Adjective";
+      case "adverb": return locale === "fa" ? "قید (Adverb)" : locale === "de" ? "Adverb" : "Adverb";
+      case "preposition": return locale === "fa" ? "حرف اضافه" : locale === "de" ? "Präposition" : "Preposition";
+      case "expression": return locale === "fa" ? "اصطلاح / عبارت" : locale === "de" ? "Redewendung" : "Expression";
+      case "verb_phrase": return locale === "fa" ? "عبارت فعلی" : locale === "de" ? "Verb-Phrase" : "Verb Phrase";
+      case "pronoun": return locale === "fa" ? "ضمیر" : locale === "de" ? "Pronomen" : "Pronoun";
+      case "conjunction": return locale === "fa" ? "حرف ربط" : locale === "de" ? "Konjunktion" : "Conjunction";
       default: return pos;
     }
   };
@@ -1017,7 +1279,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
               <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-slate-100 text-xs font-vazir">
                 <span className="text-slate-400 text-[11px] flex items-center gap-1">
                   <Filter className="w-3 h-3" />
-                  آرتیکل:
+                  {locale === "fa" ? "آرتیکل:" : locale === "de" ? "Artikel:" : "Article:"}
                 </span>
                 <button
                   onClick={() => { setArticleFilter("all"); setCurrentPage(1); }}
@@ -1025,7 +1287,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                     articleFilter === "all" ? "bg-indigo-600 text-white border-indigo-600" : "bg-slate-50 text-slate-600 border-slate-200"
                   }`}
                 >
-                  همه
+                  {locale === "fa" ? "همه" : locale === "de" ? "Alle" : "All"}
                 </button>
                 <button
                   onClick={() => { setArticleFilter("der"); setCurrentPage(1); }}
@@ -1058,7 +1320,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                     articleFilter === "none" ? "bg-slate-700 text-white border-slate-700" : "bg-slate-50 text-slate-600 border-slate-200"
                   }`}
                 >
-                  بدون آرتیکل
+                  {locale === "fa" ? "بدون آرتیکل" : locale === "de" ? "Kein Artikel" : "Without Article"}
                 </button>
 
                 <span className="text-slate-300 mx-1">|</span>
@@ -1068,15 +1330,15 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                   onChange={(e) => { setPosFilter(e.target.value as any); setCurrentPage(1); }}
                   className="px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700 focus:outline-none"
                 >
-                  <option value="all">تمام نقش‌های واژه</option>
-                  <option value="noun">اسم (Nomen)</option>
-                  <option value="adjective">صفت (Adjektiv)</option>
-                  <option value="adverb">قید (Adverb)</option>
-                  <option value="preposition">حرف اضافه</option>
-                  <option value="expression">اصطلاح / عبارت</option>
-                  <option value="verb_phrase">عبارت فعلی</option>
-                  <option value="pronoun">ضمیر</option>
-                  <option value="conjunction">حرف ربط</option>
+                  <option value="all">{locale === "fa" ? "تمام نقش‌های واژه" : locale === "de" ? "Alle Wortarten" : "All Parts of Speech"}</option>
+                  <option value="noun">{locale === "fa" ? "اسم (Nomen)" : locale === "de" ? "Nomen" : "Noun"}</option>
+                  <option value="adjective">{locale === "fa" ? "صفت (Adjektiv)" : locale === "de" ? "Adjektiv" : "Adjective"}</option>
+                  <option value="adverb">{locale === "fa" ? "قید (Adverb)" : locale === "de" ? "Adverb" : "Adverb"}</option>
+                  <option value="preposition">{locale === "fa" ? "حرف اضافه" : locale === "de" ? "Präposition" : "Preposition"}</option>
+                  <option value="expression">{locale === "fa" ? "اصطلاح / عبارت" : locale === "de" ? "Redewendung" : "Expression"}</option>
+                  <option value="verb_phrase">{locale === "fa" ? "عبارت فعلی" : locale === "de" ? "Verb-Phrase" : "Verb Phrase"}</option>
+                  <option value="pronoun">{locale === "fa" ? "ضمیر" : locale === "de" ? "Pronomen" : "Pronoun"}</option>
+                  <option value="conjunction">{locale === "fa" ? "حرف ربط" : locale === "de" ? "Konjunktion" : "Conjunction"}</option>
                 </select>
               </div>
             </div>
@@ -1085,37 +1347,78 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
             <div className="lg:col-span-4 bg-white border border-slate-200 p-4 rounded-2xl shadow-xs space-y-2">
               <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5 font-vazir">
                 <PlusCircle className="w-4 h-4 text-indigo-600" />
-                افزودن سریع واژه (واژه - معنی)
+                {locale === "fa" ? "افزودن سریع واژه (واژه - معنی)" : locale === "de" ? "Schnell hinzufügen (Wort - Bedeutung)" : "Quick Add Word (Word - Meaning)"}
               </label>
               <form onSubmit={handleQuickAdd} className="flex gap-2">
                 <input
                   type="text"
                   value={quickInput}
                   onChange={(e) => setQuickInput(e.target.value)}
-                  placeholder="مثلاً: der Tisch - میز"
+                  placeholder={locale === "fa" ? "مثلاً: der Tisch - میز" : locale === "de" ? "z.B. der Tisch - Tisch" : "e.g. der Tisch - table"}
                   className="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-xs bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-vazir"
                 />
                 <button
                   type="submit"
                   className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-2 rounded-xl text-xs font-bold font-vazir cursor-pointer"
                 >
-                  ثبت
+                  {locale === "fa" ? "ثبت" : locale === "de" ? "Hinzufügen" : "Add"}
                 </button>
               </form>
             </div>
           </div>
 
+          {/* Bulk Action Bar for Selected Vocabulary Items */}
+          {selectedVocabIds.size > 0 && (
+            <div className="bg-indigo-900 text-white p-3.5 rounded-2xl shadow-xl flex flex-col sm:flex-row items-center justify-between gap-3 border border-indigo-700 font-vazir animate-in fade-in duration-200 my-3">
+              <div className="flex items-center gap-2 text-xs font-bold">
+                <span className="bg-indigo-600 text-white px-2.5 py-1 rounded-xl font-mono text-sm">
+                  {selectedVocabIds.size}
+                </span>
+                <span>{locale === "fa" ? "واژه انتخاب شده است" : "word(s) selected"}</span>
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={handleBulkAiEnrichVocabs}
+                  disabled={aiLoading}
+                  className="px-3.5 py-1.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50"
+                >
+                  <Sparkles className={`w-4 h-4 ${aiLoading ? "animate-spin text-amber-300" : ""}`} />
+                  <span>{aiLoading ? "در حال پردازش..." : "تکمیل فیلدها با هوش مصنوعی"}</span>
+                </button>
+
+                <button
+                  onClick={() => setShowBulkDeleteVocabModal(true)}
+                  disabled={aiLoading}
+                  className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span>حذف واژگان انتخاب شده</span>
+                </button>
+
+                <button
+                  onClick={() => setSelectedVocabIds(new Set())}
+                  className="px-3 py-1.5 bg-indigo-800 hover:bg-indigo-700 text-indigo-200 rounded-xl text-xs cursor-pointer"
+                >
+                  انصراف
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Content Table / Cards */}
           {loading ? (
             <div className="bg-white border border-slate-200 rounded-3xl p-12 text-center text-slate-400 font-vazir">
-              در حال بارگذاری واژگان...
+              {locale === "fa" ? "در حال بارگذاری واژگان..." : locale === "de" ? "Wortschatz wird geladen..." : "Loading vocabulary..."}
             </div>
           ) : paginatedItems.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-3xl p-12 text-center space-y-3 font-vazir">
               <BookMarked className="w-12 h-12 text-slate-300 mx-auto" />
-              <h3 className="text-base font-bold text-slate-700">هیچ واژه‌ای یافت نشد!</h3>
+              <h3 className="text-base font-bold text-slate-700">
+                {locale === "fa" ? "هیچ واژه‌ای یافت نشد!" : locale === "de" ? "Keine Wörter gefunden!" : "No words found!"}
+              </h3>
               <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                عبارت دیگری را جستجو کنید یا فیلترها را تغییر دهید.
+                {locale === "fa" ? "عبارت دیگری را جستجو کنید یا فیلترها را تغییر دهید." : locale === "de" ? "Suchen Sie nach einem anderen Begriff oder ändern Sie die Filter." : "Search for another term or change the filters."}
               </p>
             </div>
           ) : viewMode === "table" ? (
@@ -1124,15 +1427,42 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                 <table className="w-full text-xs sm:text-sm text-right border-collapse">
                   <thead className="sticky top-0 z-20 bg-slate-50 border-b border-slate-200 shadow-2xs">
                     <tr className="text-slate-600 font-vazir text-xs">
-                      <th className="py-3 px-3 text-center font-bold w-16 bg-slate-50 sticky top-0 z-20"># / ترتیب</th>
-                      <th className="py-3 px-3 text-center font-bold w-20 bg-slate-50 sticky top-0 z-20">آرتیکل</th>
-                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">واژه / کلمه</th>
-                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">معنی / ترجمه</th>
-                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">حالت جمع (Plural)</th>
-                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">نقش واژه</th>
-                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">تگ‌ها</th>
-                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20 min-w-[280px] sm:min-w-[340px] max-w-[500px]">جمله نمونه (Beispielsatz)</th>
-                      <th className="py-3 px-3 text-center font-bold w-20 bg-slate-50 sticky top-0 z-20">عملیات</th>
+                      <th className="py-3 px-3 text-center font-bold w-10 bg-slate-50 sticky top-0 z-20">
+                        <input
+                          type="checkbox"
+                          checked={paginatedItems.length > 0 && selectedVocabIds.size === paginatedItems.length}
+                          onChange={toggleSelectAllVocabs}
+                          className="w-4 h-4 text-indigo-600 rounded cursor-pointer accent-indigo-600"
+                          title={locale === "fa" ? "انتخاب همه واژگان این صفحه" : "Select all on page"}
+                        />
+                      </th>
+                      <th className="py-3 px-3 text-center font-bold w-16 bg-slate-50 sticky top-0 z-20">
+                        {locale === "fa" ? "# / ترتیب" : locale === "de" ? "# / Sortierung" : "# / Order"}
+                      </th>
+                      <th className="py-3 px-3 text-center font-bold w-20 bg-slate-50 sticky top-0 z-20">
+                        {locale === "fa" ? "آرتیکل" : locale === "de" ? "Artikel" : "Article"}
+                      </th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">
+                        {locale === "fa" ? "واژه / کلمه" : locale === "de" ? "Wort / Ausdruck" : "Word / Term"}
+                      </th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">
+                        {locale === "fa" ? "معنی / ترجمه" : locale === "de" ? "Bedeutung" : "Meaning"}
+                      </th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">
+                        {locale === "fa" ? "حالت جمع (Plural)" : locale === "de" ? "Pluralform" : "Plural"}
+                      </th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">
+                        {locale === "fa" ? "نقش واژه" : locale === "de" ? "Wortart" : "Part of Speech"}
+                      </th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20">
+                        {locale === "fa" ? "تگ‌ها" : "Tags"}
+                      </th>
+                      <th className="py-3 px-3 font-bold bg-slate-50 sticky top-0 z-20 min-w-[280px] sm:min-w-[340px] max-w-[500px]">
+                        {locale === "fa" ? "جمله نمونه (Beispielsatz)" : locale === "de" ? "Beispielsatz" : "Example Sentence"}
+                      </th>
+                      <th className="py-3 px-3 text-center font-bold w-20 bg-slate-50 sticky top-0 z-20">
+                        {locale === "fa" ? "عملیات" : locale === "de" ? "Aktionen" : "Actions"}
+                      </th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -1140,9 +1470,18 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                       const globalIdx = (currentPage - 1) * itemsPerPage + idx + 1;
                       const isFirst = idx === 0 && currentPage === 1;
                       const isLast = idx === paginatedItems.length - 1 && currentPage === totalPages;
+                      const isSelected = selectedVocabIds.has(item.id);
 
                       return (
-                        <tr key={item.id} className="hover:bg-slate-50/80 transition-colors">
+                        <tr key={item.id} className={`transition-colors ${isSelected ? "bg-indigo-50/70" : "hover:bg-slate-50/80"}`}>
+                          <td className="py-3.5 px-3 text-center">
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => toggleSelectVocab(item.id)}
+                              className="w-4 h-4 text-indigo-600 rounded cursor-pointer accent-indigo-600"
+                            />
+                          </td>
                           <td className="py-3.5 px-2 text-center font-mono text-slate-400 text-xs">
                             <div className="flex items-center justify-center gap-1">
                               <span className="font-bold text-slate-500 w-5">{globalIdx}</span>
@@ -1151,7 +1490,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                                   disabled={isFirst}
                                   onClick={() => handleMoveVocab(idx, "up")}
                                   className="p-0.5 text-slate-400 hover:text-indigo-600 disabled:opacity-20 cursor-pointer"
-                                  title="انتقال به بالا"
+                                  title={locale === "fa" ? "انتقال به بالا" : "Move Up"}
                                 >
                                   <ChevronUp className="w-3.5 h-3.5" />
                                 </button>
@@ -1159,7 +1498,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                                   disabled={isLast}
                                   onClick={() => handleMoveVocab(idx, "down")}
                                   className="p-0.5 text-slate-400 hover:text-indigo-600 disabled:opacity-20 cursor-pointer"
-                                  title="انتقال به پایین"
+                                  title={locale === "fa" ? "انتقال به پایین" : "Move Down"}
                                 >
                                   <ChevronDown className="w-3.5 h-3.5" />
                                 </button>
@@ -1173,10 +1512,14 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                             {highlightMatch(item.word, searchQuery)}
                           </td>
                           <td className="py-3.5 px-3 font-bold text-slate-800 font-vazir">
-                            {item.meaning ? highlightMatch(item.meaning, searchQuery) : <span className="text-slate-300 text-xs">ثبت نشده</span>}
+                            {item.meaning ? highlightMatch(item.meaning, searchQuery) : <span className="text-slate-300 text-xs">–</span>}
                           </td>
                           <td className="py-3.5 px-3 font-sans text-slate-700">
-                            {item.plural ? highlightMatch(item.plural, searchQuery) : <span className="text-slate-300 font-mono text-xs">–</span>}
+                            {formatPluralDisplay(item.plural) !== "–" ? (
+                              highlightMatch(formatPluralDisplay(item.plural), searchQuery)
+                            ) : (
+                              <span className="text-slate-300 font-mono text-xs">–</span>
+                            )}
                           </td>
                           <td className="py-3.5 px-3 text-xs text-slate-600 font-vazir">
                             {getPosLabel(item.partOfSpeech)}
@@ -1450,6 +1793,86 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
               />
             </div>
 
+            {/* Tag Selection for JSON Import */}
+            <div className="space-y-2 bg-purple-50/50 p-3.5 rounded-2xl border border-purple-200">
+              <label className="text-xs font-bold text-purple-900 block font-vazir">
+                افزودن تگ به تمام واژگان این فایل JSON (تگ‌گذاری گروهی):
+              </label>
+
+              {/* Active JSON Import Tags */}
+              <div className="flex flex-wrap gap-1.5 min-h-[30px] p-2 bg-white border border-purple-200 rounded-xl">
+                {jsonImportTags.length === 0 ? (
+                  <span className="text-xs text-slate-400 font-vazir italic">هیچ تگی برای درون‌ریزی انتخاب نشده است (اختیاری)</span>
+                ) : (
+                  jsonImportTags.map(tagId => {
+                    const catObj = vocabCategories.find(c => c.id === tagId);
+                    const name = catObj ? catObj.name : tagId;
+                    return (
+                      <span
+                        key={tagId}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-bold bg-purple-100 text-purple-800 border border-purple-300 font-vazir"
+                      >
+                        <span>{name}</span>
+                        <button
+                          type="button"
+                          onClick={() => setJsonImportTags(prev => prev.filter(t => t !== tagId))}
+                          className="p-0.5 hover:bg-purple-200 rounded-full cursor-pointer text-purple-700"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Available Category Buttons */}
+              <div className="flex flex-wrap gap-1.5">
+                {vocabCategories.map((cat) => {
+                  const isChecked = jsonImportTags.includes(cat.id);
+                  return (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      onClick={() => {
+                        setJsonImportTags(prev => isChecked ? prev.filter(t => t !== cat.id) : [...prev, cat.id]);
+                      }}
+                      className={`px-2.5 py-1 rounded-xl text-xs font-bold border transition-all cursor-pointer font-vazir ${
+                        cat.color || "bg-slate-100 text-slate-800"
+                      } ${isChecked ? "ring-2 ring-purple-600 shadow-xs" : "opacity-60"}`}
+                    >
+                      {cat.name} {isChecked && "✓"}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Custom Tag Input */}
+              <div className="flex gap-2 pt-0.5">
+                <input
+                  type="text"
+                  value={jsonImportCustomTag}
+                  onChange={(e) => setJsonImportCustomTag(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddCustomTagToJsonImport();
+                    }
+                  }}
+                  placeholder="افزودن تگ اختصاصی جدید..."
+                  className="flex-1 px-3 py-1.5 border border-purple-200 rounded-xl text-xs bg-white focus:outline-none focus:ring-2 focus:ring-purple-500 font-vazir"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddCustomTagToJsonImport}
+                  className="px-3.5 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl text-xs font-bold flex items-center gap-1 cursor-pointer font-vazir shrink-0"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>افزودن تگ</span>
+                </button>
+              </div>
+            </div>
+
             {/* AI Toggle */}
             <label className="flex items-center gap-2 p-3 bg-purple-50/80 border border-purple-200 rounded-2xl cursor-pointer">
               <input
@@ -1638,26 +2061,85 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
               </div>
 
               {/* Category Tags Selection */}
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-700 block">
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 block font-vazir">
                   تگ‌ها و دسته‌بندی‌های این واژه:
                 </label>
-                <div className="flex flex-wrap gap-1.5 pt-1">
-                  {vocabCategories.map((cat) => {
-                    const isChecked = formTags.includes(cat.id);
-                    return (
-                      <button
-                        key={cat.id}
-                        type="button"
-                        onClick={() => handleToggleFormTag(cat.id)}
-                        className={`px-2.5 py-1 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
-                          cat.color || "bg-slate-100 text-slate-800"
-                        } ${isChecked ? "ring-2 ring-indigo-600 shadow-xs" : "opacity-60"}`}
-                      >
-                        {cat.name} {isChecked && "✓"}
-                      </button>
-                    );
-                  })}
+
+                {/* Active Tags list */}
+                <div className="flex flex-wrap gap-1.5 min-h-[32px] p-2 bg-slate-50 border border-slate-200 rounded-xl">
+                  {formTags.length === 0 ? (
+                    <span className="text-xs text-slate-400 font-vazir italic">هیچ تگی برای این واژه انتخاب نشده است</span>
+                  ) : (
+                    formTags.map(tagId => {
+                      const catObj = vocabCategories.find(c => c.id === tagId);
+                      const name = catObj ? catObj.name : tagId;
+                      const color = catObj?.color || "bg-indigo-100 text-indigo-800 border-indigo-200";
+                      return (
+                        <span
+                          key={tagId}
+                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-bold border ${color} font-vazir`}
+                        >
+                          <span>{name}</span>
+                          <button
+                            type="button"
+                            onClick={() => handleToggleFormTag(tagId)}
+                            className="p-0.5 hover:bg-black/10 rounded-full cursor-pointer text-slate-600 hover:text-slate-900"
+                            title="حذف تگ"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </span>
+                      );
+                    })
+                  )}
+                </div>
+
+                {/* Available Category Buttons */}
+                <div className="space-y-1">
+                  <span className="text-[11px] text-slate-500 block font-vazir">انتخاب سریع از تگ‌های موجود:</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {vocabCategories.map((cat) => {
+                      const isChecked = formTags.includes(cat.id);
+                      return (
+                        <button
+                          key={cat.id}
+                          type="button"
+                          onClick={() => handleToggleFormTag(cat.id)}
+                          className={`px-2.5 py-1 rounded-xl text-xs font-bold border transition-all cursor-pointer font-vazir ${
+                            cat.color || "bg-slate-100 text-slate-800"
+                          } ${isChecked ? "ring-2 ring-indigo-600 shadow-xs" : "opacity-60"}`}
+                        >
+                          {cat.name} {isChecked && "✓"}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Add Custom Tag to Word Input */}
+                <div className="flex gap-2 pt-1">
+                  <input
+                    type="text"
+                    value={newCustomTagInput}
+                    onChange={(e) => setNewCustomTagInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleAddCustomTagToForm();
+                      }
+                    }}
+                    placeholder="افزودن تگ اختصاصی جدید به واژه..."
+                    className="flex-1 px-3 py-1.5 border border-slate-200 rounded-xl text-xs bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-vazir"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddCustomTagToForm}
+                    className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold flex items-center gap-1 cursor-pointer font-vazir shrink-0"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>افزودن تگ</span>
+                  </button>
                 </div>
               </div>
 
@@ -1775,6 +2257,46 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                 className="px-5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
               >
                 {locale === "fa" ? "بازنشانی" : locale === "de" ? "Zurücksetzen" : "Reset"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Delete Confirm Modal */}
+      {showBulkDeleteVocabModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto no-print font-vazir">
+          <div className={`bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-md p-6 space-y-4 animate-in fade-in zoom-in-95 duration-200 ${isRtl ? "text-right" : "text-left"}`}>
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-rose-600 flex items-center gap-2">
+                <Trash2 className="w-5 h-5 text-rose-600" />
+                {locale === "fa" ? "تایید حذف گروهی واژگان" : "Confirm Bulk Delete"}
+              </h3>
+              <button onClick={() => setShowBulkDeleteVocabModal(false)} className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-slate-700 leading-relaxed">
+              {locale === "fa"
+                ? `آیا از حذف ${selectedVocabIds.size} واژه انتخاب‌شده اطمینان دارید؟ این عمل غیرقابل بازگشت است.`
+                : `Are you sure you want to delete ${selectedVocabIds.size} selected words? This action cannot be undone.`}
+            </p>
+
+            <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
+              <button
+                type="button"
+                onClick={() => setShowBulkDeleteVocabModal(false)}
+                className="px-4 py-2 border border-slate-200 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-50 cursor-pointer"
+              >
+                {locale === "fa" ? "انصراف" : "Cancel"}
+              </button>
+              <button
+                type="button"
+                onClick={handleBulkDeleteVocabs}
+                className="px-5 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
+              >
+                {locale === "fa" ? "حذف واژگان" : "Delete Words"}
               </button>
             </div>
           </div>

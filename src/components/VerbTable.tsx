@@ -235,7 +235,148 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
   const [enableAiVerbJsonImport, setEnableAiVerbJsonImport] = useState(true);
   const [verbJsonImportError, setVerbJsonImportError] = useState<string | null>(null);
   const [verbJsonImportSuccess, setVerbJsonImportSuccess] = useState<string | null>(null);
+  const [verbJsonImportTags, setVerbJsonImportTags] = useState<string[]>([]);
+  const [verbJsonImportCustomTag, setVerbJsonImportCustomTag] = useState("");
   const verbFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Bulk Selection State for Verbs
+  const [selectedVerbIds, setSelectedVerbIds] = useState<Set<string>>(new Set());
+  const [showBulkDeleteVerbModal, setShowBulkDeleteVerbModal] = useState(false);
+
+  // Helper for adding custom category in Verb JSON import
+  const handleAddCustomCategoryToVerbJsonImport = async () => {
+    const catName = verbJsonImportCustomTag.trim();
+    if (!catName) return;
+
+    let existingCat = allCategories.find(c => c.name.toLowerCase() === catName.toLowerCase() || c.id.toLowerCase() === catName.toLowerCase());
+    let catId = existingCat ? existingCat.id : "";
+
+    if (!existingCat) {
+      catId = `cat_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`;
+      await dbService.saveCategory({
+        id: catId,
+        name: catName
+      });
+      await reloadCategories();
+    }
+
+    if (!verbJsonImportTags.includes(catId)) {
+      setVerbJsonImportTags(prev => [...prev, catId]);
+    }
+    setVerbJsonImportCustomTag("");
+  };
+
+  // Bulk Selection Handlers for Verbs
+  const toggleSelectVerb = (infinitive: string) => {
+    setSelectedVerbIds(prev => {
+      const next = new Set(prev);
+      if (next.has(infinitive)) {
+        next.delete(infinitive);
+      } else {
+        next.add(infinitive);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAllVerbs = (currentPaginatedVerbs: VerbItem[]) => {
+    if (selectedVerbIds.size === currentPaginatedVerbs.length && currentPaginatedVerbs.length > 0) {
+      setSelectedVerbIds(new Set());
+    } else {
+      setSelectedVerbIds(new Set(currentPaginatedVerbs.map(v => v.infinitive)));
+    }
+  };
+
+  const handleBulkDeleteVerbs = async () => {
+    if (selectedVerbIds.size === 0) return;
+    const count = selectedVerbIds.size;
+    for (const inf of Array.from(selectedVerbIds) as string[]) {
+      await dbService.deleteVerb(inf);
+    }
+    setSelectedVerbIds(new Set());
+    setShowBulkDeleteVerbModal(false);
+    await loadVerbsList();
+    setAddVerbToastMessage(locale === "fa" ? `${count} فعل با موفقیت حذف شدند.` : `${count} verbs deleted successfully.`);
+    setTimeout(() => setAddVerbToastMessage(null), 3500);
+  };
+
+  const handleBulkAiEnrichVerbs = async () => {
+    if (selectedVerbIds.size === 0) return;
+    const selectedItems = verbs.filter(v => selectedVerbIds.has(v.infinitive));
+    if (selectedItems.length === 0) return;
+
+    setVerbAiLoading(true);
+    setAddVerbToastMessage(locale === "fa" ? `در حال استخراج و تحلیل صرف‌های کامل ${selectedItems.length} فعل...` : `Enriching ${selectedItems.length} verbs with AI...`);
+
+    try {
+      const CHUNK_SIZE = 5;
+      const BATCH_REQUEST_DELAY_MS = 2000;
+      const delayMs = (ms: number) => new Promise((res) => setTimeout(res, ms));
+
+      let updatedCount = 0;
+
+      for (let i = 0; i < selectedItems.length; i += CHUNK_SIZE) {
+        if (i > 0) await delayMs(BATCH_REQUEST_DELAY_MS);
+        const chunk = selectedItems.slice(i, i + CHUNK_SIZE);
+
+        const res = await fetch("/api/gemini/batch-verb-fill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ items: chunk })
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && Array.isArray(data.items)) {
+            for (const enriched of data.items) {
+              const orig = chunk.find(c => c.infinitive.toLowerCase() === (enriched.infinitive || enriched.word || "").toLowerCase());
+              if (orig) {
+                const cellOverrides: Record<string, string> = { ...orig.cellOverrides };
+
+                if (enriched.conjugations) {
+                  const tensesKeys = [
+                    "PRASENS", "PERFEKT", "PRATERITUM", "KONJUNKTIV2_PRATERITUM",
+                    "FUTUR1", "PLUSQUAMPERFEKT", "KONJUNKTIV1_PRASENS", "FUTUR2", "IMPERATIV"
+                  ];
+                  for (const tKey of tensesKeys) {
+                    const tenseObj = enriched.conjugations[tKey];
+                    if (tenseObj) {
+                      for (const pKey of ["S1", "S2", "S3", "P1", "P2", "P3"]) {
+                        if (tenseObj[pKey]) {
+                          const val = Array.isArray(tenseObj[pKey]) ? tenseObj[pKey].join(", ") : tenseObj[pKey];
+                          if (val) {
+                            cellOverrides[`${tKey}_${pKey}`] = val;
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+
+                await dbService.addVerb({
+                  infinitive: enriched.infinitive || orig.infinitive,
+                  bedeutung: enriched.bedeutung || orig.bedeutung,
+                  hilfsverb: enriched.hilfsverb === "sein" ? "sein" : (orig.hilfsverb || "haben"),
+                  categories: Array.isArray(enriched.categories) && enriched.categories.length > 0 ? enriched.categories : orig.categories,
+                  cellOverrides
+                });
+                updatedCount++;
+              }
+            }
+          }
+        }
+      }
+
+      await loadVerbsList();
+      setSelectedVerbIds(new Set());
+      setAddVerbToastMessage(locale === "fa" ? `تعداد ${updatedCount} فعل با موفقیت غنی‌سازی شدند ✨` : `${updatedCount} verbs enriched with AI ✨`);
+      setTimeout(() => setAddVerbToastMessage(null), 3500);
+    } catch (err: any) {
+      alert("خطا در هوش مصنوعی افعال: " + (err.message || err));
+    } finally {
+      setVerbAiLoading(false);
+    }
+  };
 
   // AI State for Verbs
   const [verbAiLoading, setVerbAiLoading] = useState(false);
@@ -276,10 +417,10 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         setAddVerbToastMessage(locale === "fa" ? "اطلاعات فعل و صرف‌ها با هوش مصنوعی پیدا شدند ✨" : "Verb data fetched with AI ✨");
         setTimeout(() => setAddVerbToastMessage(null), 3500);
       } else {
-        alert(result.error || "خطا در تحلیل فعل با هوش مصنوعی");
+        alert(result.userMessage || result.error || "خطا در تحلیل فعل با هوش مصنوعی");
       }
     } catch (err: any) {
-      alert("خطا: " + err.message);
+      alert("خطا: " + (err.message || err));
     } finally {
       setVerbAiLoading(false);
     }
@@ -352,10 +493,10 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         );
         setTimeout(() => setAddVerbToastMessage(null), 3500);
       } else {
-        alert(result.error || "خطا در هوش مصنوعی");
+        alert(result.userMessage || result.error || "خطا در هوش مصنوعی");
       }
     } catch (err: any) {
-      alert("خطا: " + err.message);
+      alert("خطا: " + (err.message || err));
     } finally {
       setVerbAiLoading(false);
     }
@@ -618,18 +759,42 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
             : "Enriching verb tenses and meanings with AI..."
         );
 
-        try {
-          const aiRes = await fetch("/api/gemini/batch-verb-fill", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ items: itemsArray.slice(0, 30) }) // safety limit 30 items
-          });
-          const aiData = await aiRes.json();
-          if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
-            itemsArray = aiData.items;
+        const enrichedList: any[] = [];
+        const CHUNK_SIZE = 5;
+        const BATCH_REQUEST_DELAY_MS = 2000;
+        const delayMs = (ms: number) => new Promise((res) => setTimeout(res, ms));
+
+        for (let i = 0; i < itemsArray.length; i += CHUNK_SIZE) {
+          if (i > 0) {
+            await delayMs(BATCH_REQUEST_DELAY_MS);
           }
-        } catch (err) {
-          console.error("Batch AI error during verb JSON import:", err);
+          const chunk = itemsArray.slice(i, i + CHUNK_SIZE);
+          try {
+            const aiRes = await fetch("/api/gemini/batch-verb-fill", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ items: chunk })
+            });
+            if (aiRes.ok) {
+              const aiData = await aiRes.json();
+              if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
+                enrichedList.push(...aiData.items);
+                continue;
+              }
+            } else {
+              const errData = await aiRes.json().catch(() => null);
+              if (errData?.userMessage) {
+                console.warn("Batch AI verb chunk warning:", errData.userMessage);
+              }
+            }
+          } catch (err) {
+            console.warn("Batch AI verb chunk error during JSON import, falling back to raw chunk items:", err);
+          }
+          enrichedList.push(...chunk);
+        }
+
+        if (enrichedList.length > 0) {
+          itemsArray = enrichedList;
         }
       }
 
@@ -665,7 +830,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
           infinitive: inf,
           bedeutung: raw.bedeutung || raw.meaning || "",
           hilfsverb: raw.hilfsverb === "sein" ? "sein" : "haben",
-          categories: Array.isArray(raw.categories) ? raw.categories : ["regular"],
+          categories: Array.from(new Set([...(Array.isArray(raw.categories) ? raw.categories : ["regular"]), ...verbJsonImportTags])),
           cellOverrides
         });
         countSuccess++;
@@ -2004,6 +2169,45 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         </div>
       </div>
 
+      {/* Bulk Action Bar for Selected Verbs */}
+      {selectedVerbIds.size > 0 && (
+        <div className="bg-indigo-900 text-white p-3.5 rounded-2xl shadow-xl flex flex-col sm:flex-row items-center justify-between gap-3 border border-indigo-700 font-vazir animate-in fade-in duration-200 my-4 no-print">
+          <div className="flex items-center gap-2 text-xs font-bold">
+            <span className="bg-indigo-600 text-white px-2.5 py-1 rounded-xl font-mono text-sm">
+              {selectedVerbIds.size}
+            </span>
+            <span>{locale === "fa" ? "فعل انتخاب شده است" : "verb(s) selected"}</span>
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={handleBulkAiEnrichVerbs}
+              disabled={verbAiLoading}
+              className="px-3.5 py-1.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50"
+            >
+              <Sparkles className={`w-4 h-4 ${verbAiLoading ? "animate-spin text-amber-300" : ""}`} />
+              <span>{verbAiLoading ? "در حال استخراج..." : "استخراج و تکمیل صرف‌ها با هوش مصنوعی"}</span>
+            </button>
+
+            <button
+              onClick={() => setShowBulkDeleteVerbModal(true)}
+              disabled={verbAiLoading}
+              className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>حذف افعال انتخاب شده</span>
+            </button>
+
+            <button
+              onClick={() => setSelectedVerbIds(new Set())}
+              className="px-3 py-1.5 bg-indigo-800 hover:bg-indigo-700 text-indigo-200 rounded-xl text-xs cursor-pointer"
+            >
+              انصراف
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Container - Conditional Rendering depending on viewMode state */}
       {viewMode === "cards" ? (
         /* COMPACT CARDS VIEW FOR MOBILE viewport */
@@ -2015,8 +2219,9 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
           ) : (
             paginatedVerbs.map((v, verbIdx) => {
               const globalVerbIdx = (currentPage - 1) * ITEMS_PER_PAGE + verbIdx;
+              const isSelected = selectedVerbIds.has(v.infinitive);
               // Alternating color design per verb!
-              const verbBgColorClass = globalVerbIdx % 2 === 0 ? "bg-white border-slate-200" : "bg-indigo-50/10 border-indigo-100";
+              const verbBgColorClass = isSelected ? "bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500" : (globalVerbIdx % 2 === 0 ? "bg-white border-slate-200" : "bg-indigo-50/10 border-indigo-100");
               const titleColorClass = "text-indigo-700";
 
               return (
@@ -2027,8 +2232,14 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                   {/* Verb Header Block */}
                   <div className="flex flex-col gap-3 border-b border-slate-100/80 pb-3">
                     <div className="flex items-center justify-between gap-2 flex-wrap">
-                      {/* Left: Number + Infinitive + Favorite + Edit */}
+                      {/* Left: Checkbox + Number + Infinitive + Favorite + Edit */}
                       <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => toggleSelectVerb(v.infinitive)}
+                          className="w-4 h-4 text-indigo-600 rounded cursor-pointer accent-indigo-600 shrink-0"
+                        />
                         <span className="font-mono text-xs bg-slate-200/80 text-slate-700 px-2 py-0.5 rounded-lg shrink-0">
                           {globalVerbIdx + 1}
                         </span>
@@ -2299,6 +2510,15 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
             <table ref={tableRef} id="verb-conjugation-main-table" dir="ltr" className={`w-full border-collapse text-sm text-slate-600 ${isRtl ? "text-right" : "text-left"}`}>
               <thead>
                 <tr className="bg-slate-900 text-white border-b border-slate-800 text-xs tracking-wider uppercase font-sans">
+                  <th className="py-4 px-3 font-semibold text-center w-10 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 no-print">
+                    <input
+                      type="checkbox"
+                      checked={paginatedVerbs.length > 0 && selectedVerbIds.size === paginatedVerbs.length}
+                      onChange={() => toggleSelectAllVerbs(paginatedVerbs)}
+                      className="w-4 h-4 text-indigo-600 rounded cursor-pointer accent-indigo-600"
+                      title={locale === "fa" ? "انتخاب همه افعال این صفحه" : "Select all verbs on page"}
+                    />
+                  </th>
                   <th className="py-4 px-4 font-semibold text-center w-14 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800">{t.numberCol}</th>
                   <th className="py-4 px-5 font-semibold text-slate-200 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.verbCol}</th>
                   <th className="py-4 px-4 font-semibold font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.auxCol}</th>
@@ -2317,17 +2537,17 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
               <tbody className="divide-y divide-slate-100">
                 {filteredVerbs.length === 0 ? (
                   <tr>
-                    <td colSpan={11} className="py-12 text-center text-slate-400 text-sm italic font-vazir">
+                    <td colSpan={12} className="py-12 text-center text-slate-400 text-sm italic font-vazir">
                       {t.noVerbsFound}
                     </td>
                   </tr>
                 ) : (
                   paginatedVerbs.map((v, verbIdx) => {
                     const globalVerbIdx = (currentPage - 1) * ITEMS_PER_PAGE + verbIdx;
+                    const isSelected = selectedVerbIds.has(v.infinitive);
                     // VERB ALTERNATING COLOR STRATEGY:
                     // Color the entire 8-row block of a verb coherently!
-                    // This visually groups all tenses of the same verb and sets it clearly apart from adjacent verbs.
-                    const verbBgClass = globalVerbIdx % 2 === 0 ? "bg-white" : "bg-indigo-50/10";
+                    const verbBgClass = isSelected ? "bg-indigo-50/70" : (globalVerbIdx % 2 === 0 ? "bg-white" : "bg-indigo-50/10");
 
                     return displayedTenses.map((tense, tenseIdx) => {
                       const conj = v.conjugations[tense] || { S1: [], S2: [], S3: [], P1: [], P2: [], P3: [] };
@@ -2361,6 +2581,21 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                           id={verbIdx === paginatedVerbs.length - 1 && tenseIdx === 0 ? "last-verb-first-row" : undefined}
                           className={`group ${borderClass} transition-colors duration-150 ${verbBgClass} hover:bg-indigo-50/30`}
                         >
+                          {/* Checkbox Column */}
+                          {tenseIdx === 0 && (
+                            <td
+                              rowSpan={displayedTenses.length}
+                              className="py-4 px-2 text-center bg-slate-50/80 border-r border-slate-200/80 align-middle no-print"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => toggleSelectVerb(v.infinitive)}
+                                className="w-4 h-4 text-indigo-600 rounded cursor-pointer accent-indigo-600"
+                              />
+                            </td>
+                          )}
+
                           {/* Grouped Number Column */}
                           {tenseIdx === 0 && (
                             <td
@@ -2880,12 +3115,92 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
             {/* JSON Text Input */}
             <div className="space-y-2">
               <textarea
-                rows={6}
+                rows={5}
                 value={verbJsonInputText}
                 onChange={(e) => setVerbJsonInputText(e.target.value)}
                 placeholder={`[\n  "gehen",\n  "sprechen",\n  "kaufen"\n]`}
                 className="w-full p-3 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 bg-slate-50 dir-ltr text-left"
               />
+            </div>
+
+            {/* Tag / Category Selection for Verb JSON Import */}
+            <div className="space-y-2 bg-purple-50/50 p-3.5 rounded-2xl border border-purple-200">
+              <label className="text-xs font-bold text-purple-900 block font-vazir">
+                افزودن تگ/دسته‌بندی به تمام افعال این فایل JSON (تگ‌گذاری گروهی):
+              </label>
+
+              {/* Active Verb Import Tags */}
+              <div className="flex flex-wrap gap-1.5 min-h-[30px] p-2 bg-white border border-purple-200 rounded-xl">
+                {verbJsonImportTags.length === 0 ? (
+                  <span className="text-xs text-slate-400 font-vazir italic">هیچ تگی برای درون‌ریزی انتخاب نشده است (اختیاری)</span>
+                ) : (
+                  verbJsonImportTags.map(tagId => {
+                    const catObj = allCategories.find(c => c.id === tagId);
+                    const name = catObj ? catObj.name : tagId;
+                    return (
+                      <span
+                        key={tagId}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-bold bg-purple-100 text-purple-800 border border-purple-300 font-vazir"
+                      >
+                        <span>{name}</span>
+                        <button
+                          type="button"
+                          onClick={() => setVerbJsonImportTags(prev => prev.filter(t => t !== tagId))}
+                          className="p-0.5 hover:bg-purple-200 rounded-full cursor-pointer text-purple-700"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Available Category Buttons */}
+              <div className="flex flex-wrap gap-1.5">
+                {allCategories.filter(c => c.id !== "favorites").map((cat) => {
+                  const isChecked = verbJsonImportTags.includes(cat.id);
+                  return (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      onClick={() => {
+                        setVerbJsonImportTags(prev => isChecked ? prev.filter(t => t !== cat.id) : [...prev, cat.id]);
+                      }}
+                      className={`px-2.5 py-1 rounded-xl text-xs font-bold border transition-all cursor-pointer font-vazir ${
+                        isChecked ? "bg-purple-600 text-white border-purple-600 shadow-xs" : "bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200 opacity-70"
+                      }`}
+                    >
+                      {cat.name} {isChecked && "✓"}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Custom Tag Input */}
+              <div className="flex gap-2 pt-0.5">
+                <input
+                  type="text"
+                  value={verbJsonImportCustomTag}
+                  onChange={(e) => setVerbJsonImportCustomTag(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddCustomCategoryToVerbJsonImport();
+                    }
+                  }}
+                  placeholder="افزودن تگ اختصاصی جدید به افعال..."
+                  className="flex-1 px-3 py-1.5 border border-purple-200 rounded-xl text-xs bg-white focus:outline-none focus:ring-2 focus:ring-purple-500 font-vazir"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddCustomCategoryToVerbJsonImport}
+                  className="px-3.5 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl text-xs font-bold flex items-center gap-1 cursor-pointer font-vazir shrink-0"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>افزودن تگ</span>
+                </button>
+              </div>
             </div>
 
             {/* Messages */}
@@ -2916,6 +3231,36 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                 className="px-5 py-2 text-xs font-bold text-white bg-purple-600 hover:bg-purple-700 rounded-xl transition-all shadow-md shadow-purple-100 font-vazir cursor-pointer disabled:opacity-40"
               >
                 {locale === "fa" ? "پردازش و درون‌ریزی افعال" : "Import Verbs"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Delete Confirmation Modal for Verbs */}
+      {showBulkDeleteVerbModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs no-print">
+          <div className="bg-white border border-slate-200/80 rounded-2xl shadow-xl max-w-md w-full p-6">
+            <h3 className={`text-lg font-bold text-slate-900 ${isRtl ? "text-right font-vazir" : "text-left"}`}>
+              {locale === "fa" ? `حذف گروهی ${selectedVerbIds.size} فعل` : `Delete ${selectedVerbIds.size} Verbs`}
+            </h3>
+            <p className={`mt-3 text-sm text-slate-600 leading-relaxed ${isRtl ? "text-right font-vazir" : "text-left"}`}>
+              {locale === "fa"
+                ? `آیا از حذف ${selectedVerbIds.size} فعل انتخاب شده اطمینان دارید؟ این عملیات غیرقابل بازگشت است.`
+                : `Are you sure you want to delete ${selectedVerbIds.size} selected verbs? This action cannot be undone.`}
+            </p>
+            <div className="mt-6 flex gap-3 justify-end">
+              <button
+                onClick={() => setShowBulkDeleteVerbModal(false)}
+                className="px-4 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-all font-vazir cursor-pointer"
+              >
+                {locale === "fa" ? "انصراف" : "Cancel"}
+              </button>
+              <button
+                onClick={handleBulkDeleteVerbs}
+                className="px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded-xl transition-all shadow-sm font-vazir cursor-pointer"
+              >
+                {locale === "fa" ? "حذف گروهی" : "Delete Selected"}
               </button>
             </div>
           </div>

@@ -8,61 +8,283 @@ const PORT = 3000;
 
 app.use(express.json({ limit: "10mb" }));
 
-// Initialize Gemini Client
-const getGeminiClient = () => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+// Initialize and cache ordered Gemini Clients for multi-account fallback
+interface GeminiClientEntry {
+  client: GoogleGenAI;
+  label: string;
+}
+
+// Models scheduled for shutdown on Oct 16, 2026; 2.5 family may show intermittent 404s.
+// gemini-3.6-flash is currently recommended & stable.
+export const GEMINI_FALLBACK_MODELS = [
+  "gemini-3.6-flash",
+  "gemini-2.5-flash",
+  "gemini-3.1-flash-lite",
+];
+
+// In-memory process-lifetime cache of models confirmed retired/unavailable per account (404 / no longer available)
+// Key format: `${accountLabel}:${modelName}`
+const retiredModels = new Set<string>();
+
+interface StructuredGeminiError extends Error {
+  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "unknown";
+  userMessage: string;
+}
+
+function createGeminiError(
+  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "unknown",
+  message: string
+): StructuredGeminiError {
+  let userMessage = "خطایی در برقراری ارتباط با سرویس هوش مصنوعی رخ داد. لطفاً دوباره تلاش کنید.";
+  if (reason === "quota_exhausted") {
+    userMessage = "سقف استفاده از تمامی حساب‌های هوش مصنوعی موقتاً به پایان رسیده است. لطفاً چند دقیقه دیگر دوباره تلاش کنید.";
+  } else if (reason === "model_unavailable") {
+    userMessage = "مدل‌های هوش مصنوعی مورد نظر در حال حاضر در دسترس نیستند. لطفاً بعداً تلاش کنید.";
+  } else if (reason === "auth_error") {
+    userMessage = "خطا در احراز هویت کلیدهای هوش مصنوعی. لطفاً تنظیمات حساب‌ها را بررسی کنید.";
+  }
+
+  const err = new Error(message) as StructuredGeminiError;
+  err.reason = reason;
+  err.userMessage = userMessage;
+  return err;
+}
+
+let cachedGeminiClients: GeminiClientEntry[] | null = null;
+
+function discoverGeminiApiKeys(): { key: string; label: string }[] {
+  const primaryKey = process.env.GEMINI_API_KEY;
+  if (!primaryKey || !primaryKey.trim()) {
     throw new Error("GEMINI_API_KEY is missing from environment variables.");
   }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
-};
 
-// Robust Gemini execution helper with automatic model fallback on rate limit / 429 quota errors
-async function callGeminiWithFallback(
-  ai: GoogleGenAI,
-  params: { contents: string; responseSchema?: any; responseMimeType?: string }
-): Promise<string> {
-  const models = [
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-1.5-flash",
-  ];
-  let lastError: any = null;
+  const entries: { key: string; label: string; num: number }[] = [];
 
-  for (const model of models) {
-    try {
-      const config: any = {
-        responseMimeType: params.responseMimeType || "application/json",
-      };
-      if (params.responseSchema) {
-        config.responseSchema = params.responseSchema;
-      }
+  // Dynamic regex scan for all fallback accounts (e.g. 2th_account_of_gais, 3th_account_of_gais, 5th_account_of_gais)
+  const accountPattern = /^(\d+)th_account_of_gais$/i;
 
-      const response = await ai.models.generateContent({
-        model,
-        contents: params.contents,
-        config,
+  for (const [envVarName, envVarVal] of Object.entries(process.env)) {
+    if (!envVarVal || !envVarVal.trim()) continue;
+    const match = envVarName.match(accountPattern);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      entries.push({
+        key: envVarVal.trim(),
+        label: `account-${num}`,
+        num,
       });
-
-      if (response && response.text) {
-        return response.text;
-      }
-    } catch (err: any) {
-      console.warn(`[Gemini Fallback] Model ${model} failed:`, err.message || err);
-      lastError = err;
-      // Continue loop to try next fallback model (e.g. gemini-2.5-flash, then gemini-2.5-flash-lite)
     }
   }
 
-  throw lastError || new Error("All Gemini models failed to generate content.");
+  // Sort matched fallback accounts ascending by numeric prefix
+  entries.sort((a, b) => a.num - b.num);
+
+  const result: { key: string; label: string }[] = [
+    { key: primaryKey.trim(), label: "primary" },
+    ...entries.map((e) => ({ key: e.key, label: e.label })),
+  ];
+
+  return result;
+}
+
+function getOrderedGeminiClients(): GeminiClientEntry[] {
+  if (cachedGeminiClients) {
+    return cachedGeminiClients;
+  }
+
+  const keyEntries = discoverGeminiApiKeys();
+  cachedGeminiClients = keyEntries.map((entry) => ({
+    client: new GoogleGenAI({
+      apiKey: entry.key,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    }),
+    label: entry.label,
+  }));
+
+  return cachedGeminiClients;
+}
+
+// Robust Gemini execution helper with multi-account failover and automatic model fallback
+function parseCleanJson(text: string): any {
+  let cleaned = text.trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  }
+  return JSON.parse(cleaned);
+}
+
+async function callGeminiWithFallback(params: {
+  contents: string;
+  responseSchema?: any;
+  responseMimeType?: string;
+}): Promise<string> {
+  const clients = getOrderedGeminiClients();
+  let lastError: any = null;
+
+  let encounteredQuota = false;
+  let encounteredModelUnavailable = false;
+  let encounteredAuth = false;
+
+  // Outer loop: Iterate over accounts (Primary -> account-2 -> account-3 -> ...)
+  for (const { client, label } of clients) {
+    let skipAccount = false;
+
+    // Inner loop: Iterate over models for current account
+    for (const model of GEMINI_FALLBACK_MODELS) {
+      if (skipAccount) break;
+
+      // Check if model is already known to be retired/unavailable for this specific account in process cache
+      const accountModelKey = `${label}:${model}`;
+      if (retiredModels.has(accountModelKey)) {
+        console.log(`[Gemini Cache Skip] Model "${model}" is retired/unavailable for account "${label}", skipping.`);
+        continue;
+      }
+
+      try {
+        const config: any = {
+          responseMimeType: params.responseMimeType || "application/json",
+        };
+        if (params.responseSchema) {
+          config.responseSchema = params.responseSchema;
+        }
+
+        const response = await client.models.generateContent({
+          model,
+          contents: params.contents,
+          config,
+        });
+
+        if (response && response.text) {
+          console.log(`[Gemini Success] Account: ${label}, Model: ${model}`);
+          return response.text;
+        }
+      } catch (err: any) {
+        lastError = err;
+        const errStr = (err.message || err.toString() || "").toLowerCase();
+        const errStatus = err.status || err.code || 0;
+
+        // 1. Auth/Key error (401, 403, invalid key) -> skip entire account immediately
+        const isAuthError =
+          errStatus === 401 ||
+          errStatus === 403 ||
+          errStr.includes("401") ||
+          errStr.includes("403") ||
+          errStr.includes("unauthenticated") ||
+          errStr.includes("permission_denied") ||
+          errStr.includes("invalid api key") ||
+          errStr.includes("api_key_invalid");
+
+        if (isAuthError) {
+          encounteredAuth = true;
+          console.warn(
+            `[Gemini Auth Failure] Account "${label}" returned 401/403 unauthorized. Skipping remaining models for this account.`
+          );
+          skipAccount = true;
+          break;
+        }
+
+        // 2. Model Unavailable / Retired / Not Found (HTTP 404, "no longer available", "not found", "deprecated", "retired")
+        const isModelUnavailable =
+          errStatus === 404 ||
+          errStr.includes("404") ||
+          errStr.includes("not_found") ||
+          errStr.includes("not found") ||
+          errStr.includes("no longer available") ||
+          errStr.includes("deprecated") ||
+          errStr.includes("retired");
+
+        if (isModelUnavailable) {
+          encounteredModelUnavailable = true;
+          retiredModels.add(accountModelKey);
+          console.warn(
+            `[Gemini Model Unavailable] Model "${model}" retired/unreachable for account "${label}", added to retired cache and skipping.`
+          );
+          continue; // Try next model for same account
+        }
+
+        // 3. Quota / Rate-limit error (429, RESOURCE_EXHAUSTED, rate limit) -> try next model for same account
+        const isQuotaError =
+          errStatus === 429 ||
+          errStr.includes("429") ||
+          errStr.includes("resource_exhausted") ||
+          errStr.includes("rate limit") ||
+          errStr.includes("quota");
+
+        if (isQuotaError) {
+          encounteredQuota = true;
+          console.warn(
+            `[Gemini Quota Limit] Account "${label}", Model "${model}" hit quota/rate limit: ${err.message || err}`
+          );
+
+          // Check if retryDelay is specified in error details (e.g. "retry in 58.6s" or "retrydelay": "58s")
+          let delaySeconds = 0;
+          const retryMatch =
+            errStr.match(/retry in\s+([\d.]+)\s*s/i) ||
+            errStr.match(/retrydelay['":\s]+([\d.]+)/i);
+          if (retryMatch) {
+            delaySeconds = parseFloat(retryMatch[1]);
+          }
+
+          // If retry delay is short (<= 10 seconds), wait and retry ONCE for the same model/account
+          if (delaySeconds > 0 && delaySeconds <= 10) {
+            console.log(
+              `[Gemini Retry Delay] Short retry delay detected (${delaySeconds}s). Waiting and retrying model "${model}" on account "${label}"...`
+            );
+            await new Promise((r) => setTimeout(r, Math.ceil(delaySeconds * 1000)));
+
+            try {
+              const config: any = {
+                responseMimeType: params.responseMimeType || "application/json",
+              };
+              if (params.responseSchema) {
+                config.responseSchema = params.responseSchema;
+              }
+
+              const retryResponse = await client.models.generateContent({
+                model,
+                contents: params.contents,
+                config,
+              });
+
+              if (retryResponse && retryResponse.text) {
+                console.log(`[Gemini Retry Success] Account: ${label}, Model: ${model}`);
+                return retryResponse.text;
+              }
+            } catch (retryErr: any) {
+              console.warn(
+                `[Gemini Retry Failed] Model "${model}" on account "${label}" still failed after retry delay: ${retryErr.message || retryErr}`
+              );
+            }
+          }
+
+          continue; // Try next model for same account
+        }
+
+        // 4. Non-quota / unknown error (e.g. 400 Bad Request, schema validation bug) -> do not burn other accounts
+        console.error(
+          `[Gemini Non-Quota Error] Account "${label}", Model "${model}" failed: ${err.message || err}`
+        );
+        throw err;
+      }
+    }
+  }
+
+  // Determine primary failure reason across all attempts
+  let primaryReason: "quota_exhausted" | "model_unavailable" | "auth_error" | "unknown" = "unknown";
+  if (encounteredQuota) {
+    primaryReason = "quota_exhausted";
+  } else if (encounteredModelUnavailable) {
+    primaryReason = "model_unavailable";
+  } else if (encounteredAuth) {
+    primaryReason = "auth_error";
+  }
+
+  const finalMsg = lastError?.message || "All Gemini accounts and models failed to generate content.";
+  throw createGeminiError(primaryReason, finalMsg);
 }
 
 // API: Auto-fill Vocabulary Details
@@ -73,7 +295,6 @@ app.post("/api/gemini/vocab-fill", async (req, res) => {
       return res.status(400).json({ error: "German word is required." });
     }
 
-    const ai = getGeminiClient();
     const prompt = `You are a German lexicographer and Persian translation specialist.
 Analyze the following German vocabulary word or phrase: "${word.trim()}".
 Existing user data if any: ${JSON.stringify(currentData || {})}
@@ -90,7 +311,7 @@ CRITICAL RULES:
 - notes: Usage notes in Persian explaining grammatical nuances, collocations, or prepositions.
 `;
 
-    const jsonText = await callGeminiWithFallback(ai, {
+    const jsonText = await callGeminiWithFallback({
       contents: prompt,
       responseSchema: {
         type: Type.OBJECT,
@@ -107,11 +328,20 @@ CRITICAL RULES:
       },
     });
 
-    const data = JSON.parse(jsonText);
+    const data = parseCleanJson(jsonText);
     res.json({ success: true, data });
   } catch (err: any) {
-    console.error("Error in /api/gemini/vocab-fill:", err);
-    res.status(500).json({ error: err.message || "Failed to analyze vocabulary word." });
+    const reason = err.reason || "unknown";
+    if (reason === "unknown") {
+      console.error("[Unknown Gemini Error]", err);
+    }
+    res.status(500).json({
+      success: false,
+      error: err.userMessage || err.message || "Failed to analyze vocabulary word.",
+      userMessage: err.userMessage,
+      reason: reason,
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+    });
   }
 });
 
@@ -123,7 +353,6 @@ app.post("/api/gemini/verb-fill", async (req, res) => {
       return res.status(400).json({ error: "Infinitive verb is required." });
     }
 
-    const ai = getGeminiClient();
     const prompt = `You are a German grammar and verb conjugation expert for Persian speakers.
 Provide complete conjugations and grammatical analysis for the German verb: "${infinitive.trim()}".
 Existing user data: ${JSON.stringify(currentData || {})}
@@ -161,12 +390,21 @@ Return JSON matching this exact structure:
   Each tense MUST have keys S1, S2, S3, P1, P2, P3 with string arrays containing the conjugated form (e.g. S1: ["ich spreche"]).
 `;
 
-    const jsonText = await callGeminiWithFallback(ai, { contents: prompt });
-    const data = JSON.parse(jsonText);
+    const jsonText = await callGeminiWithFallback({ contents: prompt });
+    const data = parseCleanJson(jsonText);
     res.json({ success: true, data });
   } catch (err: any) {
-    console.error("Error in /api/gemini/verb-fill:", err);
-    res.status(500).json({ error: err.message || "Failed to analyze verb." });
+    const reason = err.reason || "unknown";
+    if (reason === "unknown") {
+      console.error("[Unknown Gemini Error]", err);
+    }
+    res.status(500).json({
+      success: false,
+      error: err.userMessage || err.message || "Failed to analyze verb.",
+      userMessage: err.userMessage,
+      reason: reason,
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+    });
   }
 });
 
@@ -178,7 +416,6 @@ app.post("/api/gemini/batch-vocab-fill", async (req, res) => {
       return res.status(400).json({ error: "Array of items is required." });
     }
 
-    const ai = getGeminiClient();
     const prompt = `You are a German lexicographer.
 Fill in any missing or incomplete fields (article, meaning in Persian listing all major meanings, plural, partOfSpeech, German-only example sentence without Persian translation, usage notes in Persian) for each of the following vocabulary items:
 ${JSON.stringify(items, null, 2)}
@@ -194,12 +431,21 @@ Each object must have:
 - notes: Concise usage notes in Persian
 `;
 
-    const jsonText = await callGeminiWithFallback(ai, { contents: prompt });
-    const parsed = JSON.parse(jsonText);
+    const jsonText = await callGeminiWithFallback({ contents: prompt });
+    const parsed = parseCleanJson(jsonText);
     res.json({ success: true, items: parsed.items || [] });
   } catch (err: any) {
-    console.error("Error in /api/gemini/batch-vocab-fill:", err);
-    res.status(500).json({ error: err.message || "Failed to process batch vocabulary." });
+    const reason = err.reason || "unknown";
+    if (reason === "unknown") {
+      console.error("[Unknown Gemini Error]", err);
+    }
+    res.status(500).json({
+      success: false,
+      error: err.userMessage || err.message || "Failed to process batch vocabulary.",
+      userMessage: err.userMessage,
+      reason: reason,
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+    });
   }
 });
 
@@ -211,7 +457,6 @@ app.post("/api/gemini/batch-verb-fill", async (req, res) => {
       return res.status(400).json({ error: "Array of verb items is required." });
     }
 
-    const ai = getGeminiClient();
     const prompt = `You are a German verb conjugation expert.
 Fill in any missing fields (bedeutung in Persian, hilfsverb, prepositions, categories array from ['regular', 'irregular', 'separable', 'reflexive', 'akkusativ', 'dativ'], complete conjugations for ALL persons across PRASENS, PRATERITUM, PERFEKT, KONJUNKTIV2_PRATERITUM, FUTUR1, PLUSQUAMPERFEKT, KONJUNKTIV1_PRASENS, FUTUR2, IMPERATIV) for the following German verbs:
 ${JSON.stringify(items, null, 2)}
@@ -219,12 +464,21 @@ ${JSON.stringify(items, null, 2)}
 Return a JSON object with key "items" containing the completed list of verb items.
 `;
 
-    const jsonText = await callGeminiWithFallback(ai, { contents: prompt });
-    const parsed = JSON.parse(jsonText);
+    const jsonText = await callGeminiWithFallback({ contents: prompt });
+    const parsed = parseCleanJson(jsonText);
     res.json({ success: true, items: parsed.items || [] });
   } catch (err: any) {
-    console.error("Error in /api/gemini/batch-verb-fill:", err);
-    res.status(500).json({ error: err.message || "Failed to process batch verbs." });
+    const reason = err.reason || "unknown";
+    if (reason === "unknown") {
+      console.error("[Unknown Gemini Error]", err);
+    }
+    res.status(500).json({
+      success: false,
+      error: err.userMessage || err.message || "Failed to process batch verbs.",
+      userMessage: err.userMessage,
+      reason: reason,
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+    });
   }
 });
 
@@ -232,7 +486,6 @@ Return a JSON object with key "items" containing the completed list of verb item
 app.post("/api/gemini/synonyms-generate", async (req, res) => {
   try {
     const { mode, topic, currentGroup, existingWords, type } = req.body;
-    const ai = getGeminiClient();
 
     const groupType = type || (currentGroup ? currentGroup.type : "synonym");
 
@@ -290,12 +543,21 @@ Return JSON:
 }`;
     }
 
-    const jsonText = await callGeminiWithFallback(ai, { contents: prompt });
-    const data = JSON.parse(jsonText);
+    const jsonText = await callGeminiWithFallback({ contents: prompt });
+    const data = parseCleanJson(jsonText);
     res.json({ success: true, data });
   } catch (err: any) {
-    console.error("Error in /api/gemini/synonyms-generate:", err);
-    res.status(500).json({ error: err.message || "Failed to generate synonym group." });
+    const reason = err.reason || "unknown";
+    if (reason === "unknown") {
+      console.error("[Unknown Gemini Error]", err);
+    }
+    res.status(500).json({
+      success: false,
+      error: err.userMessage || err.message || "Failed to generate synonym group.",
+      userMessage: err.userMessage,
+      reason: reason,
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+    });
   }
 });
 

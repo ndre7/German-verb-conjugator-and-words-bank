@@ -47,9 +47,11 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
     article?: ArticleType;
     partOfSpeech?: PartOfSpeech;
     meaning?: string;
+    comparative?: string;
+    superlative?: string;
   }>([
-    { word: "", article: "none", partOfSpeech: "noun", meaning: "" },
-    { word: "", article: "none", partOfSpeech: "noun", meaning: "" }
+    { word: "", article: "none", partOfSpeech: "noun", meaning: "", comparative: "", superlative: "" },
+    { word: "", article: "none", partOfSpeech: "noun", meaning: "", comparative: "", superlative: "" }
   ]);
 
   // AI States
@@ -109,8 +111,10 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
           const newItems = d.items.map((it: any) => ({
             word: (it.word || "").replace(/^(der|die|das)\s+/i, "").trim(),
             article: (it.article && ["der", "die", "das", "none"].includes(it.article)) ? it.article : "none",
-            partOfSpeech: it.partOfSpeech || "noun",
-            meaning: it.meaning || ""
+            partOfSpeech: it.partOfSpeech || (formType === "comparative_adjective" ? "adjective" : "noun"),
+            meaning: it.meaning || "",
+            comparative: it.comparative || "",
+            superlative: it.superlative || ""
           }));
           setFormItems(newItems);
         }
@@ -146,8 +150,10 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
         const validItems = (Array.isArray(d.items) ? d.items : []).map((it: any) => ({
           word: (it.word || "").replace(/^(der|die|das)\s+/i, "").trim(),
           article: (it.article && ["der", "die", "das", "none"].includes(it.article)) ? it.article : "none",
-          partOfSpeech: it.partOfSpeech || "noun",
-          meaning: (it.meaning || "").trim()
+          partOfSpeech: it.partOfSpeech || (aiTypeInput === "comparative_adjective" ? "adjective" : "noun"),
+          meaning: (it.meaning || "").trim(),
+          comparative: (it.comparative || "").trim(),
+          superlative: (it.superlative || "").trim()
         })).filter((it: any) => it.word.length > 0);
 
         const newGrp: SynonymAntonymGroup = {
@@ -181,8 +187,8 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
     setFormType(type);
     setFormNotes("");
     setFormItems([
-      { word: "", article: "none", partOfSpeech: "noun", meaning: "" },
-      { word: "", article: "none", partOfSpeech: "noun", meaning: "" }
+      { word: "", article: "none", partOfSpeech: type === "comparative_adjective" ? "adjective" : "noun", meaning: "", comparative: "", superlative: "" },
+      { word: "", article: "none", partOfSpeech: type === "comparative_adjective" ? "adjective" : "noun", meaning: "", comparative: "", superlative: "" }
     ]);
     setShowModal(true);
   };
@@ -197,19 +203,21 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
         ? group.items.map(i => ({
             word: i.word.replace(/^(der|die|das)\s+/i, "").trim(),
             article: i.article || "none",
-            partOfSpeech: i.partOfSpeech || "noun",
-            meaning: i.meaning || ""
+            partOfSpeech: i.partOfSpeech || (group.type === "comparative_adjective" ? "adjective" : "noun"),
+            meaning: i.meaning || "",
+            comparative: i.comparative || "",
+            superlative: i.superlative || ""
           }))
         : [
-            { word: "", article: "none", partOfSpeech: "noun", meaning: "" },
-            { word: "", article: "none", partOfSpeech: "noun", meaning: "" }
+            { word: "", article: "none", partOfSpeech: group.type === "comparative_adjective" ? "adjective" : "noun", meaning: "", comparative: "", superlative: "" },
+            { word: "", article: "none", partOfSpeech: group.type === "comparative_adjective" ? "adjective" : "noun", meaning: "", comparative: "", superlative: "" }
           ]
     );
     setShowModal(true);
   };
 
   const handleAddItemRow = () => {
-    setFormItems(prev => [...prev, { word: "", article: "none", partOfSpeech: "noun", meaning: "" }]);
+    setFormItems(prev => [...prev, { word: "", article: "none", partOfSpeech: formType === "comparative_adjective" ? "adjective" : "noun", meaning: "", comparative: "", superlative: "" }]);
   };
 
   const handleRemoveItemRow = (index: number) => {
@@ -222,7 +230,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
 
   const handleItemChange = (
     index: number,
-    field: "word" | "article" | "partOfSpeech" | "meaning",
+    field: "word" | "article" | "partOfSpeech" | "meaning" | "comparative" | "superlative",
     value: string
   ) => {
     setFormItems(prev => {
@@ -242,8 +250,10 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
       .map(i => ({
         word: i.word.replace(/^(der|die|das)\s+/i, "").trim(),
         article: i.article || "none",
-        partOfSpeech: i.partOfSpeech || "noun",
-        meaning: i.meaning ? i.meaning.trim() : ""
+        partOfSpeech: i.partOfSpeech || (formType === "comparative_adjective" ? "adjective" : "noun"),
+        meaning: i.meaning ? i.meaning.trim() : "",
+        comparative: i.comparative ? i.comparative.trim() : "",
+        superlative: i.superlative ? i.superlative.trim() : ""
       }));
 
     if (validItems.length < 1) {
@@ -413,6 +423,13 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
             {locale === "fa" ? "اصطلاحات" : "Idioms"}
           </span>
         );
+      case "comparative_adjective":
+        return (
+          <span className="px-2.5 py-0.5 rounded-lg text-xs font-bold font-vazir bg-emerald-100 text-emerald-800 border border-emerald-300 shrink-0 flex items-center gap-1">
+            <Sparkles className="w-3 h-3 text-emerald-600" />
+            {locale === "fa" ? "صفات مقایسه‌ای" : "Comparative"}
+          </span>
+        );
     }
   };
 
@@ -424,7 +441,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
       const matchTitle = g.title.toLowerCase().includes(q);
       const matchNotes = (g.notes || "").toLowerCase().includes(q);
       const matchItem = g.items.some(
-        i => i.word.toLowerCase().includes(q) || (i.meaning || "").toLowerCase().includes(q)
+        i => i.word.toLowerCase().includes(q) || (i.meaning || "").toLowerCase().includes(q) || (i.comparative || "").toLowerCase().includes(q) || (i.superlative || "").toLowerCase().includes(q)
       );
       return matchTitle || matchNotes || matchItem;
     }
@@ -436,6 +453,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
   const wordFamilyCount = groups.filter(g => g.type === "word_family").length;
   const semanticFieldCount = groups.filter(g => g.type === "semantic_field").length;
   const idiomCount = groups.filter(g => g.type === "idiom").length;
+  const comparativeCount = groups.filter(g => g.type === "comparative_adjective").length;
 
   return (
     <div className={`space-y-6 ${isRtl ? "text-right" : "text-left"}`}>
@@ -459,12 +477,12 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
             </div>
             <div>
               <h2 className="text-lg sm:text-xl font-bold text-slate-900 font-vazir">
-                {locale === "fa" ? "شبکه‌های واژگانی (مترادف، متضاد، هم‌خانواده، میدان معنایی، اصطلاحات)" : "German Vocab Networks & Idioms"}
+                {locale === "fa" ? "شبکه‌های واژگانی (مترادف، متضاد، هم‌خانواده، میدان معنایی، اصطلاحات، صفات مقایسه‌ای)" : "German Vocab Networks & Comparative Adjectives"}
               </h2>
               <p className="text-xs text-slate-500 font-vazir">
                 {locale === "fa"
-                  ? "سازماندهی ارتباطات کلمات: مترادف‌ها، متضادها، کلمات هم‌خانواده، میدان معنایی مشترک و اصطلاحات کاربردی با توجه به موقعیت"
-                  : "Organize vocabulary networks: Synonyms, Antonyms, Word Families, Semantic Fields & Contextual Idioms"}
+                  ? "سازماندهی ارتباطات کلمات: مترادف‌ها، متضادها، کلمات هم‌خانواده، میدان معنایی مشترک، اصطلاحات کاربردی و صفات مقایسه‌ای (پایه، برتر، برترین)"
+                  : "Organize vocabulary networks: Synonyms, Antonyms, Word Families, Semantic Fields, Idioms & Comparative Adjectives"}
               </p>
             </div>
           </div>
@@ -511,6 +529,13 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
             >
               <MessageSquare className="w-3.5 h-3.5" />
               {locale === "fa" ? "+ اصطلاحات" : "+ Idioms"}
+            </button>
+            <button
+              onClick={() => handleOpenAddModal("comparative_adjective")}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded-xl text-xs font-semibold transition-all shadow-xs flex items-center gap-1 font-vazir cursor-pointer"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              {locale === "fa" ? "+ صفات مقایسه‌ای" : "+ Comparative"}
             </button>
           </div>
         </div>
@@ -565,6 +590,14 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
               }`}
             >
               {locale === "fa" ? `اصطلاحات (${idiomCount})` : `Idioms (${idiomCount})`}
+            </button>
+            <button
+              onClick={() => setTypeFilter("comparative_adjective")}
+              className={`px-3 py-1.5 rounded-xl border font-bold transition-colors cursor-pointer ${
+                typeFilter === "comparative_adjective" ? "bg-emerald-600 text-white border-emerald-600" : "bg-emerald-50 text-emerald-700 border-emerald-200"
+              }`}
+            >
+              {locale === "fa" ? `صفات مقایسه‌ای (${comparativeCount})` : `Comparative (${comparativeCount})`}
             </button>
           </div>
 
@@ -645,39 +678,76 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                   )}
 
                   {/* Words List with Article & PartOfSpeech Badges + Add to Bank Button */}
-                  <div className="space-y-2 pt-1">
-                    {group.items.map((item, idx) => (
-                      <div
-                        key={idx}
-                        className="flex items-center justify-between p-2.5 rounded-2xl border border-slate-100 bg-slate-50/50 text-xs gap-2"
-                      >
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-mono text-slate-400 text-[11px]">{idx + 1}.</span>
-                          {renderArticleBadge(item.article)}
-                          <span className="font-extrabold text-slate-900 text-sm font-sans">
-                            {item.word}
-                          </span>
-                          {renderPartOfSpeechBadge(item.partOfSpeech)}
-                        </div>
-
-                        <div className="flex items-center gap-2">
-                          {item.meaning && (
-                            <span className="text-slate-700 font-bold font-vazir text-xs">
-                              {item.meaning}
-                            </span>
-                          )}
-                          <button
-                            onClick={() => handleAddToVocabBank(item)}
-                            title={locale === "fa" ? "افزودن مستقیم به بانک اصلی واژگان" : "Add to main Vocab Bank"}
-                            className="p-1.5 text-indigo-600 hover:bg-indigo-50 border border-indigo-200 rounded-lg transition-colors cursor-pointer shrink-0 flex items-center gap-1 font-vazir text-[11px]"
-                          >
-                            <BookmarkPlus className="w-3.5 h-3.5" />
-                            <span className="hidden sm:inline">+ بانک</span>
-                          </button>
-                        </div>
+                  {group.type === "comparative_adjective" ? (
+                    <div className="space-y-2 pt-1">
+                      <div className="grid grid-cols-12 gap-2 text-[11px] font-bold text-slate-500 font-vazir px-2 pb-1 border-b border-slate-100">
+                        <span className="col-span-3">صفت پایه (Positiv)</span>
+                        <span className="col-span-3">معنی</span>
+                        <span className="col-span-3">برتر (Komparativ)</span>
+                        <span className="col-span-3">برترین (Superlativ)</span>
                       </div>
-                    ))}
-                  </div>
+                      {group.items.map((item, idx) => (
+                        <div
+                          key={idx}
+                          className="grid grid-cols-12 items-center p-2 rounded-2xl border border-emerald-100 bg-emerald-50/40 text-xs gap-1"
+                        >
+                          <div className="col-span-3 font-extrabold text-slate-900 font-sans truncate" title={item.word}>
+                            {idx + 1}. {item.word}
+                          </div>
+                          <div className="col-span-3 text-slate-700 font-vazir truncate" title={item.meaning}>
+                            {item.meaning || "—"}
+                          </div>
+                          <div className="col-span-3 font-bold text-purple-700 font-sans truncate" title={item.comparative}>
+                            {item.comparative || "—"}
+                          </div>
+                          <div className="col-span-3 font-bold text-indigo-700 font-sans truncate flex items-center justify-between gap-1" title={item.superlative}>
+                            <span className="truncate">{item.superlative || "—"}</span>
+                            <button
+                              onClick={() => handleAddToVocabBank(item)}
+                              title={locale === "fa" ? "افزودن مستقیم به بانک اصلی واژگان" : "Add to main Vocab Bank"}
+                              className="p-1 text-emerald-700 hover:bg-emerald-100 rounded-lg transition-colors cursor-pointer shrink-0"
+                            >
+                              <BookmarkPlus className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="space-y-2 pt-1">
+                      {group.items.map((item, idx) => (
+                        <div
+                          key={idx}
+                          className="flex items-center justify-between p-2.5 rounded-2xl border border-slate-100 bg-slate-50/50 text-xs gap-2"
+                        >
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-mono text-slate-400 text-[11px]">{idx + 1}.</span>
+                            {renderArticleBadge(item.article)}
+                            <span className="font-extrabold text-slate-900 text-sm font-sans">
+                              {item.word}
+                            </span>
+                            {renderPartOfSpeechBadge(item.partOfSpeech)}
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            {item.meaning && (
+                              <span className="text-slate-700 font-bold font-vazir text-xs">
+                                {item.meaning}
+                              </span>
+                            )}
+                            <button
+                              onClick={() => handleAddToVocabBank(item)}
+                              title={locale === "fa" ? "افزودن مستقیم به بانک اصلی واژگان" : "Add to main Vocab Bank"}
+                              className="p-1.5 text-indigo-600 hover:bg-indigo-50 border border-indigo-200 rounded-lg transition-colors cursor-pointer shrink-0 flex items-center gap-1 font-vazir text-[11px]"
+                            >
+                              <BookmarkPlus className="w-3.5 h-3.5" />
+                              <span className="hidden sm:inline">+ بانک</span>
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 <div className="pt-2 border-t border-slate-100 text-[11px] text-slate-400 font-vazir flex justify-between items-center">
@@ -713,7 +783,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
               <div className="bg-purple-50 border border-purple-200 p-3 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-2">
                 <div className="flex items-center gap-2 text-xs font-bold text-purple-900 font-vazir">
                   <Sparkles className="w-4 h-4 text-purple-600 shrink-0" />
-                  <span>تکمیل آرتیکل‌ها، نوع واژگان، ترجمه‌ها و نکات با AI</span>
+                  <span>تکمیل آرتیکل‌ها، نوع واژگان، صفات مقایسه‌ای، ترجمه‌ها و نکات با AI</span>
                 </div>
                 <button
                   type="button"
@@ -726,8 +796,8 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                 </button>
               </div>
 
-              {/* Type Switcher (5 Options) */}
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 text-xs font-bold font-vazir">
+              {/* Type Switcher (6 Options) */}
+              <div className="grid grid-cols-2 sm:grid-cols-6 gap-1.5 text-xs font-bold font-vazir">
                 <button
                   type="button"
                   onClick={() => setFormType("synonym")}
@@ -783,6 +853,17 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                 >
                   اصطلاحات
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setFormType("comparative_adjective")}
+                  className={`py-2 px-1 rounded-xl border text-center transition-all cursor-pointer ${
+                    formType === "comparative_adjective"
+                      ? "bg-emerald-600 text-white border-emerald-600 shadow-xs"
+                      : "bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100"
+                  }`}
+                >
+                  صفات مقایسه‌ای
+                </button>
               </div>
 
               {/* Title */}
@@ -802,6 +883,8 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                       ? "مثلاً: میدان معنایی زمان (ساعت، روز، سال)"
                       : formType === "idiom"
                       ? "مثلاً: اصطلاحات احوالپرسی و تشکر در خرید"
+                      : formType === "comparative_adjective"
+                      ? "مثلاً: صفات توصیفی، صفات کیفیت و حالت"
                       : "مثلاً: مترادف‌های زیبایی، متضادهای دما..."
                   }
                   className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 bg-slate-50 font-vazir"
@@ -830,31 +913,41 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                       <div className="flex items-center gap-2">
                         <span className="text-xs font-mono font-bold text-slate-400 w-5 text-center shrink-0">{idx + 1}.</span>
 
-                        {/* Article Dropdown */}
-                        <select
-                          value={item.article || "none"}
-                          onChange={(e) => handleItemChange(idx, "article", e.target.value)}
-                          className="py-1 px-2 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-purple-500 cursor-pointer shrink-0"
-                        >
-                          <option value="none">– آرتیکل –</option>
-                          <option value="der">der</option>
-                          <option value="die">die</option>
-                          <option value="das">das</option>
-                        </select>
+                        {formType !== "comparative_adjective" && (
+                          <>
+                            {/* Article Dropdown */}
+                            <select
+                              value={item.article || "none"}
+                              onChange={(e) => handleItemChange(idx, "article", e.target.value)}
+                              className="py-1 px-2 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-purple-500 cursor-pointer shrink-0"
+                            >
+                              <option value="none">– آرتیکل –</option>
+                              <option value="der">der</option>
+                              <option value="die">die</option>
+                              <option value="das">das</option>
+                            </select>
 
-                        {/* Part of Speech Dropdown */}
-                        <select
-                          value={item.partOfSpeech || "noun"}
-                          onChange={(e) => handleItemChange(idx, "partOfSpeech", e.target.value)}
-                          className="py-1 px-2 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-purple-500 cursor-pointer shrink-0"
-                        >
-                          <option value="noun">اسم</option>
-                          <option value="verb_phrase">فعل</option>
-                          <option value="adjective">صفت</option>
-                          <option value="adverb">قید</option>
-                          <option value="preposition">حرف اضافه</option>
-                          <option value="expression">اصطلاح</option>
-                        </select>
+                            {/* Part of Speech Dropdown */}
+                            <select
+                              value={item.partOfSpeech || "noun"}
+                              onChange={(e) => handleItemChange(idx, "partOfSpeech", e.target.value)}
+                              className="py-1 px-2 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-purple-500 cursor-pointer shrink-0"
+                            >
+                              <option value="noun">اسم</option>
+                              <option value="verb_phrase">فعل</option>
+                              <option value="adjective">صفت</option>
+                              <option value="adverb">قید</option>
+                              <option value="preposition">حرف اضافه</option>
+                              <option value="expression">اصطلاح</option>
+                            </select>
+                          </>
+                        )}
+
+                        {formType === "comparative_adjective" && (
+                          <span className="text-xs font-bold text-emerald-700 bg-emerald-100 px-2.5 py-0.5 rounded-lg border border-emerald-200 font-vazir">
+                            صفت مقایسه‌ای (Adjektiv)
+                          </span>
+                        )}
 
                         {/* Remove Row Button */}
                         <button
@@ -867,22 +960,67 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                         </button>
                       </div>
 
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        <input
-                          type="text"
-                          value={item.word}
-                          onChange={(e) => handleItemChange(idx, "word", e.target.value)}
-                          placeholder="واژه آلمانی (مثلاً: schön)"
-                          className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-sans focus:outline-none focus:ring-2 focus:ring-purple-500"
-                        />
-                        <input
-                          type="text"
-                          value={item.meaning || ""}
-                          onChange={(e) => handleItemChange(idx, "meaning", e.target.value)}
-                          placeholder="معنی فارسی (مثلاً: زیبا)"
-                          className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-vazir focus:outline-none focus:ring-2 focus:ring-purple-500"
-                        />
-                      </div>
+                      {formType === "comparative_adjective" ? (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <div>
+                            <label className="text-[10px] font-bold text-slate-500 font-vazir block mb-0.5">صفت در حالت پایه (Positiv)</label>
+                            <input
+                              type="text"
+                              value={item.word}
+                              onChange={(e) => handleItemChange(idx, "word", e.target.value)}
+                              placeholder="مثلاً: schön, gut, alt"
+                              className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-sans focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[10px] font-bold text-slate-500 font-vazir block mb-0.5">معنی صفت</label>
+                            <input
+                              type="text"
+                              value={item.meaning || ""}
+                              onChange={(e) => handleItemChange(idx, "meaning", e.target.value)}
+                              placeholder="مثلاً: زیبا"
+                              className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-vazir focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[10px] font-bold text-slate-500 font-vazir block mb-0.5">حالت برتر (Komparativ)</label>
+                            <input
+                              type="text"
+                              value={item.comparative || ""}
+                              onChange={(e) => handleItemChange(idx, "comparative", e.target.value)}
+                              placeholder="مثلاً: schöner"
+                              className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-sans focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[10px] font-bold text-slate-500 font-vazir block mb-0.5">حالت برترین (Superlativ)</label>
+                            <input
+                              type="text"
+                              value={item.superlative || ""}
+                              onChange={(e) => handleItemChange(idx, "superlative", e.target.value)}
+                              placeholder="مثلاً: am schönsten"
+                              className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-sans focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <input
+                            type="text"
+                            value={item.word}
+                            onChange={(e) => handleItemChange(idx, "word", e.target.value)}
+                            placeholder="واژه آلمانی (مثلاً: schön)"
+                            className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-sans focus:outline-none focus:ring-2 focus:ring-purple-500"
+                          />
+                          <input
+                            type="text"
+                            value={item.meaning || ""}
+                            onChange={(e) => handleItemChange(idx, "meaning", e.target.value)}
+                            placeholder="معنی فارسی (مثلاً: زیبا)"
+                            className="w-full py-1.5 px-3 bg-white border border-slate-200 rounded-xl text-xs font-vazir focus:outline-none focus:ring-2 focus:ring-purple-500"
+                          />
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -984,11 +1122,20 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
                   <button
                     type="button"
                     onClick={() => setAiTypeInput("idiom")}
-                    className={`py-2 rounded-xl border text-center font-bold col-span-2 cursor-pointer ${
+                    className={`py-2 rounded-xl border text-center font-bold cursor-pointer ${
                       aiTypeInput === "idiom" ? "bg-rose-600 text-white border-rose-600" : "bg-slate-50 text-slate-700 border-slate-200"
                     }`}
                   >
-                    اصطلاحات و تعابیر کاربردی (Redewendungen)
+                    اصطلاحات (Redewendungen)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAiTypeInput("comparative_adjective")}
+                    className={`py-2 rounded-xl border text-center font-bold cursor-pointer ${
+                      aiTypeInput === "comparative_adjective" ? "bg-emerald-600 text-white border-emerald-600" : "bg-slate-50 text-slate-700 border-slate-200"
+                    }`}
+                  >
+                    صفات مقایسه‌ای (Komparation)
                   </button>
                 </div>
               </div>

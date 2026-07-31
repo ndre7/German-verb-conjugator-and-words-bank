@@ -132,7 +132,7 @@ export interface VocabularyCategory {
   color?: string;
 }
 
-export type SynonymAntonymType = "synonym" | "antonym" | "word_family" | "semantic_field" | "idiom";
+export type SynonymAntonymType = "synonym" | "antonym" | "word_family" | "semantic_field" | "idiom" | "comparative_adjective";
 
 export interface SynonymAntonymGroup {
   id: string;
@@ -143,6 +143,8 @@ export interface SynonymAntonymGroup {
     article?: ArticleType;
     meaning?: string;
     partOfSpeech?: PartOfSpeech;
+    comparative?: string;
+    superlative?: string;
   }[];
   notes?: string;
   createdAt: number;

@@ -287,6 +287,30 @@ async function callGeminiWithFallback(params: {
   throw createGeminiError(primaryReason, finalMsg);
 }
 
+// Helper function to strip German pronouns from conjugation output strings
+function cleanConjugationPronouns(obj: any): any {
+  if (!obj || typeof obj !== "object") return obj;
+  const PRONOUN_REGEX = /^(ich|du|er\/sie\/es|er\/es\/sie|er|sie|es|wir|ihr|sie\/Sie|Sie)\s+/i;
+
+  if (obj.conjugations && typeof obj.conjugations === "object") {
+    for (const tenseKey of Object.keys(obj.conjugations)) {
+      const tense = obj.conjugations[tenseKey];
+      if (tense && typeof tense === "object") {
+        for (const pKey of Object.keys(tense)) {
+          if (Array.isArray(tense[pKey])) {
+            tense[pKey] = tense[pKey].map((val: any) =>
+              typeof val === "string" ? val.replace(PRONOUN_REGEX, "").trim() : val
+            );
+          } else if (typeof tense[pKey] === "string") {
+            tense[pKey] = tense[pKey].replace(PRONOUN_REGEX, "").trim();
+          }
+        }
+      }
+    }
+  }
+  return obj;
+}
+
 // API: Auto-fill Vocabulary Details
 app.post("/api/gemini/vocab-fill", async (req, res) => {
   try {
@@ -359,7 +383,8 @@ Existing user data: ${JSON.stringify(currentData || {})}
 
 CRITICAL RULES:
 1. SPELL CORRECTION & CANONICAL VERB: If the user's input verb contains a spelling mistake or typo (e.g. 'sprechne' instead of 'sprechen', 'gehn' instead of 'gehen', 'kaufn' instead of 'kaufen'), identify the closest correct German infinitive verb and set the 'infinitive' field in JSON to that CORRECT German infinitive verb!
-2. CATEGORIES & CASE GOVERNANCE TAGS: Automatically assign ALL matching category IDs from:
+2. NO PRONOUNS IN CONJUGATIONS: DO NOT INCLUDE ANY SUBJECT PRONOUNS (ich, du, er, sie, es, wir, ihr, Sie) IN THE CONJUGATIONS OUTPUT. Return ONLY the conjugated verb form string (e.g. S1: ["spreche"], NOT ["ich spreche"]; S2: ["hast geaalt"], NOT ["du hast geaalt"]).
+3. CATEGORIES & CASE GOVERNANCE TAGS: Automatically assign ALL matching category IDs from:
    - 'regular' (با‌قاعده)
    - 'irregular' (بی‌قاعده)
    - 'separable' (جداشدنی)
@@ -367,16 +392,16 @@ CRITICAL RULES:
    - 'akkusativ' (فعل آکوزاتیو ساز / نیازمند مفعول مستقیم Akkusativ)
    - 'dativ' (فعل داتیو ساز / نیازمند مفعول غیرمستقیم Dativ)
    Determine whether this verb takes Akkusativ, Dativ, or both (e.g. 'helfen' -> ['dativ'], 'kaufen' -> ['akkusativ', 'dativ'], 'sehen' -> ['akkusativ']) and include 'akkusativ' and/or 'dativ' in the 'categories' array!
-3. Provide full, non-truncated conjugations for ALL 6 persons (S1=ich, S2=du, S3=er/sie/es, P1=wir, P2=ihr, P3=sie/Sie) for ALL 9 TENSES:
+4. Provide full, non-truncated conjugations for ALL 6 persons (S1, S2, S3, P1, P2, P3) for ALL 9 TENSES:
    - PRASENS (زمان حال)
    - PERFEKT (گذشته نقلی / ماضی نقلی)
    - PRATERITUM (گذشته ساده / ماضی استمراری)
-   - KONJUNKTIV2_PRATERITUM (التزامی / شرطی نوع ۲ - e.g., ich spräche, du sprächest...)
+   - KONJUNKTIV2_PRATERITUM (التزامی / شرطی نوع ۲ - e.g., spräche, sprächest...)
    - FUTUR1 (آینده ۱)
    - PLUSQUAMPERFEKT (ماضی بعید)
-   - KONJUNKTIV1_PRASENS (التزامی ۱ / نقل قول - e.g., ich spreche, du sprechest...)
+   - KONJUNKTIV1_PRASENS (التزامی ۱ / نقل قول)
    - FUTUR2 (آینده کامل)
-   - IMPERATIV (امر - S2: du, P1: wir, P2: ihr, P3: Sie)
+   - IMPERATIV (امر)
 
 Return JSON matching this exact structure:
 - infinitive: Clean, correct German infinitive verb (e.g. "sprechen")
@@ -387,11 +412,12 @@ Return JSON matching this exact structure:
 - notes: Usage tips or grammatical nuances in Persian.
 - categories: Array of matching category IDs from ["regular", "irregular", "separable", "reflexive", "akkusativ", "dativ", "favorites"]
 - conjugations: Object containing ALL 9 tenses keys: PRASENS, PERFEKT, PRATERITUM, KONJUNKTIV2_PRATERITUM, FUTUR1, PLUSQUAMPERFEKT, KONJUNKTIV1_PRASENS, FUTUR2, IMPERATIV.
-  Each tense MUST have keys S1, S2, S3, P1, P2, P3 with string arrays containing the conjugated form (e.g. S1: ["ich spreche"]).
+  Each tense MUST have keys S1, S2, S3, P1, P2, P3 with string arrays containing ONLY the conjugated verb form WITHOUT PRONOUN (e.g. S1: ["spreche"]).
 `;
 
     const jsonText = await callGeminiWithFallback({ contents: prompt });
-    const data = parseCleanJson(jsonText);
+    let data = parseCleanJson(jsonText);
+    data = cleanConjugationPronouns(data);
     res.json({ success: true, data });
   } catch (err: any) {
     const reason = err.reason || "unknown";
@@ -458,14 +484,18 @@ app.post("/api/gemini/batch-verb-fill", async (req, res) => {
     }
 
     const prompt = `You are a German verb conjugation expert.
-Fill in any missing fields (bedeutung in Persian, hilfsverb, prepositions, categories array from ['regular', 'irregular', 'separable', 'reflexive', 'akkusativ', 'dativ'], complete conjugations for ALL persons across PRASENS, PRATERITUM, PERFEKT, KONJUNKTIV2_PRATERITUM, FUTUR1, PLUSQUAMPERFEKT, KONJUNKTIV1_PRASENS, FUTUR2, IMPERATIV) for the following German verbs:
+Fill in any missing fields (bedeutung in Persian, hilfsverb, prepositions, categories array from ['regular', 'irregular', 'separable', 'reflexive', 'akkusativ', 'dativ'], complete conjugations for ALL persons across PRASENS, PRATERITUM, PERFEKT, KONJUNKTIV2_PRATERITUM, FUTUR1, PLUSQUAMPERFEKT, KONJUNKTIV1_PRASENS, FUTUR2, IMPERATIV) for the following German verbs.
+CRITICAL: DO NOT INCLUDE SUBJECT PRONOUNS (ich, du, er, sie, es, wir, ihr, Sie) IN THE CONJUGATION VALUES! Return ONLY the conjugated verb forms.
 ${JSON.stringify(items, null, 2)}
 
 Return a JSON object with key "items" containing the completed list of verb items.
 `;
 
     const jsonText = await callGeminiWithFallback({ contents: prompt });
-    const parsed = parseCleanJson(jsonText);
+    let parsed = parseCleanJson(jsonText);
+    if (Array.isArray(parsed.items)) {
+      parsed.items = parsed.items.map((vItem: any) => cleanConjugationPronouns(vItem));
+    }
     res.json({ success: true, items: parsed.items || [] });
   } catch (err: any) {
     const reason = err.reason || "unknown";
@@ -482,7 +512,7 @@ Return a JSON object with key "items" containing the completed list of verb item
   }
 });
 
-// API: Generate or Complete Synonym / Antonym / Word Family / Semantic Field Groups
+// API: Generate or Complete Synonym / Antonym / Word Family / Semantic Field / Comparative Adjective Groups
 app.post("/api/gemini/synonyms-generate", async (req, res) => {
   try {
     const { mode, topic, currentGroup, existingWords, type } = req.body;
@@ -500,11 +530,39 @@ app.post("/api/gemini/synonyms-generate", async (req, res) => {
       groupDescription = "German Semantic Field / Word Field (میدان معنایی / Wortfeld - words sharing a common conceptual area e.g. time domain: Uhr, Tag, Monat, Jahr, Minute)";
     } else if (groupType === "idiom") {
       groupDescription = "German Idioms / Expressions (اصطلاحات و تعابیر کاربردی / Redewendungen - real-life expressions used in specific contexts e.g. greetings, shopping, express agreement/disagreement)";
+    } else if (groupType === "comparative_adjective") {
+      groupDescription = "German Comparative Adjectives (صفات مقایسه‌ای - Adjectives with Base form (Positiv), Persian Meaning, Comparative form (Komparativ), and Superlative form (Superlativ) e.g. schön -> schöner, am schönsten; gut -> besser, am besten)";
     }
 
     let prompt = "";
     if (mode === "complete_group" && currentGroup) {
-      prompt = `You are a German vocabulary expert.
+      if (groupType === "comparative_adjective") {
+        prompt = `You are a German grammar and vocabulary expert.
+Complete and expand this Comparative Adjectives group titled "${currentGroup.title}":
+Current items: ${JSON.stringify(currentGroup.items || [])}
+Current notes: "${currentGroup.notes || ""}"
+
+CRITICAL INSTRUCTIONS FOR COMPARATIVE ADJECTIVES:
+1. For every item/adjective:
+   - "word": Base form of adjective (صفت در حالت پایه - Positiv e.g. "schön", "gut", "groß", "schnell")
+   - "meaning": Persian translation (e.g. "زیبا", "خوب", "بزرگ", "سریع")
+   - "comparative": Comparative form (حالت برتر - Komparativ e.g. "schöner", "besser", "größer", "schneller")
+   - "superlative": Superlative form (حالت برترین - Superlativ e.g. "am schönsten", "am besten", "am größten", "am schnellsten")
+2. If the user provided items with only base words ("word"), fill in the "meaning", "comparative", and "superlative" for EACH item!
+3. Add any missing common adjectives if appropriate to complete the group.
+4. "notes": 2-3 concise bullet points in Persian about irregular comparative rules or usage.
+
+Return JSON:
+{
+  "title": "${currentGroup.title}",
+  "type": "comparative_adjective",
+  "items": [
+    { "word": "base adjective", "meaning": "Persian translation", "comparative": "Komparativ form", "superlative": "Superlativ form" }
+  ],
+  "notes": "• نکته اول\\n• نکته دوم"
+}`;
+      } else {
+        prompt = `You are a German vocabulary expert.
 Complete and expand this existing ${groupType} group (${groupDescription}) titled "${currentGroup.title}":
 Current items: ${JSON.stringify(currentGroup.items || [])}
 Current notes: "${currentGroup.notes || ""}"
@@ -522,8 +580,34 @@ Return JSON:
   ],
   "notes": "• نکته اول\\n• نکته دوم"
 }`;
+      }
     } else {
-      prompt = `You are a German vocabulary expert.
+      if (groupType === "comparative_adjective") {
+        prompt = `You are a German grammar and vocabulary expert.
+Create a high-quality Comparative Adjectives group (صفات مقایسه‌ای) for German language learners.
+Topic/Keywords/Adjectives given by user: "${topic || "صفات پرکاربرد آلمانی"}"
+Existing vocabulary in user's bank (if relevant): ${JSON.stringify((existingWords || []).slice(0, 30))}
+
+CRITICAL INSTRUCTIONS FOR COMPARATIVE ADJECTIVES:
+1. If the user provided a list of base adjectives in the topic field (e.g. "schön, gut, alt, groß, schnell"), create an entry for EVERY ONE of those base adjectives and complete its meaning, comparative, and superlative forms!
+2. Each item MUST have:
+   - "word": Base form of adjective (صفت در حالت پایه - Positiv e.g. "schön")
+   - "meaning": Persian translation (e.g. "زیبا")
+   - "comparative": Comparative form (حالت برتر - Komparativ e.g. "schöner")
+   - "superlative": Superlative form (حالت برترین - Superlativ e.g. "am schönsten")
+3. "notes": 2-3 concise bullet points in Persian on comparative adjective rules in German.
+
+Return JSON:
+{
+  "title": "Clear descriptive title in Persian & German (e.g. صفات مقایسه‌ای - Komparation der Adjektive)",
+  "type": "comparative_adjective",
+  "items": [
+    { "word": "base adjective", "meaning": "Persian translation", "comparative": "Komparativ form", "superlative": "Superlativ form" }
+  ],
+  "notes": "• نکته اول\\n• نکته دوم"
+}`;
+      } else {
+        prompt = `You are a German vocabulary expert.
 Create a high-quality ${groupType} group (${groupDescription}) for German language learners.
 Topic/Keyword: "${topic || "General Vocabulary"}"
 Existing vocabulary in user's bank (if relevant): ${JSON.stringify((existingWords || []).slice(0, 30))}
@@ -541,6 +625,7 @@ Return JSON:
   ],
   "notes": "• نکته اول\\n• نکته دوم"
 }`;
+      }
     }
 
     const jsonText = await callGeminiWithFallback({ contents: prompt });

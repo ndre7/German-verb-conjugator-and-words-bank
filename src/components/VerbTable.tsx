@@ -380,6 +380,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
 
   // AI State for Verbs
   const [verbAiLoading, setVerbAiLoading] = useState(false);
+  const [activeAiVerbInfinitive, setActiveAiVerbInfinitive] = useState<string | null>(null);
 
   // AI Fill Verb in Add Modal
   const handleAiFillVerbInModal = async () => {
@@ -429,6 +430,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
   // AI Enrich Existing Verb with full conjugations
   const handleAiEnrichVerb = async (verbItem: VerbItem) => {
     setVerbAiLoading(true);
+    setActiveAiVerbInfinitive(verbItem.infinitive);
     try {
       const res = await fetch("/api/gemini/verb-fill", {
         method: "POST",
@@ -499,6 +501,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       alert("خطا: " + (err.message || err));
     } finally {
       setVerbAiLoading(false);
+      setActiveAiVerbInfinitive(null);
     }
   };
 
@@ -2292,7 +2295,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                           className="w-8 h-8 sm:w-9 sm:h-9 flex items-center justify-center border border-purple-200 bg-purple-50 text-purple-700 hover:bg-purple-100 rounded-xl transition-all shadow-2xs shrink-0 cursor-pointer disabled:opacity-50"
                           title={locale === "fa" ? "تکمیل هوشمند معانی و تمامی صرف‌ها با AI" : "AI Enrich Verb"}
                         >
-                          <Sparkles className={`w-4 h-4 ${verbAiLoading ? "animate-spin" : ""}`} />
+                          <Sparkles className={`w-4 h-4 ${activeAiVerbInfinitive === v.infinitive && verbAiLoading ? "animate-spin text-amber-500" : ""}`} />
                         </button>
                         <button
                           onClick={() => handleMoveVerb(globalVerbIdx, "up")}
@@ -2679,7 +2682,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                                     className="p-1 text-purple-600 hover:text-purple-800 hover:bg-purple-50 rounded transition-all no-print cursor-pointer shrink-0"
                                     title={locale === "fa" ? "تکمیل هوشمند معانی و تمامی صرف‌ها با AI" : "AI Enrich Verb"}
                                   >
-                                    <Sparkles className={`w-3.5 h-3.5 ${verbAiLoading ? "animate-spin" : ""}`} />
+                                    <Sparkles className={`w-3.5 h-3.5 ${activeAiVerbInfinitive === v.infinitive && verbAiLoading ? "animate-spin text-amber-500" : ""}`} />
                                   </button>
                                   <button
                                     onClick={(e) => { e.stopPropagation(); handleDeleteVerb(v.infinitive); }}

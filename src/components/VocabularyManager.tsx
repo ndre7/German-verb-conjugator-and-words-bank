@@ -144,9 +144,13 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
   // Bulk Selection & Operations
   const [selectedVocabIds, setSelectedVocabIds] = useState<Set<string>>(new Set());
   const [showBulkDeleteVocabModal, setShowBulkDeleteVocabModal] = useState(false);
+  const [showBulkTagVocabModal, setShowBulkTagVocabModal] = useState(false);
+  const [bulkTagSelectedIds, setBulkTagSelectedIds] = useState<string[]>([]);
+  const [bulkTagCustomInput, setBulkTagCustomInput] = useState("");
 
   // AI States
   const [aiLoading, setAiLoading] = useState(false);
+  const [activeAiVocabId, setActiveAiVocabId] = useState<string | null>(null);
   const [enableAiJsonImport, setEnableAiJsonImport] = useState(true);
 
   // Custom Tag Helper for Form
@@ -340,6 +344,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
   // AI Enrich Existing Item directly from list
   const handleAiEnrichExistingItem = async (item: VocabularyItem) => {
     setAiLoading(true);
+    setActiveAiVocabId(item.id);
     try {
       const res = await fetch("/api/gemini/vocab-fill", {
         method: "POST",
@@ -377,6 +382,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       alert("خطا: " + (err.message || err));
     } finally {
       setAiLoading(false);
+      setActiveAiVocabId(null);
     }
   };
 
@@ -391,14 +397,21 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     setLoading(true);
     try {
       const list = await dbService.getVocabularies();
-      const customOrder = await dbService.getCustomVocabOrder();
+      let customOrder = await dbService.getCustomVocabOrder();
 
       if (customOrder && customOrder.length > 0) {
+        // Prepend any new items missing from customOrder so they appear at the VERY TOP!
+        const missingIds = list.map(v => v.id).filter(id => !customOrder.includes(id));
+        if (missingIds.length > 0) {
+          customOrder = [...missingIds, ...customOrder];
+          await dbService.saveCustomVocabOrder(customOrder);
+        }
+
         list.sort((a, b) => {
           let idxA = customOrder.indexOf(a.id);
           let idxB = customOrder.indexOf(b.id);
-          if (idxA === -1) idxA = 99999;
-          if (idxB === -1) idxB = 99999;
+          if (idxA === -1) idxA = -1;
+          if (idxB === -1) idxB = -1;
           if (idxA !== idxB) return idxA - idxB;
           return b.createdAt - a.createdAt;
         });
@@ -417,13 +430,13 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     }
   };
 
-  // Reorder row up or down
-  const handleMoveVocab = async (indexOnPage: number, direction: "up" | "down") => {
-    const targetOnPage = direction === "up" ? indexOnPage - 1 : indexOnPage + 1;
-    if (targetOnPage < 0 || targetOnPage >= filteredVocabularies.length) return;
+  // Reorder row up or down using global index in filtered list
+  const handleMoveVocab = async (globalIdx: number, direction: "up" | "down") => {
+    const targetGlobalIdx = direction === "up" ? globalIdx - 1 : globalIdx + 1;
+    if (targetGlobalIdx < 0 || targetGlobalIdx >= filteredVocabularies.length) return;
 
-    const itemToMove = filteredVocabularies[indexOnPage];
-    const itemToSwap = filteredVocabularies[targetOnPage];
+    const itemToMove = filteredVocabularies[globalIdx];
+    const itemToSwap = filteredVocabularies[targetGlobalIdx];
 
     const idx1 = vocabularies.findIndex(v => v.id === itemToMove.id);
     const idx2 = vocabularies.findIndex(v => v.id === itemToSwap.id);
@@ -512,6 +525,51 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     } else {
       showToast(locale === "fa" ? `واژه "${rawWord}" با موفقیت اضافه شد.` : `Word "${rawWord}" added.`);
     }
+  };
+
+  // Apply Bulk Tags to Selected Vocabulary Items
+  const handleApplyBulkTagsToVocabs = async () => {
+    if (selectedVocabIds.size === 0) return;
+    let tagIdsToApply = [...bulkTagSelectedIds];
+
+    if (bulkTagCustomInput.trim()) {
+      const rawTag = bulkTagCustomInput.trim();
+      const existing = vocabCategories.find(
+        c => c.name.toLowerCase() === rawTag.toLowerCase() || c.id.toLowerCase() === rawTag.toLowerCase()
+      );
+      if (existing) {
+        if (!tagIdsToApply.includes(existing.id)) tagIdsToApply.push(existing.id);
+      } else {
+        const newCat: VocabularyCategory = {
+          id: `cat_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          name: rawTag,
+          color: "bg-purple-100 text-purple-800 border-purple-200"
+        };
+        await dbService.saveVocabCategory(newCat);
+        tagIdsToApply.push(newCat.id);
+      }
+    }
+
+    if (tagIdsToApply.length === 0) {
+      alert(locale === "fa" ? "لطفاً حداقل یک تگ انتخاب یا وارد کنید." : "Please select or enter at least one tag.");
+      return;
+    }
+
+    let count = 0;
+    for (const id of Array.from(selectedVocabIds)) {
+      const item = vocabularies.find(v => v.id === id);
+      if (item) {
+        const currentTags = item.tags || [];
+        const updatedTags = Array.from(new Set([...currentTags, ...tagIdsToApply]));
+        await dbService.saveVocabulary({ ...item, tags: updatedTags, updatedAt: Date.now() });
+        count++;
+      }
+    }
+
+    setShowBulkTagVocabModal(false);
+    setSelectedVocabIds(new Set());
+    await loadData();
+    showToast(locale === "fa" ? `تگ‌ها بر روی ${count} واژه اعمال شدند ✨` : `Tags applied to ${count} words ✨`);
   };
 
   const handleQuickAdd = async (e: React.FormEvent) => {
@@ -1388,6 +1446,15 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                 </button>
 
                 <button
+                  onClick={() => { setBulkTagSelectedIds([]); setBulkTagCustomInput(""); setShowBulkTagVocabModal(true); }}
+                  disabled={aiLoading}
+                  className="px-3.5 py-1.5 bg-purple-600 hover:bg-purple-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50"
+                >
+                  <Tag className="w-4 h-4" />
+                  <span>{locale === "fa" ? "افزودن تگ گروهی" : "Bulk Tag"}</span>
+                </button>
+
+                <button
                   onClick={() => setShowBulkDeleteVocabModal(true)}
                   disabled={aiLoading}
                   className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50"
@@ -1467,9 +1534,10 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {paginatedItems.map((item, idx) => {
-                      const globalIdx = (currentPage - 1) * itemsPerPage + idx + 1;
-                      const isFirst = idx === 0 && currentPage === 1;
-                      const isLast = idx === paginatedItems.length - 1 && currentPage === totalPages;
+                      const zeroBasedGlobalIdx = (currentPage - 1) * itemsPerPage + idx;
+                      const displayNum = zeroBasedGlobalIdx + 1;
+                      const isFirst = zeroBasedGlobalIdx === 0;
+                      const isLast = zeroBasedGlobalIdx === filteredVocabularies.length - 1;
                       const isSelected = selectedVocabIds.has(item.id);
 
                       return (
@@ -1484,11 +1552,11 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                           </td>
                           <td className="py-3.5 px-2 text-center font-mono text-slate-400 text-xs">
                             <div className="flex items-center justify-center gap-1">
-                              <span className="font-bold text-slate-500 w-5">{globalIdx}</span>
+                              <span className="font-bold text-slate-500 w-5">{displayNum}</span>
                               <div className="flex flex-col gap-0.5">
                                 <button
                                   disabled={isFirst}
-                                  onClick={() => handleMoveVocab(idx, "up")}
+                                  onClick={() => handleMoveVocab(zeroBasedGlobalIdx, "up")}
                                   className="p-0.5 text-slate-400 hover:text-indigo-600 disabled:opacity-20 cursor-pointer"
                                   title={locale === "fa" ? "انتقال به بالا" : "Move Up"}
                                 >
@@ -1496,7 +1564,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                                 </button>
                                 <button
                                   disabled={isLast}
-                                  onClick={() => handleMoveVocab(idx, "down")}
+                                  onClick={() => handleMoveVocab(zeroBasedGlobalIdx, "down")}
                                   className="p-0.5 text-slate-400 hover:text-indigo-600 disabled:opacity-20 cursor-pointer"
                                   title={locale === "fa" ? "انتقال به پایین" : "Move Down"}
                                 >
@@ -1528,12 +1596,12 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                             <div className="flex flex-wrap gap-1">
                               {item.tags && item.tags.length > 0 ? (
                                 item.tags.map(tagId => {
-                                  const tagObj = vocabCategories.find(c => c.id === tagId);
+                                  const tagObj = vocabCategories.find(c => c.id === tagId || c.name.toLowerCase() === String(tagId).toLowerCase());
                                   return (
                                     <span
                                       key={tagId}
                                       className={`px-2 py-0.5 rounded-md text-[10px] font-bold font-vazir ${
-                                        tagObj ? tagObj.color : "bg-slate-100 text-slate-700"
+                                        tagObj ? tagObj.color : "bg-purple-100 text-purple-800"
                                       }`}
                                     >
                                       {tagObj ? tagObj.name : tagId}
@@ -1562,7 +1630,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                                 title="تکمیل کامل هوشمند با AI"
                                 className="p-1.5 text-purple-600 hover:text-purple-800 hover:bg-purple-50 rounded-lg cursor-pointer transition-colors"
                               >
-                                <Sparkles className="w-4 h-4 text-purple-600" />
+                                <Sparkles className={`w-4 h-4 text-purple-600 ${activeAiVocabId === item.id && aiLoading ? "animate-spin text-amber-500" : "hover:rotate-180 transition-transform duration-300"}`} />
                               </button>
                               <button
                                 onClick={() => handleOpenEditModal(item)}
@@ -1633,7 +1701,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
           )}
 
           {/* Pagination Controls */}
-          {totalPages > 1 && (
+          {filteredVocabularies.length > 0 && (
             <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mt-6 bg-white p-4 rounded-2xl border border-slate-200/80 no-print">
               <div className={`text-xs text-slate-500 font-vazir ${isRtl ? "text-right" : "text-left"}`}>
                 {locale === "fa" 
@@ -2297,6 +2365,85 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                 className="px-5 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
               >
                 {locale === "fa" ? "حذف واژگان" : "Delete Words"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Tag Application Modal */}
+      {showBulkTagVocabModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto no-print font-vazir">
+          <div className={`bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-md p-6 space-y-4 animate-in fade-in zoom-in-95 duration-200 ${isRtl ? "text-right" : "text-left"}`}>
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-indigo-700 flex items-center gap-2">
+                <Tag className="w-5 h-5 text-indigo-600" />
+                {locale === "fa" ? `افزودن تگ گروهی به ${selectedVocabIds.size} واژه` : `Apply Bulk Tags (${selectedVocabIds.size})`}
+              </h3>
+              <button onClick={() => setShowBulkTagVocabModal(false)} className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <label className="block text-xs font-bold text-slate-700">
+                {locale === "fa" ? "تگ‌های موجود را انتخاب کنید:" : "Select existing tags:"}
+              </label>
+              <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto p-1">
+                {vocabCategories.map((cat) => {
+                  const isChecked = bulkTagSelectedIds.includes(cat.id);
+                  return (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      onClick={() => {
+                        if (isChecked) {
+                          setBulkTagSelectedIds(bulkTagSelectedIds.filter(id => id !== cat.id));
+                        } else {
+                          setBulkTagSelectedIds([...bulkTagSelectedIds, cat.id]);
+                        }
+                      }}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer border flex items-center gap-1.5 ${
+                        isChecked
+                          ? "bg-indigo-600 text-white border-indigo-600 shadow-xs"
+                          : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                      }`}
+                    >
+                      <span>{cat.name}</span>
+                      {isChecked && <Check className="w-3.5 h-3.5" />}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="pt-2 border-t border-slate-100">
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  {locale === "fa" ? "یا یک تگ جدید وارد کنید:" : "Or type a new tag:"}
+                </label>
+                <input
+                  type="text"
+                  value={bulkTagCustomInput}
+                  onChange={(e) => setBulkTagCustomInput(e.target.value)}
+                  placeholder={locale === "fa" ? "مثلاً: A1، خانواده، سفر..." : "e.g. A1, Travel..."}
+                  className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-vazir"
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
+              <button
+                type="button"
+                onClick={() => setShowBulkTagVocabModal(false)}
+                className="px-4 py-2 border border-slate-200 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-50 cursor-pointer"
+              >
+                {locale === "fa" ? "انصراف" : "Cancel"}
+              </button>
+              <button
+                type="button"
+                onClick={handleApplyBulkTagsToVocabs}
+                className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
+              >
+                {locale === "fa" ? "اعمال تگ‌ها" : "Apply Tags"}
               </button>
             </div>
           </div>

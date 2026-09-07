@@ -60,7 +60,7 @@ function getClientAccounts(): GeminiAccount[] {
   const extraPattern = /^VITE_GEMINI_API_KEY_(\d+)$/;
   const extras: { key: string; label: string; num: number }[] = [];
   for (const [name, value] of Object.entries(env)) {
-    if (!value || !value.trim()) continue;
+    if (typeof value !== "string" || !value || !value.trim()) continue;
     const match = name.match(extraPattern);
     if (match) {
       extras.push({ key: value.trim(), label: `account-${match[1]}`, num: parseInt(match[1], 10) });

@@ -44,6 +44,10 @@ export function createGeminiError(
 }
 
 export function parseCleanJson(text: string): any {
+  if (typeof text !== "string") {
+    console.warn("parseCleanJson received non-string input:", typeof text, text);
+    return {};
+  }
   let cleaned = text.trim();
   if (cleaned.startsWith("```")) {
     cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
@@ -171,8 +175,13 @@ export async function generateWithFallback(options: {
         });
 
         if (response && response.text) {
+          const text = response.text;
+          if (typeof text !== "string") {
+            log("warn", `[Gemini] response.text is not a string: ${typeof text}, skipping model`);
+            continue;
+          }
           log("log", `[Gemini Success] Account: ${label}, Model: ${model}`);
-          return response.text;
+          return text;
         }
       } catch (err: any) {
         lastError = err;

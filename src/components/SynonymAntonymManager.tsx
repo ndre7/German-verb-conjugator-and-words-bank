@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { geminiApi } from "../ai/aiClient";
 import {
   Sparkles,
   Plus,
@@ -88,21 +89,16 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
   const handleAiCompleteModalGroup = async () => {
     setAiLoading(true);
     try {
-      const res = await fetch("/api/gemini/synonyms-generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "complete_group",
+      const result = await geminiApi.synonymsGenerate({
+        mode: "complete_group",
+        type: formType,
+        currentGroup: {
+          title: formTitle || "گروه شبکه واژگانی",
           type: formType,
-          currentGroup: {
-            title: formTitle || "گروه شبکه واژگانی",
-            type: formType,
-            items: formItems.filter(i => i.word.trim()),
-            notes: formNotes
-          }
-        })
+          items: formItems.filter(i => i.word.trim()),
+          notes: formNotes
+        }
       });
-      const result = await res.json();
       if (result.success && result.data) {
         const d = result.data;
         if (d.title && !formTitle.trim()) setFormTitle(d.title);
@@ -135,16 +131,11 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
     if (!aiTopicInput.trim()) return;
     setAiLoading(true);
     try {
-      const res = await fetch("/api/gemini/synonyms-generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: "new_group",
-          topic: aiTopicInput,
-          type: aiTypeInput
-        })
+      const result = await geminiApi.synonymsGenerate({
+        mode: "new_group",
+        topic: aiTopicInput,
+        type: aiTypeInput
       });
-      const result = await res.json();
       if (result.success && result.data) {
         const d = result.data;
         const validItems = (Array.isArray(d.items) ? d.items : []).map((it: any) => ({

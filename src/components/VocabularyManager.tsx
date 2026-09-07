@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
+import { geminiApi } from "../ai/aiClient";
 import {
   PlusCircle,
   Search,
@@ -255,32 +256,25 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         if (i > 0) await delayMs(BATCH_REQUEST_DELAY_MS);
         const chunk = selectedItems.slice(i, i + CHUNK_SIZE);
 
-        const res = await fetch("/api/gemini/batch-vocab-fill", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ items: chunk })
-        });
+        const data = await geminiApi.batchVocabFill({ items: chunk });
 
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && Array.isArray(data.items)) {
-            for (const enriched of data.items) {
-              const orig = chunk.find(c => c.word.toLowerCase() === (enriched.word || "").toLowerCase() || c.id === enriched.id);
-              if (orig) {
-                const updatedItem: VocabularyItem = {
-                  ...orig,
-                  article: (enriched.article && ["der","die","das","none"].includes(enriched.article)) ? enriched.article : orig.article,
-                  word: enriched.word || orig.word,
-                  meaning: enriched.meaning || orig.meaning,
-                  plural: enriched.plural !== undefined ? enriched.plural : orig.plural,
-                  partOfSpeech: enriched.partOfSpeech || orig.partOfSpeech,
-                  example: enriched.example ? cleanGermanExample(enriched.example) : orig.example,
-                  notes: enriched.notes || orig.notes,
-                  updatedAt: Date.now()
-                };
-                await dbService.saveVocabulary(updatedItem);
-                updatedCount++;
-              }
+        if (data.success && Array.isArray(data.items)) {
+          for (const enriched of data.items) {
+            const orig = chunk.find(c => c.word.toLowerCase() === (enriched.word || "").toLowerCase() || c.id === enriched.id);
+            if (orig) {
+              const updatedItem: VocabularyItem = {
+                ...orig,
+                article: (enriched.article && ["der","die","das","none"].includes(enriched.article)) ? enriched.article : orig.article,
+                word: enriched.word || orig.word,
+                meaning: enriched.meaning || orig.meaning,
+                plural: enriched.plural !== undefined ? enriched.plural : orig.plural,
+                partOfSpeech: enriched.partOfSpeech || orig.partOfSpeech,
+                example: enriched.example ? cleanGermanExample(enriched.example) : orig.example,
+                notes: enriched.notes || orig.notes,
+                updatedAt: Date.now()
+              };
+              await dbService.saveVocabulary(updatedItem);
+              updatedCount++;
             }
           }
         }
@@ -305,15 +299,10 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     }
     setAiLoading(true);
     try {
-      const res = await fetch("/api/gemini/vocab-fill", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          word,
-          currentData: { article: formArticle, meaning: formMeaning, plural: formPlural, notes: formNotes }
-        })
+      const result = await geminiApi.vocabFill({
+        word,
+        currentData: { article: formArticle, meaning: formMeaning, plural: formPlural, notes: formNotes }
       });
-      const result = await res.json();
       if (result.success && result.data) {
         const d = result.data;
         if (d.article && ["der", "die", "das", "none"].includes(d.article)) {
@@ -346,15 +335,10 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     setAiLoading(true);
     setActiveAiVocabId(item.id);
     try {
-      const res = await fetch("/api/gemini/vocab-fill", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          word: item.word,
-          currentData: item
-        })
+      const result = await geminiApi.vocabFill({
+        word: item.word,
+        currentData: item
       });
-      const result = await res.json();
       if (result.success && result.data) {
         const d = result.data;
         const updated: VocabularyItem = {
@@ -845,22 +829,12 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
           }
           const chunk = itemsArray.slice(i, i + CHUNK_SIZE);
           try {
-            const aiRes = await fetch("/api/gemini/batch-vocab-fill", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ items: chunk })
-            });
-            if (aiRes.ok) {
-              const aiData = await aiRes.json();
-              if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
-                enrichedList.push(...aiData.items);
-                continue;
-              }
-            } else {
-              const errData = await aiRes.json().catch(() => null);
-              if (errData?.userMessage) {
-                console.warn("Batch AI vocab chunk warning:", errData.userMessage);
-              }
+            const aiData = await geminiApi.batchVocabFill({ items: chunk });
+            if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
+              enrichedList.push(...aiData.items);
+              continue;
+            } else if (aiData.userMessage) {
+              console.warn("Batch AI vocab chunk warning:", aiData.userMessage);
             }
           } catch (err) {
             console.warn("Batch AI chunk error during JSON import, falling back to raw chunk items:", err);

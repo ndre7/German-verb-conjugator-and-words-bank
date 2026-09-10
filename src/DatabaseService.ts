@@ -1,5 +1,5 @@
 import Dexie, { type Table } from "dexie";
-import { Tense, type UserOverride, type Category, type TenseConjugations, type VerbItem, type ConjugationPerson, type AppChangeLog, type VocabChangeLog, type VocabularyItem, type ArticleType, type PartOfSpeech, type VocabularyCategory, type SynonymAntonymGroup } from "./types";
+import { Tense, type UserOverride, type Category, type TenseConjugations, type VerbItem, type ConjugationPerson, type AppChangeLog, type VocabChangeLog, type VocabularyItem, type ArticleType, type PartOfSpeech, type VocabularyCategory, type SynonymAntonymGroup, type SavedStory } from "./types";
 import sampleDb from "./German_DB_sample_file.json";
 
 // ----------------------------------------------------
@@ -12,6 +12,7 @@ export class VerbConjugationDatabase extends Dexie {
   vocabularies!: Table<VocabularyItem, string>;
   vocabCategories!: Table<VocabularyCategory, string>;
   synonymAntonymGroups!: Table<SynonymAntonymGroup, string>;
+  savedStories!: Table<SavedStory, string>;
 
   constructor() {
     super("GermanVerbManagerDB");
@@ -34,6 +35,15 @@ export class VerbConjugationDatabase extends Dexie {
       vocabCategories: "id, name",
       synonymAntonymGroups: "id, title, type"
     });
+    this.version(4).stores({
+      overrides: "infinitive, sortOrder",
+      categories: "id, name",
+      settings: "key",
+      vocabularies: "id, word, article, partOfSpeech",
+      vocabCategories: "id, name",
+      synonymAntonymGroups: "id, title, type",
+      savedStories: "id, title, createdAt, cefrLevel"
+    });
   }
 }
 
@@ -53,6 +63,7 @@ export class DatabaseService {
   private useInMemoryFallback: boolean = false;
   private inMemorySettings: Record<string, any> = {};
   private inMemoryOverrides: Record<string, UserOverride> = {};
+  private inMemorySavedStories: SavedStory[] = [];
   private inMemoryCategories: Category[] = [
     { id: "regular", name: "Regelmäßig", color: "#10B981" },
     { id: "irregular", name: "Unregelmäßig", color: "#EF4444" },
@@ -1682,6 +1693,84 @@ export class DatabaseService {
   }
 
   // ----------------------------------------------------
+  // Story Exercises & Saved Stories Persistence
+  // ----------------------------------------------------
+  public async getSavedStories(): Promise<SavedStory[]> {
+    try {
+      await db.open();
+      const stories = await db.savedStories.orderBy("createdAt").reverse().toArray();
+      if (stories && stories.length > 0) {
+        this.inMemorySavedStories = stories;
+        return stories;
+      }
+    } catch (e) {
+      console.warn("Could not read savedStories from IndexedDB, using fallback", e);
+    }
+    const raw = localStorage.getItem("g_saved_stories");
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        this.inMemorySavedStories = parsed;
+        return parsed;
+      } catch (err) {}
+    }
+    return this.inMemorySavedStories;
+  }
+
+  public async saveStory(story: SavedStory): Promise<void> {
+    try {
+      await db.open();
+      await db.savedStories.put(story);
+    } catch (e) {
+      console.warn("Failed to put saved story in IndexedDB, using fallback", e);
+    }
+    const existing = this.inMemorySavedStories.filter((s) => s.id !== story.id);
+    this.inMemorySavedStories = [story, ...existing];
+    try {
+      localStorage.setItem("g_saved_stories", JSON.stringify(this.inMemorySavedStories));
+    } catch (e) {}
+
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("saved-stories-changed"));
+    }
+  }
+
+  public async deleteStory(id: string): Promise<void> {
+    try {
+      await db.open();
+      await db.savedStories.delete(id);
+    } catch (e) {
+      console.warn("Failed to delete story in IndexedDB, using fallback", e);
+    }
+    this.inMemorySavedStories = this.inMemorySavedStories.filter((s) => s.id !== id);
+    try {
+      localStorage.setItem("g_saved_stories", JSON.stringify(this.inMemorySavedStories));
+    } catch (e) {}
+
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("saved-stories-changed"));
+    }
+  }
+
+  public async deleteStories(ids: string[]): Promise<void> {
+    const idSet = new Set(ids);
+    try {
+      await db.open();
+      await db.savedStories.bulkDelete(ids);
+    } catch (e) {
+      console.warn("Failed to bulk delete stories in IndexedDB, using fallback", e);
+    }
+    this.inMemorySavedStories = this.inMemorySavedStories.filter((s) => !idSet.has(s.id));
+    try {
+      localStorage.setItem("g_saved_stories", JSON.stringify(this.inMemorySavedStories));
+    } catch (e) {}
+
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("saved-stories-changed"));
+    }
+  }
+
+  // ----------------------------------------------------
   // Full Application Data Export & Import (Backup & Sync)
   // ----------------------------------------------------
   public async exportFullBackupJSON(): Promise<string> {
@@ -1690,6 +1779,7 @@ export class DatabaseService {
     let vocabularies: VocabularyItem[] = [];
     let vocabCategories: VocabularyCategory[] = [];
     let synonymAntonymGroups: SynonymAntonymGroup[] = [];
+    let savedStories: SavedStory[] = [];
     let settings: Array<{ key: string; value: any }> = [];
 
     try {
@@ -1699,6 +1789,7 @@ export class DatabaseService {
       vocabularies = await db.vocabularies.toArray();
       vocabCategories = await db.vocabCategories.toArray();
       synonymAntonymGroups = await db.synonymAntonymGroups.toArray();
+      savedStories = await db.savedStories.toArray();
       settings = await db.settings.toArray();
     } catch (e) {
       console.warn("Error reading IndexedDB for full export, using memory/fallback", e);
@@ -1707,9 +1798,10 @@ export class DatabaseService {
       vocabularies = await this.getVocabularies();
       vocabCategories = await this.getVocabCategories();
       synonymAntonymGroups = await this.getSynonymAntonymGroups();
+      savedStories = await this.getSavedStories();
     }
 
-    // Ensure fallback data is pulled if IndexedDB was empty for vocab / groups
+    // Ensure fallback data is pulled if IndexedDB was empty for vocab / groups / stories
     if (vocabularies.length === 0) {
       vocabularies = await this.getVocabularies();
     }
@@ -1718,6 +1810,9 @@ export class DatabaseService {
     }
     if (synonymAntonymGroups.length === 0) {
       synonymAntonymGroups = await this.getSynonymAntonymGroups();
+    }
+    if (savedStories.length === 0) {
+      savedStories = await this.getSavedStories();
     }
 
     let allVerbs: VerbItem[] = [];
@@ -1748,7 +1843,8 @@ export class DatabaseService {
         totalVocabularies: vocabularies.length,
         totalVerbCategories: categories.length,
         totalVocabCategories: vocabCategories.length,
-        totalLexicalNetworkGroups: synonymAntonymGroups.length
+        totalLexicalNetworkGroups: synonymAntonymGroups.length,
+        totalSavedStories: savedStories.length
       },
       data: {
         verbs: allVerbs,
@@ -1759,6 +1855,7 @@ export class DatabaseService {
         vocabCategories,
         lexicalNetworkGroups: synonymAntonymGroups,
         synonymAntonymGroups,
+        savedStories,
         customVerbOrder: await this.getCustomOrder(),
         customVocabOrder: await this.getCustomVocabOrder(),
         settings,
@@ -1887,11 +1984,22 @@ export class DatabaseService {
         localStorage.setItem("g_verb_vocab_history", JSON.stringify(data.vocabHistory));
       }
 
+      // 11. Saved Stories
+      if (Array.isArray(data.savedStories)) {
+        await db.savedStories.clear();
+        if (data.savedStories.length > 0) {
+          await db.savedStories.bulkPut(data.savedStories);
+        }
+        this.inMemorySavedStories = data.savedStories;
+        localStorage.setItem("g_saved_stories", JSON.stringify(data.savedStories));
+      }
+
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("vocab-data-changed"));
         window.dispatchEvent(new CustomEvent("app-data-changed"));
         window.dispatchEvent(new CustomEvent("vocab-categories-changed"));
         window.dispatchEvent(new CustomEvent("synonym-antonym-changed"));
+        window.dispatchEvent(new CustomEvent("saved-stories-changed"));
       }
 
       return true;

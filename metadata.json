@@ -1,6 +1,6 @@
 {
   "name": "Remix: German Verb Conjugation Manager",
-  "description": "Manage, search, customize, and export German verb conjugations with local IndexedDB persistence.",
+  "description": "Manage German verb conjugations and vocabulary with local IndexedDB persistence, AI auto-fill, and interactive story practice.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

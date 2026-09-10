@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
-import { geminiApi } from "../ai/aiClient";
 import {
   ArrowUp,
   ArrowDown,
@@ -26,6 +25,7 @@ import {
   Upload
 } from "lucide-react";
 import { dbService, db } from "../DatabaseService";
+import { geminiFetch } from "../services/apiKeyService";
 import { Tense, TENSE_ORDER, type VerbItem, type Category } from "../types";
 import CategoryManager from "./CategoryManager";
 
@@ -320,42 +320,49 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         if (i > 0) await delayMs(BATCH_REQUEST_DELAY_MS);
         const chunk = selectedItems.slice(i, i + CHUNK_SIZE);
 
-        const data = await geminiApi.batchVerbFill({ items: chunk });
+        const res = await geminiFetch("/api/gemini/batch-verb-fill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ items: chunk })
+        });
 
-        if (data.success && Array.isArray(data.items)) {
-          for (const enriched of data.items) {
-            const orig = chunk.find(c => c.infinitive.toLowerCase() === (enriched.infinitive || enriched.word || "").toLowerCase());
-            if (orig) {
-              const cellOverrides: Record<string, string> = { ...orig.cellOverrides };
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && Array.isArray(data.items)) {
+            for (const enriched of data.items) {
+              const orig = chunk.find(c => c.infinitive.toLowerCase() === (enriched.infinitive || enriched.word || "").toLowerCase());
+              if (orig) {
+                const cellOverrides: Record<string, string> = { ...orig.cellOverrides };
 
-              if (enriched.conjugations) {
-                const tensesKeys = [
-                  "PRASENS", "PERFEKT", "PRATERITUM", "KONJUNKTIV2_PRATERITUM",
-                  "FUTUR1", "PLUSQUAMPERFEKT", "KONJUNKTIV1_PRASENS", "FUTUR2", "IMPERATIV"
-                ];
-                for (const tKey of tensesKeys) {
-                  const tenseObj = enriched.conjugations[tKey];
-                  if (tenseObj) {
-                    for (const pKey of ["S1", "S2", "S3", "P1", "P2", "P3"]) {
-                      if (tenseObj[pKey]) {
-                        const val = Array.isArray(tenseObj[pKey]) ? tenseObj[pKey].join(", ") : tenseObj[pKey];
-                        if (val) {
-                          cellOverrides[`${tKey}_${pKey}`] = val;
+                if (enriched.conjugations) {
+                  const tensesKeys = [
+                    "PRASENS", "PERFEKT", "PRATERITUM", "KONJUNKTIV2_PRATERITUM",
+                    "FUTUR1", "PLUSQUAMPERFEKT", "KONJUNKTIV1_PRASENS", "FUTUR2", "IMPERATIV"
+                  ];
+                  for (const tKey of tensesKeys) {
+                    const tenseObj = enriched.conjugations[tKey];
+                    if (tenseObj) {
+                      for (const pKey of ["S1", "S2", "S3", "P1", "P2", "P3"]) {
+                        if (tenseObj[pKey]) {
+                          const val = Array.isArray(tenseObj[pKey]) ? tenseObj[pKey].join(", ") : tenseObj[pKey];
+                          if (val) {
+                            cellOverrides[`${tKey}_${pKey}`] = val;
+                          }
                         }
                       }
                     }
                   }
                 }
-              }
 
-              await dbService.addVerb({
-                infinitive: enriched.infinitive || orig.infinitive,
-                bedeutung: enriched.bedeutung || orig.bedeutung,
-                hilfsverb: enriched.hilfsverb === "sein" ? "sein" : (orig.hilfsverb || "haben"),
-                categories: Array.isArray(enriched.categories) && enriched.categories.length > 0 ? enriched.categories : orig.categories,
-                cellOverrides
-              });
-              updatedCount++;
+                await dbService.addVerb({
+                  infinitive: enriched.infinitive || orig.infinitive,
+                  bedeutung: enriched.bedeutung || orig.bedeutung,
+                  hilfsverb: enriched.hilfsverb === "sein" ? "sein" : (orig.hilfsverb || "haben"),
+                  categories: Array.isArray(enriched.categories) && enriched.categories.length > 0 ? enriched.categories : orig.categories,
+                  cellOverrides
+                });
+                updatedCount++;
+              }
             }
           }
         }
@@ -379,13 +386,19 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
   // AI Fill Verb in Add Modal
   const handleAiFillVerbInModal = async () => {
     const inf = newInfinitive.trim();
-    if (!inf) {
-      alert(locale === "fa" ? "لطفاً ابتدا مصدر فعل آلمانی را وارد کنید." : "Please enter the German verb infinitive first.");
+    const bed = newBedeutung.trim();
+    if (!inf && !bed) {
+      alert(locale === "fa" ? "لطفاً ابتدا مصدر فعل آلمانی یا معنی فارسی آن را وارد کنید." : "Please enter the German verb infinitive or Persian meaning first.");
       return;
     }
     setVerbAiLoading(true);
     try {
-      const result = await geminiApi.verbFill({ infinitive: inf });
+      const res = await geminiFetch("/api/gemini/verb-fill", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ infinitive: inf, bedeutung: bed })
+      });
+      const result = await res.json();
       if (result.success && result.data) {
         const d = result.data;
         if (d.infinitive) setNewInfinitive(d.infinitive);
@@ -421,7 +434,12 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     setVerbAiLoading(true);
     setActiveAiVerbInfinitive(verbItem.infinitive);
     try {
-      const result = await geminiApi.verbFill({ infinitive: verbItem.infinitive, currentData: verbItem });
+      const res = await geminiFetch("/api/gemini/verb-fill", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ infinitive: verbItem.infinitive, currentData: verbItem })
+      });
+      const result = await res.json();
       if (result.success && result.data) {
         const d = result.data;
         const cellOverrides: Record<string, string> = { ...verbItem.cellOverrides };
@@ -757,12 +775,22 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
           }
           const chunk = itemsArray.slice(i, i + CHUNK_SIZE);
           try {
-            const aiData = await geminiApi.batchVerbFill({ items: chunk });
-            if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
-              enrichedList.push(...aiData.items);
-              continue;
-            } else if (aiData.userMessage) {
-              console.warn("Batch AI verb chunk warning:", aiData.userMessage);
+            const aiRes = await geminiFetch("/api/gemini/batch-verb-fill", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ items: chunk })
+            });
+            if (aiRes.ok) {
+              const aiData = await aiRes.json();
+              if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
+                enrichedList.push(...aiData.items);
+                continue;
+              }
+            } else {
+              const errData = await aiRes.json().catch(() => null);
+              if (errData?.userMessage) {
+                console.warn("Batch AI verb chunk warning:", errData.userMessage);
+              }
             }
           } catch (err) {
             console.warn("Batch AI verb chunk error during JSON import, falling back to raw chunk items:", err);
@@ -1821,7 +1849,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
               <div className="bg-purple-50 border border-purple-200 p-3.5 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-2">
                 <div className="flex items-center gap-2 text-xs font-bold text-purple-900 font-vazir">
                   <Sparkles className="w-4 h-4 text-purple-600 shrink-0" />
-                  <span>تکمیل هوشمند معانی و تمامی صرف‌های فعل با هوش مصنوعی</span>
+                  <span>تکمیل هوشمند با AI (می‌توانید فقط معنی فارسی یا مصدر را بنویسید)</span>
                 </div>
                 <button
                   type="button"

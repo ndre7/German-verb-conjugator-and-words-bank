@@ -151,3 +151,18 @@ export interface SynonymAntonymGroup {
   updatedAt: number;
 }
 
+export type CefrLevel = "A1" | "A2" | "B1" | "B2" | "C1" | "C2" | "none";
+
+export interface SavedStory {
+  id: string;
+  title: string;
+  storyGerman: string;
+  storyPersian?: string;
+  targetItems: string[];
+  selectedCount: number;
+  selectionMode: "manual" | "random";
+  totalWordCount: number;
+  cefrLevel: CefrLevel;
+  createdAt: number;
+}
+

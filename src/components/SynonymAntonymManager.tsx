@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from "react";
-import { geminiApi } from "../ai/aiClient";
 import {
   Sparkles,
   Plus,
@@ -18,6 +17,7 @@ import {
   MessageSquare
 } from "lucide-react";
 import { dbService } from "../DatabaseService";
+import { geminiFetch } from "../services/apiKeyService";
 import { SynonymAntonymGroup, ArticleType, SynonymAntonymType, PartOfSpeech, VocabularyItem } from "../types";
 import { Locale } from "../translations";
 
@@ -89,16 +89,21 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
   const handleAiCompleteModalGroup = async () => {
     setAiLoading(true);
     try {
-      const result = await geminiApi.synonymsGenerate({
-        mode: "complete_group",
-        type: formType,
-        currentGroup: {
-          title: formTitle || "گروه شبکه واژگانی",
+      const res = await geminiFetch("/api/gemini/synonyms-generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "complete_group",
           type: formType,
-          items: formItems.filter(i => i.word.trim()),
-          notes: formNotes
-        }
+          currentGroup: {
+            title: formTitle || "گروه شبکه واژگانی",
+            type: formType,
+            items: formItems.filter(i => i.word.trim()),
+            notes: formNotes
+          }
+        })
       });
+      const result = await res.json();
       if (result.success && result.data) {
         const d = result.data;
         if (d.title && !formTitle.trim()) setFormTitle(d.title);
@@ -131,11 +136,16 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
     if (!aiTopicInput.trim()) return;
     setAiLoading(true);
     try {
-      const result = await geminiApi.synonymsGenerate({
-        mode: "new_group",
-        topic: aiTopicInput,
-        type: aiTypeInput
+      const res = await geminiFetch("/api/gemini/synonyms-generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "new_group",
+          topic: aiTopicInput,
+          type: aiTypeInput
+        })
       });
+      const result = await res.json();
       if (result.success && result.data) {
         const d = result.data;
         const validItems = (Array.isArray(d.items) ? d.items : []).map((it: any) => ({

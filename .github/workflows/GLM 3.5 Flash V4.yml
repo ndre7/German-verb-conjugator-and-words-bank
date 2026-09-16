@@ -53,13 +53,13 @@ jobs:
           };
           EOF
 
-      - name: Bundle AI proxy server (esbuild -> standalone CJS)
+      - name: Bundle AI proxy server (esbuild - standalone CJS)
         shell: bash
         run: |
           mkdir -p stage
           bunx esbuild server.ts --bundle --platform=node --format=cjs --alias:vite=./ci-shims/vite.js --external:@modelcontextprotocol/sdk --outfile=stage/server.cjs
 
-      - name: Assemble Electron app (v4: direct-session UI + OS-assigned ports + proxy-aware AI fetch)
+      - name: Assemble Electron app (v4 - direct-session UI, OS-assigned ports, proxy-aware AI fetch)
         shell: bash
         run: |
           mkdir -p stage/app
@@ -73,8 +73,8 @@ jobs:
           const path = require("path");
 
           const API_HOST = "127.0.0.1";
-          let WEB_PORT = 0; // OS-assigned
-          let API_PORT = 0; // OS-assigned
+          let WEB_PORT = 0;
+          let API_PORT = 0;
 
           let logFd = null;
           function logLine() {
@@ -102,7 +102,6 @@ jobs:
 
           process.env.NODE_ENV = "production";
 
-          // ---------------- Proxy support for AI fetch (VPN / system proxy) ----------------
           function normalizeProxyUrl(raw) {
             var p = String(raw || "").trim();
             if (!p) return null;
@@ -165,7 +164,6 @@ jobs:
               return false;
             }
           }
-          // ----------------------------------------------------------------------------------
 
           const MIME = {
             ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".mjs": "text/javascript",
@@ -297,7 +295,6 @@ jobs:
             app.setAppUserModelId("com.ndre7.germanverbmanager");
 
             app.whenReady().then(async function () {
-              // 1) Neutralize broken system proxy for the UI window (AI traffic is proxied separately below)
               try {
                 await session.defaultSession.setProxy({ mode: "direct" });
                 logLine("[desktop] UI session proxy mode: direct (system proxy bypassed for localhost UI)");
@@ -305,7 +302,6 @@ jobs:
                 logLine("[desktop] setProxy failed:", err);
               }
 
-              // 2) Proxy-aware AI fetch (system proxy / env / GERMAN_APP_PROXY)
               var proxyUrl = detectProxyUrl();
               if (proxyUrl) {
                 applyProxyToNodeFetch(proxyUrl);
@@ -313,7 +309,6 @@ jobs:
                 logLine("[desktop] No proxy detected - AI calls will use direct connection");
               }
 
-              // 3) OS-assigned free ports (immune to Windows reserved port ranges)
               var apiPort = 0, webBound = false;
               try { apiPort = await getFreePort(); } catch (err) { logLine("[desktop] getFreePort(API) failed:", err); }
               logLine("[desktop] Electron ready. Reserving ports: API=" + apiPort);

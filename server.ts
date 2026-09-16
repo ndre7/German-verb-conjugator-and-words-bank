@@ -184,12 +184,12 @@ export { detectProvider };
 const retiredModels = new Set<string>();
 
 interface StructuredGeminiError extends Error {
-  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "unknown";
+  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "unknown";
   userMessage: string;
 }
 
 function createGeminiError(
-  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "unknown",
+  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "unknown",
   message: string
 ): StructuredGeminiError {
   let userMessage = "خطایی در برقراری ارتباط با سرویس هوش مصنوعی رخ داد. لطفاً دوباره تلاش کنید.";
@@ -199,6 +199,8 @@ function createGeminiError(
     userMessage = "مدل‌های هوش مصنوعی در حال حاضر با تقاضای بالا یا عدم دسترسی موقت مواجه هستند. لطفاً لحظاتی بعد دوباره تلاش فرمایید.";
   } else if (reason === "auth_error") {
     userMessage = "خطا در احراز هویت کلیدهای هوش مصنوعی. لطفاً تنظیمات حساب‌ها را بررسی کنید.";
+  } else if (reason === "timeout") {
+    userMessage = "پاسخ مدل در زمان مجاز آماده نشد (مدل کند یا در صف است). لطفاً مدل دیگری انتخاب کنید یا دوباره تلاش کنید.";
   }
 
   const err = new Error(message) as StructuredGeminiError;
@@ -559,17 +561,18 @@ async function executeAIProviderCall(
 
         if (!res.ok) {
           const errText = await res.text();
+          const shortErr = errText.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
           const isAuth = res.status === 401 || res.status === 403;
           if (isAuth) {
-            const authErr = new Error(`Anthropic authentication failed (${res.status}): ${errText}`);
+            const authErr = new Error(`Anthropic authentication failed (${res.status}): ${shortErr}`);
             (authErr as any).isAuth = true;
             throw authErr;
           }
           if (options.model?.trim()) {
-            throw new Error(`Anthropic error (${res.status}) on model "${targetModel}": ${errText}`);
+            throw new Error(`Anthropic error (${res.status}) on model "${targetModel}": ${shortErr}`);
           }
-          console.warn(`[Anthropic Fallback] Model "${targetModel}" failed with HTTP ${res.status}: ${errText.slice(0, 100)}. Trying next candidate model...`);
-          lastAnthropicErr = new Error(`Anthropic error (${res.status}): ${errText}`);
+          console.warn(`[Anthropic Fallback] Model "${targetModel}" failed with HTTP ${res.status}: ${shortErr.slice(0, 100)}. Trying next candidate model...`);
+          lastAnthropicErr = new Error(`Anthropic error (${res.status}): ${shortErr}`);
           continue;
         }
 
@@ -600,7 +603,7 @@ async function executeAIProviderCall(
       Authorization: `Bearer ${cleanKey}`,
     };
     if (resolvedProvider === "openrouter") {
-      headers["HTTP-Referer"] = process.env.APP_URL || `http://localhost:${PORT}`;
+      headers["HTTP-Referer"] = process.env.APP_URL || "https://github.com/ndre7/German-verb-conjugator-and-words-bank";
       headers["X-Title"] = "German Verb Conjugation Manager";
     }
 
@@ -626,7 +629,9 @@ async function executeAIProviderCall(
           temperature: 0.2,
         };
 
-        if (options.maxTokens) {
+        if (!options.isPing) {
+          body.max_tokens = options.maxTokens || 4096;
+        } else if (options.maxTokens) {
           body.max_tokens = options.maxTokens;
         }
 
@@ -644,17 +649,18 @@ async function executeAIProviderCall(
 
         if (!res.ok) {
           const errText = await res.text();
+          const shortErr = errText.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
           const isAuth = res.status === 401 || res.status === 403;
           if (isAuth) {
-            const authErr = new Error(`${resolvedProvider} authentication failed (${res.status}): ${errText}`);
+            const authErr = new Error(`${resolvedProvider} authentication failed (${res.status}): ${shortErr}`);
             (authErr as any).isAuth = true;
             throw authErr;
           }
           if (options.model?.trim()) {
-            throw new Error(`خطا در درخواست به مدل "${targetModel}" از سرویس ${resolvedProvider} (${res.status}): ${errText}`);
+            throw new Error(`خطا در درخواست به مدل "${targetModel}" از سرویس ${resolvedProvider} (${res.status}): ${shortErr}`);
           }
-          console.warn(`[${resolvedProvider} Model Fallback] Model "${targetModel}" returned HTTP ${res.status}: ${errText.slice(0, 100)}. Trying next candidate model...`);
-          lastProviderErr = new Error(`${resolvedProvider} error (${res.status}): ${errText}`);
+          console.warn(`[${resolvedProvider} Model Fallback] Model "${targetModel}" returned HTTP ${res.status}: ${shortErr.slice(0, 100)}. Trying next candidate model...`);
+          lastProviderErr = new Error(`${resolvedProvider} error (${res.status}): ${shortErr}`);
           continue;
         }
 
@@ -695,7 +701,7 @@ async function executeCustomKeyCall(
     contents: params.contents,
     responseSchema: params.responseSchema,
     responseMimeType: params.responseMimeType,
-    timeoutMs: 45000,
+    timeoutMs: 120000,
     isPing: false,
   });
   return { text: result.text, tokensUsed: result.tokensUsed };
@@ -713,6 +719,7 @@ async function callGeminiWithFallback(params: {
   let encounteredQuota = false;
   let encounteredModelUnavailable = false;
   let encounteredAuth = false;
+  let encounteredTimeout = false;
 
   // Outer loop: Iterate over accounts (Primary -> account-2 -> account-3 -> ...)
   for (const { client, label } of clients) {
@@ -935,6 +942,7 @@ async function callGeminiWithFallback(params: {
         lastError = err;
         const isAuth = !!err.isAuth;
         const isQuota = !!err.isQuota;
+        const isTimeout = err.name === "AbortError" || /timeout|aborted/i.test(String(err.message || ""));
 
         if (isAuth) {
           encounteredAuth = true;
@@ -952,6 +960,14 @@ async function callGeminiWithFallback(params: {
           continue;
         }
 
+        if (isTimeout) {
+          encounteredTimeout = true;
+          console.warn(
+            `[AI Custom Key Timeout] Key "${customKey.name || customKey.id}" (${provider}) timed out. Trying next key...`
+          );
+          continue;
+        }
+
         console.warn(
           `[AI Custom Key Error] Key "${customKey.name || customKey.id}" (${provider}) failed: ${err.message}. Trying next key...`
         );
@@ -960,13 +976,15 @@ async function callGeminiWithFallback(params: {
   }
 
   // Determine primary failure reason across all attempts
-  let primaryReason: "quota_exhausted" | "model_unavailable" | "auth_error" | "unknown" = "unknown";
+  let primaryReason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "unknown" = "unknown";
   if (encounteredQuota) {
     primaryReason = "quota_exhausted";
   } else if (encounteredModelUnavailable) {
     primaryReason = "model_unavailable";
   } else if (encounteredAuth) {
     primaryReason = "auth_error";
+  } else if (encounteredTimeout) {
+    primaryReason = "timeout";
   }
 
   const finalMsg = lastError?.message || "All AI accounts, models, and custom keys failed to generate content.";
@@ -1023,7 +1041,7 @@ function cleanConjugationPronouns(obj: any): any {
 }
 
 // API: Validate Any AI Provider Key (Gemini, OpenAI, Groq, DeepSeek, Anthropic, OpenRouter, Mistral, Custom)
-app.post(["/api/gemini/validate-key", "/api/keys/validate"], aiRateLimiter, async (req, res) => {
+app.post("/api/gemini/validate-key", async (req, res) => {
   try {
     const { apiKey, provider, baseUrl, model } = req.body;
     if (!apiKey || typeof apiKey !== "string" || !apiKey.trim()) {

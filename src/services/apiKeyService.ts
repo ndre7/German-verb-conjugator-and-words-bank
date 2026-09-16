@@ -310,9 +310,13 @@ export const apiKeyService = {
       keyItem.model
     );
 
+    const cleanError = result.error
+      ? String(result.error).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300)
+      : undefined;
+
     this.updateKey(id, {
       status: result.valid ? "valid" : "invalid",
-      errorMessage: result.error,
+      errorMessage: cleanError,
       lastChecked: Date.now(),
     });
 
@@ -326,6 +330,10 @@ export const apiKeyService = {
     }
   }
 };
+
+function toHeaderSafe(v: unknown): string {
+  return String(v ?? "").replace(/[^\x20-\x7E]/g, "");
+}
 
 // Global geminiFetch wrapper that attaches custom API keys and records usage safely
 export async function geminiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -341,7 +349,17 @@ export async function geminiFetch(input: RequestInfo | URL, init?: RequestInit):
         if (b.status === "valid" && a.status !== "valid") return 1;
         return (b.lastChecked || 0) - (a.lastChecked || 0);
       })
-      .slice(0, 10);
+      .slice(0, 10)
+      .map((k) => ({
+        id: toHeaderSafe(k.id),
+        key: toHeaderSafe(k.key),
+        name: toHeaderSafe(k.name).slice(0, 40) || "key",
+        provider: toHeaderSafe(k.provider),
+        providerName: k.providerName ? toHeaderSafe(k.providerName).slice(0, 40) : undefined,
+        model: k.model ? toHeaderSafe(k.model) : undefined,
+        baseUrl: k.baseUrl ? toHeaderSafe(k.baseUrl) : undefined,
+        enabled: k.enabled !== false,
+      }));
 
     headers.set("x-custom-api-keys", JSON.stringify(prioritizedKeys));
   }

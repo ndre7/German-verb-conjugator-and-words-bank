@@ -11,6 +11,10 @@ body {
   font-family: var(--font-sans);
 }
 
+:root {
+  --header-h: 64px;
+}
+
 /* Print Styling */
 @media print {
   body {

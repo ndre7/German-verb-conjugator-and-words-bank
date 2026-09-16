@@ -281,7 +281,7 @@ export const translations = {
     templateTitle: "Benötigen Sie eine Vorlagendatei?",
     templateDesc: "Laden Sie eine Vorlagendatei mit dem genauen vom Verwaltungssystem erwarteten Format herunter, um das Datenbankschema anzuzeigen.",
     templateBtn: "Beispieldatei herunterladen",
-    archTitle: "Systemarchitektur &amp; Ordnerstruktur",
+    archTitle: "Systemarchitektur & Ordnerstruktur",
     archSub: "Visualisierung des technischen Designs des German Verb Conjugation Managers",
     archDiagramTab: "Architektur-Diagramm",
     archFolderTab: "Ordnerstruktur",

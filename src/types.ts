@@ -85,6 +85,7 @@ export interface AppChangeLog {
   descEn: string;
   descDe: string;
   previousOverride: UserOverride | null;
+  fields?: Partial<UserOverride>;
 }
 
 export interface VocabChangeLog {
@@ -134,18 +135,20 @@ export interface VocabularyCategory {
 
 export type SynonymAntonymType = "synonym" | "antonym" | "word_family" | "semantic_field" | "idiom" | "comparative_adjective";
 
+export interface SynonymAntonymItem {
+  word: string;
+  article?: ArticleType;
+  meaning?: string;
+  partOfSpeech?: PartOfSpeech;
+  comparative?: string;
+  superlative?: string;
+}
+
 export interface SynonymAntonymGroup {
   id: string;
   title: string;
   type: SynonymAntonymType;
-  items: {
-    word: string;
-    article?: ArticleType;
-    meaning?: string;
-    partOfSpeech?: PartOfSpeech;
-    comparative?: string;
-    superlative?: string;
-  }[];
+  items: SynonymAntonymItem[];
   notes?: string;
   createdAt: number;
   updatedAt: number;

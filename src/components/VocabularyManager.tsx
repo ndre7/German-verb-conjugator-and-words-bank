@@ -102,6 +102,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
   // Custom Delete/Reset Modal Confirmation (bypasses iframe window.confirm block)
   const [itemToDelete, setItemToDelete] = useState<VocabularyItem | null>(null);
   const [showResetConfirmModal, setShowResetConfirmModal] = useState(false);
+  const [pendingFullBackupText, setPendingFullBackupText] = useState<string | null>(null);
 
   useEffect(() => {
     setPageInput(String(currentPage));
@@ -227,14 +228,24 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
   const handleBulkDeleteVocabs = async () => {
     if (selectedVocabIds.size === 0) return;
-    const count = selectedVocabIds.size;
-    for (const id of Array.from(selectedVocabIds) as string[]) {
-      await dbService.deleteVocabulary(id);
-    }
+    const itemsToDelete = Array.from(selectedVocabIds) as string[];
+    const results = await Promise.allSettled(itemsToDelete.map(id => dbService.deleteVocabulary(id)));
+    const failed = results.filter(r => r.status === "rejected").length;
+    const succeeded = results.length - failed;
+
     setSelectedVocabIds(new Set());
     setShowBulkDeleteVocabModal(false);
     await loadData();
-    showToast(locale === "fa" ? `${count} واژه با موفقیت حذف شدند.` : `${count} words deleted successfully.`);
+
+    if (failed === 0) {
+      showToast(locale === "fa" ? `${succeeded} واژه با موفقیت حذف شدند.` : `${succeeded} words deleted successfully.`);
+    } else {
+      showToast(
+        locale === "fa"
+          ? `${succeeded} واژه حذف شد، ${failed} واژه با خطا مواجه شد.`
+          : `${succeeded} words deleted, ${failed} failed.`
+      );
+    }
   };
 
   const handleBulkAiEnrichVocabs = async () => {
@@ -289,9 +300,13 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
       await loadData();
       setSelectedVocabIds(new Set());
-      showToast(locale === "fa" ? `تعداد ${updatedCount} واژه با هوش مصنوعی بروزرسانی شدند ✨` : `${updatedCount} words enriched with AI ✨`);
+      showToast(
+        locale === "fa"
+          ? `تعداد ${updatedCount} واژه با هوش مصنوعی بروزرسانی شدند (قابل بازگشت از تاریخچه) ✨`
+          : `${updatedCount} words enriched with AI (revertible via History) ✨`
+      );
     } catch (err: any) {
-      alert("خطا در هوش مصنوعی: " + (err.message || err));
+      showToast((locale === "fa" ? "خطا در هوش مصنوعی: " : "AI error: ") + (err.message || err));
     } finally {
       setAiLoading(false);
     }
@@ -302,7 +317,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     const word = formWord.trim();
     const meaning = formMeaning.trim();
     if (!word && !meaning) {
-      alert(
+      showToast(
         locale === "fa"
           ? "لطفاً حداقل واژه آلمانی یا معنی فارسی آن را وارد کنید."
           : "Please enter the German word or Persian meaning first."
@@ -338,11 +353,11 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
             : "Word analyzed and filled with AI ✨"
         );
       } else {
-        alert(result.userMessage || result.error || "خطا در فراخوانی هوش مصنوعی");
+        showToast(result.userMessage || result.error || (locale === "fa" ? "خطا در فراخوانی هوش مصنوعی" : "AI error"));
       }
     } catch (err: any) {
       console.error("AI Error:", err);
-      alert("خطا در ارتباط با سرور: " + (err.message || err));
+      showToast((locale === "fa" ? "خطا در ارتباط با سرور: " : "Server connection error: ") + (err.message || err));
     } finally {
       setAiLoading(false);
     }
@@ -379,14 +394,14 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         await loadData();
         showToast(
           locale === "fa"
-            ? `اطلاعات کامل واژه "${updated.word}" با هوش مصنوعی بروزرسانی شد ✨`
-            : `Word "${updated.word}" enriched with AI ✨`
+            ? `اطلاعات کامل واژه "${updated.word}" با هوش مصنوعی بروزرسانی شد (قابل بازگشت از تاریخچه) ✨`
+            : `Word "${updated.word}" enriched with AI (revertible via History) ✨`
         );
       } else {
-        alert(result.userMessage || result.error || "خطا در هوش مصنوعی");
+        showToast(result.userMessage || result.error || (locale === "fa" ? "خطا در هوش مصنوعی" : "AI error"));
       }
     } catch (err: any) {
-      alert("خطا: " + (err.message || err));
+      showToast((locale === "fa" ? "خطا: " : "Error: ") + (err.message || err));
     } finally {
       setAiLoading(false);
       setActiveAiVocabId(null);
@@ -395,6 +410,29 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimer = useRef<any>(null);
+
+  const showToast = (msg: string | null, duration = 4000) => {
+    if (toastTimer.current) {
+      clearTimeout(toastTimer.current);
+      toastTimer.current = null;
+    }
+    setToastMessage(msg);
+    if (msg && duration > 0) {
+      toastTimer.current = setTimeout(() => {
+        setToastMessage(null);
+        toastTimer.current = null;
+      }, duration);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (toastTimer.current) {
+        clearTimeout(toastTimer.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     loadData();
@@ -458,11 +496,6 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       await dbService.saveCustomVocabOrder(newOrder);
       showToast(locale === "fa" ? "ترتیب واژگان بروزرسانی شد." : "Vocabulary reordered.");
     }
-  };
-
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 4000);
   };
 
   const handleOpenAddModal = () => {
@@ -558,7 +591,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     }
 
     if (tagIdsToApply.length === 0) {
-      alert(locale === "fa" ? "لطفاً حداقل یک تگ انتخاب یا وارد کنید." : "Please select or enter at least one tag.");
+      showToast(locale === "fa" ? "لطفاً حداقل یک تگ انتخاب یا وارد کنید." : "Please select or enter at least one tag.");
       return;
     }
 
@@ -686,7 +719,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       URL.revokeObjectURL(url);
       showToast(locale === "fa" ? "پشتیبان‌گیری کامل برنامه دانلود شد 📦" : "Full backup downloaded 📦");
     } catch (err: any) {
-      alert("خطا در پشتیبان‌گیری: " + err.message);
+      showToast((locale === "fa" ? "خطا در پشتیبان‌گیری: " : "Export error: ") + err.message);
     }
   };
 
@@ -695,23 +728,34 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = async (event) => {
-      try {
-        const text = event.target?.result as string;
-        const success = await dbService.importFullBackupJSON(text);
-        if (success) {
-          showToast(
-            locale === "fa"
-              ? "بازیابی کامل دیتابیس با موفقیت انجام شد ✨"
-              : "Full backup restored successfully ✨"
-          );
-          await loadData();
-        }
-      } catch (err: any) {
-        alert("خطا در فایل پشتیبان: " + err.message);
+    reader.onload = (event) => {
+      const text = event.target?.result as string;
+      if (text) {
+        setPendingFullBackupText(text);
       }
     };
     reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const handleConfirmFullBackup = async () => {
+    if (!pendingFullBackupText) return;
+    const text = pendingFullBackupText;
+    setPendingFullBackupText(null);
+
+    try {
+      const success = await dbService.importFullBackupJSON(text);
+      if (success) {
+        showToast(
+          locale === "fa"
+            ? "بازیابی کامل دیتابیس با موفقیت انجام شد ✨"
+            : "Full backup restored successfully ✨"
+        );
+        await loadData();
+      }
+    } catch (err: any) {
+      showToast((locale === "fa" ? "خطا در فایل پشتیبان: " : "Backup file error: ") + err.message);
+    }
   };
 
   // Bulk JSON File / Code Import Processing
@@ -1266,7 +1310,9 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                         setSuggestionIndex(prev => Math.max(prev - 1, -1));
                       } else if (e.key === "Enter" && suggestionIndex >= 0 && suggestedVocabs[suggestionIndex]) {
                         e.preventDefault();
-                        setLocalSearchQuery(suggestedVocabs[suggestionIndex].word);
+                        const selectedWord = suggestedVocabs[suggestionIndex].word;
+                        setLocalSearchQuery(selectedWord);
+                        setSearchQuery(selectedWord);
                         setShowSuggestions(false);
                       } else if (e.key === "Escape") {
                         setShowSuggestions(false);
@@ -1303,6 +1349,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                           key={vItem.id}
                           onClick={() => {
                             setLocalSearchQuery(vItem.word);
+                            setSearchQuery(vItem.word);
                             setShowSuggestions(false);
                           }}
                           className={`p-2.5 flex items-center justify-between cursor-pointer transition-colors ${
@@ -1685,10 +1732,14 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
                     <div className="text-sm font-bold text-slate-800 font-vazir">{item.meaning}</div>
 
-                    {item.plural && (
+                    {formatPluralDisplay(item.plural) !== "–" && (
                       <div className="text-xs text-slate-500 font-vazir">
-                        <span className="text-slate-400">جمع: </span>
-                        <span className="font-sans font-semibold text-slate-700">{item.plural}</span>
+                        <span className="text-slate-400">
+                          {locale === "fa" ? "جمع: " : locale === "de" ? "Plural: " : "Plural: "}
+                        </span>
+                        <span className="font-sans font-semibold text-slate-700">
+                          {formatPluralDisplay(item.plural)}
+                        </span>
                       </div>
                     )}
 
@@ -2332,6 +2383,48 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                 className="px-5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
               >
                 {locale === "fa" ? "بازنشانی" : locale === "de" ? "Zurücksetzen" : "Reset"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Full Backup Restore Confirmation Modal */}
+      {pendingFullBackupText !== null && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto no-print font-vazir">
+          <div className={`bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-md p-6 space-y-4 animate-in fade-in zoom-in-95 duration-200 ${isRtl ? "text-right" : "text-left"}`}>
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-amber-600 flex items-center gap-2">
+                <AlertCircle className="w-5 h-5 text-amber-600" />
+                {locale === "fa" ? "هشدار بازیابی نسخه پشتیبان" : locale === "de" ? "Backup wiederherstellen" : "Confirm Backup Restore"}
+              </h3>
+              <button onClick={() => setPendingFullBackupText(null)} className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-slate-700 leading-relaxed">
+              {locale === "fa"
+                ? "بازیابی این نسخه پشتیبان، تمام افعال، صرف‌ها، واژگان، دسته‌بندی‌ها و تنظیمات فعلی را با داده‌های فایل پشتیبان جایگزین خواهد کرد. آیا مایل به ادامه هستید؟"
+                : locale === "de"
+                ? "Durch das Wiederherstellen dieser Sicherung werden alle aktuellen Verben, Konjugationen, Vokabeln und Einstellungen überschrieben. Möchten Sie fortfahren?"
+                : "Restoring this backup will replace all current verbs, conjugations, vocabulary, categories, and settings with the backup data. Are you sure you want to proceed?"}
+            </p>
+
+            <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
+              <button
+                type="button"
+                onClick={() => setPendingFullBackupText(null)}
+                className="px-4 py-2 border border-slate-200 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-50 cursor-pointer"
+              >
+                {locale === "fa" ? "انصراف" : locale === "de" ? "Abbrechen" : "Cancel"}
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmFullBackup}
+                className="px-5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
+              >
+                {locale === "fa" ? "تایید و بازیابی" : locale === "de" ? "Wiederherstellen" : "Confirm & Restore"}
               </button>
             </div>
           </div>

@@ -35,8 +35,6 @@ import { geminiFetch } from "../services/apiKeyService";
 interface StoryPracticeProps {
   locale: "fa" | "de" | "en";
   isRtl: boolean;
-  verbs?: VerbItem[];
-  vocabularies?: VocabularyItem[];
   initialSubTab?: "generate" | "saved";
 }
 
@@ -84,38 +82,36 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
 export const StoryPractice: React.FC<StoryPracticeProps> = ({
   locale,
   isRtl,
-  verbs = [],
-  vocabularies = [],
   initialSubTab = "generate"
 }) => {
   // Navigation inside Practice
   const [activeSubTab, setActiveSubTab] = useState<"generate" | "saved">(initialSubTab);
 
-  // Local fallback verbs & vocabularies if parent doesn't provide them
-  const [dbVerbs, setDbVerbs] = useState<VerbItem[]>(verbs);
-  const [dbVocabs, setDbVocabs] = useState<VocabularyItem[]>(vocabularies);
+  // Verbs & vocabularies loaded directly from dbService on mount
+  const [dbVerbs, setDbVerbs] = useState<VerbItem[]>([]);
+  const [dbVocabs, setDbVocabs] = useState<VocabularyItem[]>([]);
 
   useEffect(() => {
+    let isMounted = true;
     const fetchDbData = async () => {
       try {
-        if (verbs.length === 0) {
-          const v = await dbService.getAllVerbs();
+        const [v, voc] = await Promise.all([
+          dbService.getAllVerbs(),
+          dbService.getVocabularies(),
+        ]);
+        if (isMounted) {
           setDbVerbs(v || []);
-        } else {
-          setDbVerbs(verbs);
-        }
-        if (vocabularies.length === 0) {
-          const voc = await dbService.getVocabularies();
           setDbVocabs(voc || []);
-        } else {
-          setDbVocabs(vocabularies);
         }
       } catch (e) {
         console.error("Error loading verbs/vocab for story practice:", e);
       }
     };
     fetchDbData();
-  }, [verbs, vocabularies]);
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Sync initialSubTab when parent changes it
   useEffect(() => {
@@ -816,7 +812,7 @@ export const StoryPractice: React.FC<StoryPracticeProps> = ({
                           manualFilterType === "verb" ? "bg-white text-indigo-700 shadow-3xs" : "text-slate-600"
                         }`}
                       >
-                        {locale === "fa" ? "افعال" : "Verbs"} ({verbs.length})
+                        {locale === "fa" ? "افعال" : "Verbs"} ({dbVerbs.length})
                       </button>
                       <button
                         type="button"
@@ -825,7 +821,7 @@ export const StoryPractice: React.FC<StoryPracticeProps> = ({
                           manualFilterType === "vocab" ? "bg-white text-purple-700 shadow-3xs" : "text-slate-600"
                         }`}
                       >
-                        {locale === "fa" ? "واژگان" : "Vocab"} ({vocabularies.length})
+                        {locale === "fa" ? "واژگان" : "Vocab"} ({dbVocabs.length})
                       </button>
                     </div>
 

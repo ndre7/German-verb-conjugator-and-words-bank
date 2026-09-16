@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   KeyRound,
   Plus,
@@ -14,6 +14,7 @@ import {
   Zap,
   ExternalLink,
   ShieldCheck,
+  ShieldAlert,
   Cpu,
   Server,
   Sparkles,
@@ -56,6 +57,16 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
   const [editingModelKeyId, setEditingModelKeyId] = useState<string | null>(null);
   const [editingModelValue, setEditingModelValue] = useState("");
 
+  // Flag to track whether the user explicitly picked a provider manually
+  const manualProviderSelectedRef = useRef(false);
+
+  // Reset customModel and customBaseUrl when provider changes
+  useEffect(() => {
+    setCustomModel("");
+    setCustomBaseUrl("");
+    setCustomProviderName("");
+  }, [selectedProvider]);
+
   // Load keys on mount and listen to updates
   useEffect(() => {
     const refreshKeys = () => {
@@ -76,7 +87,7 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
   const handleKeyChange = (val: string) => {
     setNewKeyValue(val);
     const clean = val.trim();
-    if (clean.length >= 4) {
+    if (!manualProviderSelectedRef.current && clean.length >= 4) {
       const detected = detectProvider(clean);
       if (detected !== "custom") {
         setSelectedProvider(detected);
@@ -120,6 +131,7 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
       setCustomModel("");
       setCustomBaseUrl("");
       setCustomProviderName("");
+      manualProviderSelectedRef.current = false;
       setShowNewKey(false);
       setShowAdvanced(false);
 
@@ -353,7 +365,10 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
               </label>
               <select
                 value={selectedProvider}
-                onChange={(e) => setSelectedProvider(e.target.value as ApiKeyProvider)}
+                onChange={(e) => {
+                  manualProviderSelectedRef.current = true;
+                  setSelectedProvider(e.target.value as ApiKeyProvider);
+                }}
                 className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50/70 font-sans cursor-pointer"
               >
                 {PROVIDER_LIST.map((p) => (
@@ -590,6 +605,8 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
               const isRevealed = revealedKeys[k.id] || false;
               const maskedKey = isRevealed
                 ? k.key
+                : k.key.length <= 12
+                ? `••••••••${k.key.slice(-2)}`
                 : `${k.key.substring(0, 6)}••••••••••••••••${k.key.substring(k.key.length - 4)}`;
               const providerMeta = PROVIDER_LIST.find((p) => p.id === k.provider);
               const displayName = k.providerName || (providerMeta ? (locale === "fa" ? providerMeta.nameFa : providerMeta.name) : k.provider);
@@ -830,6 +847,19 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
             })}
           </div>
         )}
+
+        {/* Security Notice: Local Plaintext Storage Disclaimer */}
+        <div className="mt-4 p-3 rounded-xl bg-amber-50/80 border border-amber-200/90 flex items-start gap-2.5 text-amber-900">
+          <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+          <div className="text-xs leading-relaxed">
+            <span className="font-bold">
+              {locale === "fa" ? "هشدار امنیتی:" : "Security Notice:"}
+            </span>{" "}
+            {locale === "fa"
+              ? "کلیدهای API به صورت متن خام (Plaintext) در حافظه مرورگر دستگاه شما ذخیره می‌شوند. هر فرد با دسترسی فیزیکی به این دستگاه یا افزونه‌های مخرب نصب‌شده روی مرورگر ممکن است به آن‌ها دسترسی یابد. لطفاً سهمیه‌ها و محدودیت‌های مالی کلیدهای خود را در پنل ارائه‌دهنده محدود فرمایید."
+              : "API keys are stored locally in your browser in plain text; anyone with device access or a malicious browser extension could read them. Please set spend limits and restrictions on your API provider dashboards."}
+          </div>
+        </div>
       </div>
     </div>
   );

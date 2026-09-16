@@ -23,6 +23,8 @@ export default function CategoryManager({
   const [newCatColor, setNewCatColor] = useState("#3B82F6");
   const [isOpen, setIsOpen] = useState(false);
 
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+
   useEffect(() => {
     loadCategories();
   }, []);
@@ -30,11 +32,13 @@ export default function CategoryManager({
   const loadCategories = async () => {
     const list = await dbService.getCategories();
     // Translate the seeded base categories based on current locale
-    const translatedList = list.map(cat => {
+    const translatedList = list.map((cat) => {
       if (cat.id === "regular" && t.regular) return { ...cat, name: t.regular };
       if (cat.id === "irregular" && t.irregular) return { ...cat, name: t.irregular };
       if (cat.id === "separable" && t.separable) return { ...cat, name: t.separable };
       if (cat.id === "reflexive" && t.reflexive) return { ...cat, name: t.reflexive };
+      if (cat.id === "akkusativ" && t.akkusativ) return { ...cat, name: t.akkusativ };
+      if (cat.id === "dativ" && t.dativ) return { ...cat, name: t.dativ };
       if (cat.id === "favorites" && t.favorites) return { ...cat, name: t.favorites };
       return cat;
     });
@@ -48,12 +52,30 @@ export default function CategoryManager({
 
   const handleAddCategory = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newCatName.trim()) return;
+    const trimmed = newCatName.trim();
+    if (!trimmed) return;
 
-    const id = newCatName.toLowerCase().replace(/\s+/g, "-");
+    const isDuplicate = categories.some(
+      (c) => c.name.trim().toLowerCase() === trimmed.toLowerCase()
+    );
+    if (isDuplicate) {
+      alert(
+        locale === "fa"
+          ? "دسته‌ای با این نام قبلاً ایجاد شده است."
+          : locale === "de"
+          ? "Eine Kategorie mit diesem Namen existiert bereits."
+          : "A category with this name already exists."
+      );
+      return;
+    }
+
+    const id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `cat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
     const newCat: Category = {
       id,
-      name: newCatName.trim(),
+      name: trimmed,
       color: newCatColor,
     };
 
@@ -64,14 +86,13 @@ export default function CategoryManager({
   };
 
   const handleDeleteCategory = async (id: string) => {
-    if (confirm(t.deleteCatConfirm)) {
-      await dbService.deleteCategory(id);
-      if (activeFilterIds.includes(id)) {
-        onFilterChange(activeFilterIds.filter((fId) => fId !== id));
-      }
-      await loadCategories();
-      if (onCategoriesChanged) onCategoriesChanged();
+    await dbService.deleteCategory(id);
+    setDeleteConfirmId(null);
+    if (activeFilterIds.includes(id)) {
+      onFilterChange(activeFilterIds.filter((fId) => fId !== id));
     }
+    await loadCategories();
+    if (onCategoriesChanged) onCategoriesChanged();
   };
 
   const isRtl = locale === "fa";
@@ -182,14 +203,34 @@ export default function CategoryManager({
                     />
                     <span className="font-vazir">{cat.name}</span>
                   </div>
-                  {/* Avoid deleting seeded defaults blindly, but let them delete if wanted, or guard regular/irregular */}
-                  <button
-                    onClick={() => handleDeleteCategory(cat.id)}
-                    className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg hover:bg-white border border-transparent hover:border-slate-200 transition-all"
-                    title="Kategorie löschen"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+                  {/* Delete category with non-blocking inline confirmation */}
+                  {deleteConfirmId !== cat.id ? (
+                    <button
+                      onClick={() => setDeleteConfirmId(cat.id)}
+                      className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg hover:bg-white border border-transparent hover:border-slate-200 transition-all cursor-pointer"
+                      title={t.deleteCatConfirm || "Kategorie löschen"}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  ) : (
+                    <div className="inline-flex items-center gap-1 bg-red-50 border border-red-200 p-1 rounded-lg">
+                      <span className="text-[11px] text-red-700 font-bold px-1 font-vazir">
+                        {locale === "fa" ? "حذف؟" : "Löschen?"}
+                      </span>
+                      <button
+                        onClick={() => handleDeleteCategory(cat.id)}
+                        className="px-2 py-0.5 bg-red-600 hover:bg-red-700 text-white rounded text-xs font-bold cursor-pointer font-vazir"
+                      >
+                        {locale === "fa" ? "بله" : "Ja"}
+                      </button>
+                      <button
+                        onClick={() => setDeleteConfirmId(null)}
+                        className="px-1.5 py-0.5 text-slate-500 hover:text-slate-800 text-xs cursor-pointer font-vazir"
+                      >
+                        {locale === "fa" ? "خیر" : "Nein"}
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

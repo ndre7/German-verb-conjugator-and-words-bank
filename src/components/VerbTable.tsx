@@ -101,9 +101,12 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
   const tableRef = useRef<HTMLTableElement>(null);
   const resultsContainerRef = useRef<HTMLDivElement>(null);
 
-  // Auto-detect responsive viewport on mount & resize
+  const userPickedView = useRef(false);
+
+  // Auto-detect responsive viewport on mount & resize (only if user hasn't toggled manually)
   useEffect(() => {
     const handleResize = () => {
+      if (userPickedView.current) return;
       if (window.innerWidth < 1024) {
         setViewMode("cards");
       } else {
@@ -114,61 +117,6 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
-
-  // Sticky Table Header Scroll Effect
-  useEffect(() => {
-    if (viewMode !== "table") return;
-
-    const handleScroll = () => {
-      const table = tableRef.current;
-      if (!table) return;
-
-      const thead = table.querySelector("thead");
-      if (!thead) return;
-
-      const ths = thead.querySelectorAll("th");
-      if (ths.length === 0) return;
-
-      const lastVerbRow = table.querySelector("#last-verb-first-row") as HTMLElement;
-      if (!lastVerbRow) {
-        ths.forEach((th) => {
-          th.style.transform = "";
-        });
-        return;
-      }
-
-      const rect = table.getBoundingClientRect();
-      const lastVerbTop = lastVerbRow.getBoundingClientRect().top;
-      const theadHeight = thead.getBoundingClientRect().height;
-
-      const navbar = document.querySelector("header");
-      const navbarHeight = navbar ? navbar.getBoundingClientRect().height : 80;
-
-      let translateY = 0;
-      if (rect.top < navbarHeight) {
-        const scrollOffset = navbarHeight - rect.top;
-        const maxTranslateY = lastVerbTop - rect.top - theadHeight;
-        translateY = Math.max(0, Math.min(scrollOffset, maxTranslateY));
-      }
-
-      ths.forEach((th) => {
-        th.style.transform = `translateY(${translateY}px)`;
-        th.style.position = "relative";
-        th.style.zIndex = "10";
-      });
-    };
-
-    window.addEventListener("scroll", handleScroll, { passive: true });
-    window.addEventListener("resize", handleScroll);
-
-    const timeoutId = setTimeout(handleScroll, 100);
-
-    return () => {
-      window.removeEventListener("scroll", handleScroll);
-      window.removeEventListener("resize", handleScroll);
-      clearTimeout(timeoutId);
-    };
-  }, [verbs, currentPage, showImperativ, activeFilterIds, searchQuery, viewMode]);
 
   // Handle click outside suggestions
   useEffect(() => {
@@ -205,11 +153,10 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     setLoading(true);
     await dbService.loadDatabase();
     await loadVerbsList();
-    await reloadCategories();
     setLoading(false);
   };
 
-  // Update translated categories when locale changes
+  // Update translated categories when locale changes (also fires on mount)
   useEffect(() => {
     reloadCategories();
   }, [locale]);
@@ -229,6 +176,30 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     S1: "", S2: "", S3: "", P1: "", P2: "", P3: ""
   });
   const [addVerbToastMessage, setAddVerbToastMessage] = useState<string | null>(null);
+  const toastTimer = useRef<any>(null);
+
+  const showToast = (msg: string | null, duration?: number) => {
+    if (toastTimer.current) {
+      clearTimeout(toastTimer.current);
+      toastTimer.current = null;
+    }
+    setAddVerbToastMessage(msg);
+    if (msg && duration !== 0) {
+      toastTimer.current = setTimeout(() => {
+        setAddVerbToastMessage(null);
+        toastTimer.current = null;
+      }, duration || 3500);
+    }
+  };
+
+  // Cleanup toast timers on unmount
+  useEffect(() => {
+    return () => {
+      if (toastTimer.current) {
+        clearTimeout(toastTimer.current);
+      }
+    };
+  }, []);
 
   // Verb JSON Import Modal State
   const [showVerbJsonModal, setShowVerbJsonModal] = useState(false);
@@ -290,15 +261,25 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
 
   const handleBulkDeleteVerbs = async () => {
     if (selectedVerbIds.size === 0) return;
-    const count = selectedVerbIds.size;
-    for (const inf of Array.from(selectedVerbIds) as string[]) {
-      await dbService.deleteVerb(inf);
-    }
+    const itemsToDelete = Array.from(selectedVerbIds) as string[];
+    const results = await Promise.allSettled(itemsToDelete.map(inf => dbService.deleteVerb(inf)));
+    const failed = results.filter(r => r.status === "rejected").length;
+    const succeeded = results.length - failed;
+
     setSelectedVerbIds(new Set());
     setShowBulkDeleteVerbModal(false);
     await loadVerbsList();
-    setAddVerbToastMessage(locale === "fa" ? `${count} فعل با موفقیت حذف شدند.` : `${count} verbs deleted successfully.`);
-    setTimeout(() => setAddVerbToastMessage(null), 3500);
+
+    if (failed === 0) {
+      showToast(locale === "fa" ? `${succeeded} فعل با موفقیت حذف شدند.` : `${succeeded} verbs deleted successfully.`, 3500);
+    } else {
+      showToast(
+        locale === "fa"
+          ? `${succeeded} فعل حذف شد، ${failed} فعل با خطا مواجه شد.`
+          : `${succeeded} verbs deleted, ${failed} failed.`,
+        4000
+      );
+    }
   };
 
   const handleBulkAiEnrichVerbs = async () => {
@@ -307,7 +288,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     if (selectedItems.length === 0) return;
 
     setVerbAiLoading(true);
-    setAddVerbToastMessage(locale === "fa" ? `در حال استخراج و تحلیل صرف‌های کامل ${selectedItems.length} فعل...` : `Enriching ${selectedItems.length} verbs with AI...`);
+    showToast(locale === "fa" ? `در حال استخراج و تحلیل صرف‌های کامل ${selectedItems.length} فعل...` : `Enriching ${selectedItems.length} verbs with AI...`, 0);
 
     try {
       const CHUNK_SIZE = 5;
@@ -329,8 +310,9 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         if (res.ok) {
           const data = await res.json();
           if (data.success && Array.isArray(data.items)) {
-            for (const enriched of data.items) {
-              const orig = chunk.find(c => c.infinitive.toLowerCase() === (enriched.infinitive || enriched.word || "").toLowerCase());
+            for (let idx = 0; idx < data.items.length; idx++) {
+              const enriched = data.items[idx];
+              const orig = chunk[idx] || chunk.find(c => c.infinitive.toLowerCase() === (enriched.infinitive || enriched.word || "").toLowerCase());
               if (orig) {
                 const cellOverrides: Record<string, string> = { ...orig.cellOverrides };
 
@@ -354,8 +336,16 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                   }
                 }
 
+                const correctedInfinitive = (enriched.infinitive && typeof enriched.infinitive === "string" && enriched.infinitive.trim())
+                  ? enriched.infinitive.trim()
+                  : orig.infinitive;
+
+                if (orig.infinitive !== correctedInfinitive) {
+                  await dbService.renameVerbInfinitive(orig.infinitive, correctedInfinitive);
+                }
+
                 await dbService.addVerb({
-                  infinitive: enriched.infinitive || orig.infinitive,
+                  infinitive: correctedInfinitive,
                   bedeutung: enriched.bedeutung || orig.bedeutung,
                   hilfsverb: enriched.hilfsverb === "sein" ? "sein" : (orig.hilfsverb || "haben"),
                   categories: Array.isArray(enriched.categories) && enriched.categories.length > 0 ? enriched.categories : orig.categories,
@@ -370,10 +360,14 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
 
       await loadVerbsList();
       setSelectedVerbIds(new Set());
-      setAddVerbToastMessage(locale === "fa" ? `تعداد ${updatedCount} فعل با موفقیت غنی‌سازی شدند ✨` : `${updatedCount} verbs enriched with AI ✨`);
-      setTimeout(() => setAddVerbToastMessage(null), 3500);
+      showToast(
+        locale === "fa"
+          ? `تعداد ${updatedCount} فعل با موفقیت غنی‌سازی شدند (قابل بازگشت از تاریخچه) ✨`
+          : `${updatedCount} verbs enriched with AI (revertible via History) ✨`,
+        3500
+      );
     } catch (err: any) {
-      alert("خطا در هوش مصنوعی افعال: " + (err.message || err));
+      showToast((locale === "fa" ? "خطا در هوش مصنوعی افعال: " : "Verb AI error: ") + (err.message || err), 4000);
     } finally {
       setVerbAiLoading(false);
     }
@@ -388,7 +382,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     const inf = newInfinitive.trim();
     const bed = newBedeutung.trim();
     if (!inf && !bed) {
-      alert(locale === "fa" ? "لطفاً ابتدا مصدر فعل آلمانی یا معنی فارسی آن را وارد کنید." : "Please enter the German verb infinitive or Persian meaning first.");
+      showToast(locale === "fa" ? "لطفاً ابتدا مصدر فعل آلمانی یا معنی فارسی آن را وارد کنید." : "Please enter the German verb infinitive or Persian meaning first.", 3500);
       return;
     }
     setVerbAiLoading(true);
@@ -417,13 +411,12 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
             P3: Array.isArray(pr.P3) ? pr.P3.join(", ") : pr.P3 || "",
           });
         }
-        setAddVerbToastMessage(locale === "fa" ? "اطلاعات فعل و صرف‌ها با هوش مصنوعی پیدا شدند ✨" : "Verb data fetched with AI ✨");
-        setTimeout(() => setAddVerbToastMessage(null), 3500);
+        showToast(locale === "fa" ? "اطلاعات فعل و صرف‌ها با هوش مصنوعی پیدا شدند ✨" : "Verb data fetched with AI ✨", 3500);
       } else {
-        alert(result.userMessage || result.error || "خطا در تحلیل فعل با هوش مصنوعی");
+        showToast(result.userMessage || result.error || (locale === "fa" ? "خطا در تحلیل فعل با هوش مصنوعی" : "Verb AI error"), 4000);
       }
     } catch (err: any) {
-      alert("خطا: " + (err.message || err));
+      showToast((locale === "fa" ? "خطا: " : "Error: ") + (err.message || err), 4000);
     } finally {
       setVerbAiLoading(false);
     }
@@ -490,17 +483,17 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         });
 
         await loadVerbsList();
-        setAddVerbToastMessage(
+        showToast(
           locale === "fa"
-            ? `تمام صرف‌های فعل "${correctedInfinitive}" با هوش مصنوعی تکمیل شد ✨`
-            : `All tenses for "${correctedInfinitive}" populated with AI ✨`
+            ? `تمام صرف‌های فعل "${correctedInfinitive}" با هوش مصنوعی تکمیل شد (قابل بازگشت از تاریخچه) ✨`
+            : `All tenses for "${correctedInfinitive}" populated with AI (revertible via History) ✨`,
+          3500
         );
-        setTimeout(() => setAddVerbToastMessage(null), 3500);
       } else {
-        alert(result.userMessage || result.error || "خطا در هوش مصنوعی");
+        showToast(result.userMessage || result.error || (locale === "fa" ? "خطا در هوش مصنوعی" : "AI error"), 4000);
       }
     } catch (err: any) {
-      alert("خطا: " + (err.message || err));
+      showToast((locale === "fa" ? "خطا: " : "Error: ") + (err.message || err), 4000);
     } finally {
       setVerbAiLoading(false);
       setActiveAiVerbInfinitive(null);
@@ -524,12 +517,12 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     // Duplicate check for single verb creation
     const exists = verbs.some(v => v.infinitive.toLowerCase().trim() === rawInf.toLowerCase());
     if (exists) {
-      setAddVerbToastMessage(
+      showToast(
         locale === "fa"
           ? `فعل "${rawInf}" از قبل در جدول افعال وجود دارد و اضافه نشد.`
-          : `Verb "${rawInf}" already exists in table.`
+          : `Verb "${rawInf}" already exists in table.`,
+        4000
       );
-      setTimeout(() => setAddVerbToastMessage(null), 4000);
       return;
     }
 
@@ -562,8 +555,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
     await loadVerbsList();
 
     const successMsg = (t.verbAddedSuccess || "فعل \"{verb}\" با موفقیت اضافه شد و در بالای لیست قرار گرفت!").replace("{verb}", rawInf);
-    setAddVerbToastMessage(successMsg);
-    setTimeout(() => setAddVerbToastMessage(null), 4000);
+    showToast(successMsg, 4000);
   };
 
   const loadVerbsList = async () => {
@@ -643,8 +635,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       const msg = locale === "fa"
         ? `تمامی افعال وارد شده (${duplicateVerbs.join(", ")}) از قبل در جدول وجود دارند و هیچ فعل جدیدی اضافه نشد.`
         : `All entered verbs already exist (${duplicateVerbs.join(", ")}).`;
-      setAddVerbToastMessage(msg);
-      setTimeout(() => setAddVerbToastMessage(null), 4000);
+      showToast(msg, 4000);
       return;
     }
 
@@ -680,8 +671,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         : ` (${duplicateVerbs.length} duplicates skipped)`;
     }
 
-    setAddVerbToastMessage(msg);
-    setTimeout(() => setAddVerbToastMessage(null), 4000);
+    showToast(msg, 4000);
   };
 
   // Verb JSON File Upload Handler
@@ -855,7 +845,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       }
 
       setVerbJsonImportSuccess(msg);
-      setAddVerbToastMessage(locale === "fa" ? `${countSuccess} فعل جدید درون‌ریزی شد.` : `${countSuccess} new verbs imported.`);
+      showToast(locale === "fa" ? `${countSuccess} فعل جدید درون‌ریزی شد.` : `${countSuccess} new verbs imported.`, 3000);
       setTimeout(() => setShowVerbJsonModal(false), 2000);
     } catch (err: any) {
       console.error("Verb JSON parse error:", err);
@@ -1029,12 +1019,12 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       if (newInf && newInf !== verb) {
         await dbService.renameVerbInfinitive(verb, newInf);
         await loadVerbsList();
-        setAddVerbToastMessage(
+        showToast(
           locale === "fa"
             ? `املای فعل به "${newInf}" تغییر یافت`
-            : `Verb spelling updated to "${newInf}"`
+            : `Verb spelling updated to "${newInf}"`,
+          3000
         );
-        setTimeout(() => setAddVerbToastMessage(null), 3000);
       }
       setEditingCell(null);
       return;
@@ -1664,7 +1654,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
           <Check className="w-5 h-5 bg-white text-emerald-700 rounded-full p-0.5 shrink-0" />
           <span>{addVerbToastMessage}</span>
           <button 
-            onClick={() => setAddVerbToastMessage(null)}
+            onClick={() => showToast(null)}
             className="mr-2 text-emerald-200 hover:text-white p-1 rounded-lg"
           >
             <X className="w-4 h-4" />
@@ -2061,7 +2051,10 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
           <span className="text-xs font-semibold text-slate-600 font-vazir shrink-0">{t.mobileViewMode}</span>
           <div className="flex bg-slate-200/60 p-0.5 rounded-xl border border-slate-200 w-full sm:w-auto overflow-hidden">
             <button
-              onClick={() => setViewMode("cards")}
+              onClick={() => {
+                userPickedView.current = true;
+                setViewMode("cards");
+              }}
               className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
                 viewMode === "cards" ? "bg-white text-indigo-600 shadow-2xs" : "text-slate-600 hover:text-slate-800"
               }`}
@@ -2070,7 +2063,10 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
               <span className="font-vazir whitespace-nowrap">{t.mobileGrid}</span>
             </button>
             <button
-              onClick={() => setViewMode("table")}
+              onClick={() => {
+                userPickedView.current = true;
+                setViewMode("table");
+              }}
               className={`flex-1 sm:flex-initial flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
                 viewMode === "table" ? "bg-white text-indigo-600 shadow-2xs" : "text-slate-600 hover:text-slate-800"
               }`}
@@ -2515,7 +2511,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
             <table ref={tableRef} id="verb-conjugation-main-table" dir="ltr" className={`w-full border-collapse text-sm text-slate-600 ${isRtl ? "text-right" : "text-left"}`}>
               <thead>
                 <tr className="bg-slate-900 text-white border-b border-slate-800 text-xs tracking-wider uppercase font-sans">
-                  <th className="py-4 px-3 font-semibold text-center w-10 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 no-print">
+                  <th className="py-4 px-3 font-semibold text-center w-10 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 no-print">
                     <input
                       type="checkbox"
                       checked={paginatedVerbs.length > 0 && selectedVerbIds.size === paginatedVerbs.length}
@@ -2524,19 +2520,19 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                       title={locale === "fa" ? "انتخاب همه افعال این صفحه" : "Select all verbs on page"}
                     />
                   </th>
-                  <th className="py-4 px-4 font-semibold text-center w-14 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800">{t.numberCol}</th>
-                  <th className="py-4 px-5 font-semibold text-slate-200 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.verbCol}</th>
-                  <th className="py-4 px-4 font-semibold font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.auxCol}</th>
-                  <th className="py-4 px-4 font-semibold font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.meaningCol}</th>
-                  <th className="py-4 px-4 font-semibold text-indigo-400 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">
+                  <th className="py-4 px-4 font-semibold text-center w-14 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800">{t.numberCol}</th>
+                  <th className="py-4 px-5 font-semibold text-slate-200 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.verbCol}</th>
+                  <th className="py-4 px-4 font-semibold font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.auxCol}</th>
+                  <th className="py-4 px-4 font-semibold font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.meaningCol}</th>
+                  <th className="py-4 px-4 font-semibold text-indigo-400 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">
                     {showImperativ ? (locale === "fa" ? "حالت" : locale === "de" ? "Modus" : "Mode") : t.tenseCol}
                   </th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.ichCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.duCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.erCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.wirCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.ihrCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir relative z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.sieCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.ichCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.duCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.erCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.wirCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.ihrCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.sieCol}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">

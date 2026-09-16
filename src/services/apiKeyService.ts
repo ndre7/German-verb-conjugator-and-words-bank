@@ -1,17 +1,6 @@
-export type ApiKeyProvider =
-  | "gemini"
-  | "openai"
-  | "groq"
-  | "deepseek"
-  | "anthropic"
-  | "openrouter"
-  | "mistral"
-  | "together"
-  | "xai"
-  | "perplexity"
-  | "cerebras"
-  | "custom"
-  | string;
+import { ApiKeyProvider, detectProvider } from "../shared/providers";
+export type { ApiKeyProvider };
+export { detectProvider };
 
 export interface ProviderMeta {
   id: ApiKeyProvider;
@@ -65,7 +54,7 @@ export const PROVIDER_LIST: ProviderMeta[] = [
   {
     id: "anthropic",
     name: "Anthropic Claude",
-    nameFa: "آنت Consistent کلود (Anthropic Claude)",
+    nameFa: "آنتروپیک کلود (Anthropic Claude)",
     candidateModels: ["claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307", "claude-3-5-sonnet-latest"],
     placeholder: "sk-ant-...",
     descriptionFa: "درک زبانی فوق‌العاده با مدل‌های Haiku و Sonnet",
@@ -136,19 +125,6 @@ export const PROVIDER_LIST: ProviderMeta[] = [
     baseUrl: "https://api.together.xyz/v1",
   },
 ];
-
-export function detectProvider(key: string): ApiKeyProvider {
-  const trimmed = (key || "").trim();
-  if (trimmed.startsWith("AIza")) return "gemini";
-  if (trimmed.startsWith("gsk_")) return "groq";
-  if (trimmed.startsWith("sk-ant-")) return "anthropic";
-  if (trimmed.startsWith("sk-or-")) return "openrouter";
-  if (trimmed.startsWith("pplx-")) return "perplexity";
-  if (trimmed.startsWith("xai-")) return "xai";
-  if (trimmed.startsWith("csk-")) return "cerebras";
-  if (trimmed.startsWith("sk-proj-") || trimmed.startsWith("sk-")) return "openai";
-  return "custom";
-}
 
 export interface CustomApiKey {
   id: string;
@@ -284,26 +260,9 @@ export const apiKeyService = {
     }
   },
 
-  getEnabledKeys(): {
-    id: string;
-    key: string;
-    name: string;
-    provider: ApiKeyProvider;
-    providerName?: string;
-    model?: string;
-    baseUrl?: string;
-  }[] {
+  getEnabledKeys(): CustomApiKey[] {
     return this.getKeys()
-      .filter((k) => k.enabled && k.key && k.key.trim().length > 5)
-      .map((k) => ({
-        id: k.id,
-        key: k.key.trim(),
-        name: k.name,
-        provider: k.provider || detectProvider(k.key),
-        providerName: k.providerName,
-        model: k.model,
-        baseUrl: k.baseUrl,
-      }));
+      .filter((k) => k.enabled && k.key && k.key.trim().length > 5);
   },
 
   async validateKey(
@@ -375,7 +334,16 @@ export async function geminiFetch(input: RequestInfo | URL, init?: RequestInit):
   const headers = new Headers(modifiedInit.headers || {});
 
   if (enabledKeys.length > 0) {
-    headers.set("x-custom-api-keys", JSON.stringify(enabledKeys));
+    // Cap at 10 keys: prefer valid status, then most-recently validated / checked
+    const prioritizedKeys = [...enabledKeys]
+      .sort((a, b) => {
+        if (a.status === "valid" && b.status !== "valid") return -1;
+        if (b.status === "valid" && a.status !== "valid") return 1;
+        return (b.lastChecked || 0) - (a.lastChecked || 0);
+      })
+      .slice(0, 10);
+
+    headers.set("x-custom-api-keys", JSON.stringify(prioritizedKeys));
   }
   modifiedInit.headers = headers;
 

@@ -2,11 +2,50 @@ import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
+import { detectProvider } from "./src/shared/providers";
 
 const app = express();
-const PORT = 3000;
+app.set("trust proxy", true); // Cloud Run frontend proxy trust
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
 app.use(express.json({ limit: "10mb" }));
+
+// In-memory sliding window rate limiter for AI endpoints (protect server resources & quotas)
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT_MAX = 60; // 60 requests per minute
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimitMap) {
+    if (now > v.resetTime) rateLimitMap.delete(k);
+  }
+}, 5 * 60 * 1000).unref();
+
+function aiRateLimiter(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const ip = req.ip || req.headers["x-forwarded-for"]?.toString() || "unknown";
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+
+  if (!entry || now > entry.resetTime) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS });
+    return next();
+  }
+
+  if (entry.count >= RATE_LIMIT_MAX) {
+    return res.status(429).json({
+      success: false,
+      error: "تعداد درخواست‌های ارسالی بیش از حد مجاز است. لطفاً کمی بعد تلاش فرمایید.",
+      userMessage: "تعداد درخواست‌های ارسالی بیش از حد مجاز است. لطفاً یک دقیقه دیگر دوباره تلاش کنید.",
+      reason: "quota_exhausted",
+    });
+  }
+
+  entry.count++;
+  return next();
+}
+
+app.use("/api/gemini", aiRateLimiter);
 
 // Initialize and cache ordered Gemini Clients for multi-account fallback
 interface GeminiClientEntry {
@@ -14,14 +53,12 @@ interface GeminiClientEntry {
   label: string;
 }
 
-// Models scheduled for shutdown on Oct 16, 2026; 2.5 family may show intermittent 404s.
 // gemini-3.6-flash is currently recommended & stable.
 export const GEMINI_FALLBACK_MODELS = [
-  "gemini-2.5-flash",
-  "gemini-3.8-flash",
   "gemini-3.6-flash",
+  "gemini-3.8-flash",
   "gemini-3.1-flash-lite",
-  "gemini-1.5-flash",
+  "gemini-2.5-flash",
 ];
 
 export type ApiKeyProvider =
@@ -41,11 +78,10 @@ export type ApiKeyProvider =
 
 export const PROVIDER_FALLBACK_MODELS: Record<string, string[]> = {
   gemini: [
-    "gemini-2.5-flash",
-    "gemini-3.8-flash",
     "gemini-3.6-flash",
+    "gemini-3.8-flash",
     "gemini-3.1-flash-lite",
-    "gemini-1.5-flash",
+    "gemini-2.5-flash",
   ],
   openai: [
     "gpt-4o-mini",
@@ -141,15 +177,7 @@ export interface GeminiCallResult {
   tokensUsed: number;
 }
 
-export function detectProvider(key: string): ApiKeyProvider {
-  const trimmed = (key || "").trim();
-  if (trimmed.startsWith("AIza")) return "gemini";
-  if (trimmed.startsWith("gsk_")) return "groq";
-  if (trimmed.startsWith("sk-ant-")) return "anthropic";
-  if (trimmed.startsWith("sk-or-")) return "openrouter";
-  if (trimmed.startsWith("sk-proj-") || trimmed.startsWith("sk-")) return "openai";
-  return "gemini";
-}
+export { detectProvider };
 
 // In-memory process-lifetime cache of models confirmed retired/unavailable per account (404 / no longer available)
 // Key format: `${accountLabel}:${modelName}`
@@ -234,29 +262,419 @@ function getOrderedGeminiClients(): GeminiClientEntry[] {
   return cachedGeminiClients;
 }
 
+// SSRF Protection: Validate custom base URL
+function validateCustomBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim();
+  if (!trimmed) return "";
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(trimmed);
+  } catch {
+    throw new Error(`Invalid custom baseUrl: "${trimmed}". Must be a valid HTTP or HTTPS URL.`);
+  }
+
+  const hostname = parsedUrl.hostname.toLowerCase();
+  const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+
+  if (parsedUrl.protocol === "http:") {
+    if (!isLocalhost) {
+      throw new Error("HTTP protocol is only allowed for localhost/127.0.0.1. Remote APIs must use HTTPS.");
+    }
+  } else if (parsedUrl.protocol !== "https:") {
+    throw new Error("Only HTTP or HTTPS protocols are permitted.");
+  }
+
+  const isCloudMetadata =
+    hostname === "169.254.169.254" ||
+    hostname === "metadata.google.internal" ||
+    hostname === "metadata.google" ||
+    hostname === "metadata" ||
+    hostname.endsWith(".internal");
+
+  if (isCloudMetadata) {
+    throw new Error("Access to internal metadata services is prohibited.");
+  }
+
+  if (!isLocalhost) {
+    const isPrivateIp =
+      /^10\./.test(hostname) ||
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname) ||
+      /^192\.168\./.test(hostname) ||
+      /^169\.254\./.test(hostname) ||
+      hostname === "0.0.0.0";
+    if (isPrivateIp) {
+      throw new Error("Access to private network IP addresses is restricted.");
+    }
+  }
+
+  return trimmed.replace(/\/+$/, "");
+}
+
+function resolveChatEndpoint(provider: string, rawBaseUrl?: string): string {
+  const customBase = rawBaseUrl ? validateCustomBaseUrl(rawBaseUrl) : "";
+  if (customBase) {
+    if (customBase.endsWith("/chat/completions")) return customBase;
+    if (customBase.endsWith("/v1") || customBase.endsWith("/v2")) return `${customBase}/chat/completions`;
+    return `${customBase}/v1/chat/completions`;
+  }
+  switch (provider) {
+    case "openai": return "https://api.openai.com/v1/chat/completions";
+    case "groq": return "https://api.groq.com/openai/v1/chat/completions";
+    case "deepseek": return "https://api.deepseek.com/chat/completions";
+    case "mistral": return "https://api.mistral.ai/v1/chat/completions";
+    case "openrouter": return "https://openrouter.ai/api/v1/chat/completions";
+    case "together": return "https://api.together.xyz/v1/chat/completions";
+    case "xai": return "https://api.x.ai/v1/chat/completions";
+    case "perplexity": return "https://api.perplexity.ai/chat/completions";
+    case "cerebras": return "https://api.cerebras.ai/v1/chat/completions";
+    default: return "http://localhost:11434/v1/chat/completions";
+  }
+}
+
 // Robust execution helper with multi-model and multi-provider failover
 function parseCleanJson(text: string): any {
   let cleaned = text.trim();
-  if (cleaned.startsWith("```")) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceMatch) {
+    cleaned = fenceMatch[1].trim();
   }
   try {
     return JSON.parse(cleaned);
   } catch (initialErr) {
-    // Robust extraction: locate first '{' and matching last '}' OR first '[' and last ']'
+    // Balanced-brace / bracket scanner that respects string literals and escapes
     const firstBrace = cleaned.indexOf("{");
-    const lastBrace = cleaned.lastIndexOf("}");
     const firstBracket = cleaned.indexOf("[");
-    const lastBracket = cleaned.lastIndexOf("]");
 
-    if (firstBrace !== -1 && lastBrace > firstBrace && (firstBracket === -1 || firstBrace < firstBracket)) {
-      const extracted = cleaned.substring(firstBrace, lastBrace + 1);
-      return JSON.parse(extracted);
-    } else if (firstBracket !== -1 && lastBracket > firstBracket) {
-      const extracted = cleaned.substring(firstBracket, lastBracket + 1);
-      return JSON.parse(extracted);
+    let startIdx = -1;
+    let openChar = "";
+    let closeChar = "";
+
+    if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) {
+      startIdx = firstBrace;
+      openChar = "{";
+      closeChar = "}";
+    } else if (firstBracket !== -1) {
+      startIdx = firstBracket;
+      openChar = "[";
+      closeChar = "]";
+    }
+
+    if (startIdx !== -1) {
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let i = startIdx; i < cleaned.length; i++) {
+        const c = cleaned[i];
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (c === "\\") {
+          escaped = true;
+          continue;
+        }
+        if (c === '"') {
+          inString = !inString;
+          continue;
+        }
+        if (!inString) {
+          if (c === openChar) {
+            depth++;
+          } else if (c === closeChar) {
+            depth--;
+            if (depth === 0) {
+              const candidate = cleaned.substring(startIdx, i + 1);
+              try {
+                return JSON.parse(candidate);
+              } catch (_) {
+                break;
+              }
+            }
+          }
+        }
+      }
     }
     throw initialErr;
+  }
+}
+
+interface ExecuteAIProviderCallOptions {
+  key: string;
+  provider?: ApiKeyProvider;
+  baseUrl?: string;
+  model?: string;
+  contents: string;
+  maxTokens?: number;
+  isPing?: boolean;
+  responseSchema?: any;
+  responseMimeType?: string;
+  timeoutMs?: number;
+}
+
+interface ExecuteAIProviderCallResult {
+  text: string;
+  tokensUsed: number;
+  activeModel: string;
+  resolvedProvider: ApiKeyProvider;
+}
+
+// Single authoritative AI caller for Gemini, Anthropic, and OpenAI-compatible providers
+async function executeAIProviderCall(
+  options: ExecuteAIProviderCallOptions
+): Promise<ExecuteAIProviderCallResult> {
+  const cleanKey = options.key.trim();
+  const resolvedProvider: ApiKeyProvider = options.provider || detectProvider(cleanKey);
+
+  if (resolvedProvider === "gemini") {
+    const customClient = new GoogleGenAI({
+      apiKey: cleanKey,
+      httpOptions: { headers: { "User-Agent": options.isPing ? "aistudio-build-validate" : "aistudio-build-custom" } },
+    });
+
+    const modelsToTry = options.isPing
+      ? getCandidateModelsForProvider("gemini", options.model)
+      : options.model?.trim()
+      ? [options.model.trim()]
+      : GEMINI_FALLBACK_MODELS;
+
+    let lastGeminiErr: any = null;
+
+    for (const model of modelsToTry) {
+      try {
+        const config: any = {};
+        if (options.isPing) {
+          config.maxOutputTokens = options.maxTokens || 2;
+        } else {
+          config.responseMimeType = options.responseMimeType || "application/json";
+          if (options.responseSchema) {
+            config.responseSchema = options.responseSchema;
+          }
+        }
+
+        const response = await customClient.models.generateContent({
+          model,
+          contents: options.contents,
+          config,
+        });
+
+        if (response && response.text) {
+          const tokenCount =
+            (response as any).usageMetadata?.totalTokenCount ||
+            Math.ceil((options.contents.length + response.text.length) / 4);
+          return {
+            text: response.text,
+            tokensUsed: tokenCount,
+            activeModel: model,
+            resolvedProvider,
+          };
+        }
+      } catch (err: any) {
+        lastGeminiErr = err;
+        const errStr = (err.message || err.toString() || "").toLowerCase();
+        const errStatus = err.status || err.code || 0;
+        const isAuth =
+          errStatus === 401 ||
+          errStatus === 403 ||
+          errStr.includes("401") ||
+          errStr.includes("403") ||
+          errStr.includes("unauthenticated") ||
+          errStr.includes("invalid api key") ||
+          errStr.includes("api key not valid");
+
+        if (isAuth) {
+          const authErr = new Error(`Authentication failed for Gemini key: ${err.message}`);
+          (authErr as any).isAuth = true;
+          throw authErr;
+        }
+
+        if (options.model?.trim()) {
+          throw err;
+        }
+
+        if (!options.isPing) {
+          const isQuota =
+            errStatus === 429 ||
+            errStr.includes("429") ||
+            errStr.includes("quota") ||
+            errStr.includes("resource_exhausted");
+          if (isQuota) {
+            let delaySeconds = 0;
+            const retryMatch = errStr.match(/retry in\s+([\d.]+)\s*s/i) || errStr.match(/retrydelay['":\s]+([\d.]+)/i);
+            if (retryMatch) delaySeconds = parseFloat(retryMatch[1]);
+            if (delaySeconds > 0 && delaySeconds <= 10) {
+              await new Promise((r) => setTimeout(r, Math.ceil(delaySeconds * 1000)));
+              const retryRes = await customClient.models.generateContent({
+                model,
+                contents: options.contents,
+                config: {
+                  responseMimeType: options.responseMimeType || "application/json",
+                  ...(options.responseSchema ? { responseSchema: options.responseSchema } : {}),
+                },
+              });
+              if (retryRes && retryRes.text) {
+                const count = (retryRes as any).usageMetadata?.totalTokenCount || Math.ceil((options.contents.length + retryRes.text.length) / 4);
+                return {
+                  text: retryRes.text,
+                  tokensUsed: count,
+                  activeModel: model,
+                  resolvedProvider,
+                };
+              }
+            }
+            const quotaErr = new Error(`Quota exhausted for Gemini key: ${err.message}`);
+            (quotaErr as any).isQuota = true;
+            throw quotaErr;
+          }
+        }
+      }
+    }
+    throw lastGeminiErr || new Error("Gemini models failed to generate content.");
+  } else if (resolvedProvider === "anthropic") {
+    const modelsToTry = getCandidateModelsForProvider("anthropic", options.model);
+    const endpoint = "https://api.anthropic.com/v1/messages";
+    let lastAnthropicErr: any = null;
+
+    for (const targetModel of modelsToTry) {
+      try {
+        const body: any = {
+          model: targetModel,
+          max_tokens: options.maxTokens || 4096,
+          messages: [{ role: "user", content: options.contents }],
+        };
+        if (!options.isPing) {
+          body.system = "You are a professional linguistic assistant for German language learning. You must return your response strictly as valid, raw JSON without any markdown code fence wrappers and without conversational preamble.";
+        }
+
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "x-api-key": cleanKey,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+          redirect: "manual",
+          signal: AbortSignal.timeout(options.timeoutMs || 45000),
+        });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          const isAuth = res.status === 401 || res.status === 403;
+          if (isAuth) {
+            const authErr = new Error(`Anthropic authentication failed (${res.status}): ${errText}`);
+            (authErr as any).isAuth = true;
+            throw authErr;
+          }
+          if (options.model?.trim()) {
+            throw new Error(`Anthropic error (${res.status}) on model "${targetModel}": ${errText}`);
+          }
+          console.warn(`[Anthropic Fallback] Model "${targetModel}" failed with HTTP ${res.status}: ${errText.slice(0, 100)}. Trying next candidate model...`);
+          lastAnthropicErr = new Error(`Anthropic error (${res.status}): ${errText}`);
+          continue;
+        }
+
+        const data: any = await res.json();
+        const text = data.content?.[0]?.text || "";
+        const tokens =
+          (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0) ||
+          Math.ceil((options.contents.length + text.length) / 4);
+        return {
+          text,
+          tokensUsed: tokens,
+          activeModel: targetModel,
+          resolvedProvider,
+        };
+      } catch (err: any) {
+        if (err.isAuth) throw err;
+        if (options.model?.trim()) throw err;
+        lastAnthropicErr = err;
+      }
+    }
+    throw lastAnthropicErr || new Error("All candidate Anthropic models failed.");
+  } else {
+    // OpenAI-compatible providers: openai, groq, deepseek, mistral, openrouter, together, xai, perplexity, cerebras, or ANY custom provider
+    const endpoint = resolveChatEndpoint(resolvedProvider, options.baseUrl);
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${cleanKey}`,
+    };
+    if (resolvedProvider === "openrouter") {
+      headers["HTTP-Referer"] = process.env.APP_URL || `http://localhost:${PORT}`;
+      headers["X-Title"] = "German Verb Conjugation Manager";
+    }
+
+    const modelsToTry = getCandidateModelsForProvider(resolvedProvider, options.model);
+    let lastProviderErr: any = null;
+
+    for (const targetModel of modelsToTry) {
+      try {
+        const body: any = {
+          model: targetModel,
+          messages: options.isPing
+            ? [{ role: "user", content: "ping" }]
+            : [
+                {
+                  role: "system",
+                  content: "You are a professional linguistic assistant for German language learning. You must return your response strictly as valid, raw JSON without any markdown code fence wrappers (such as ```json) and without conversational preamble.",
+                },
+                {
+                  role: "user",
+                  content: options.contents,
+                },
+              ],
+          temperature: 0.2,
+        };
+
+        if (options.maxTokens) {
+          body.max_tokens = options.maxTokens;
+        }
+
+        if (!options.isPing && (resolvedProvider === "openai" || resolvedProvider === "deepseek" || resolvedProvider === "groq" || resolvedProvider === "mistral" || resolvedProvider === "together")) {
+          body.response_format = { type: "json_object" };
+        }
+
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          redirect: "manual",
+          signal: AbortSignal.timeout(options.timeoutMs || 45000),
+        });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          const isAuth = res.status === 401 || res.status === 403;
+          if (isAuth) {
+            const authErr = new Error(`${resolvedProvider} authentication failed (${res.status}): ${errText}`);
+            (authErr as any).isAuth = true;
+            throw authErr;
+          }
+          if (options.model?.trim()) {
+            throw new Error(`خطا در درخواست به مدل "${targetModel}" از سرویس ${resolvedProvider} (${res.status}): ${errText}`);
+          }
+          console.warn(`[${resolvedProvider} Model Fallback] Model "${targetModel}" returned HTTP ${res.status}: ${errText.slice(0, 100)}. Trying next candidate model...`);
+          lastProviderErr = new Error(`${resolvedProvider} error (${res.status}): ${errText}`);
+          continue;
+        }
+
+        const data: any = await res.json();
+        const text = data.choices?.[0]?.message?.content || "";
+        const tokens = data.usage?.total_tokens || Math.ceil((options.contents.length + text.length) / 4);
+        return {
+          text,
+          tokensUsed: tokens,
+          activeModel: targetModel,
+          resolvedProvider,
+        };
+      } catch (err: any) {
+        if (err.isAuth) throw err;
+        if (options.model?.trim()) throw err;
+        lastProviderErr = err;
+      }
+    }
+
+    throw lastProviderErr || new Error(`All candidate models for ${resolvedProvider} failed.`);
   }
 }
 
@@ -269,241 +687,18 @@ async function executeCustomKeyCall(
     responseMimeType?: string;
   }
 ): Promise<{ text: string; tokensUsed: number }> {
-  const provider = customKey.provider || detectProvider(customKey.key);
-  const cleanKey = customKey.key.trim();
-
-  if (provider === "gemini") {
-    const customClient = new GoogleGenAI({
-      apiKey: cleanKey,
-      httpOptions: { headers: { "User-Agent": "aistudio-build-custom" } },
-    });
-    const modelsToTry = customKey.model?.trim() ? [customKey.model.trim()] : GEMINI_FALLBACK_MODELS;
-    let lastGeminiErr: any = null;
-
-    for (const model of modelsToTry) {
-      try {
-        const config: any = {
-          responseMimeType: params.responseMimeType || "application/json",
-        };
-        if (params.responseSchema) {
-          config.responseSchema = params.responseSchema;
-        }
-        const response = await customClient.models.generateContent({
-          model,
-          contents: params.contents,
-          config,
-        });
-        if (response && response.text) {
-          const tokenCount =
-            (response as any).usageMetadata?.totalTokenCount ||
-            Math.ceil((params.contents.length + response.text.length) / 4);
-          return { text: response.text, tokensUsed: tokenCount };
-        }
-      } catch (err: any) {
-        lastGeminiErr = err;
-        const errStr = (err.message || err.toString() || "").toLowerCase();
-        const errStatus = err.status || err.code || 0;
-        const isAuth =
-          errStatus === 401 ||
-          errStatus === 403 ||
-          errStr.includes("401") ||
-          errStr.includes("403") ||
-          errStr.includes("unauthenticated") ||
-          errStr.includes("invalid api key");
-        if (isAuth) {
-          const authErr = new Error(`Authentication failed for Gemini key: ${err.message}`);
-          (authErr as any).isAuth = true;
-          throw authErr;
-        }
-        // اگر کاربر خود نام مدل را صریحاً تعیین کرده است، بدون تغییر مدل خطا را گزارش کنیم
-        if (customKey.model?.trim()) {
-          throw err;
-        }
-        const isQuota =
-          errStatus === 429 ||
-          errStr.includes("429") ||
-          errStr.includes("quota") ||
-          errStr.includes("resource_exhausted");
-        if (isQuota) {
-          let delaySeconds = 0;
-          const retryMatch = errStr.match(/retry in\s+([\d.]+)\s*s/i) || errStr.match(/retrydelay['":\s]+([\d.]+)/i);
-          if (retryMatch) delaySeconds = parseFloat(retryMatch[1]);
-          if (delaySeconds > 0 && delaySeconds <= 10) {
-            await new Promise((r) => setTimeout(r, Math.ceil(delaySeconds * 1000)));
-            const retryRes = await customClient.models.generateContent({
-              model,
-              contents: params.contents,
-              config: { responseMimeType: params.responseMimeType || "application/json" },
-            });
-            if (retryRes && retryRes.text) {
-              const count = (retryRes as any).usageMetadata?.totalTokenCount || Math.ceil((params.contents.length + retryRes.text.length) / 4);
-              return { text: retryRes.text, tokensUsed: count };
-            }
-          }
-          const quotaErr = new Error(`Quota exhausted for Gemini key: ${err.message}`);
-          (quotaErr as any).isQuota = true;
-          throw quotaErr;
-        }
-      }
-    }
-    throw lastGeminiErr || new Error("Gemini models failed to generate content.");
-  } else if (provider === "anthropic") {
-    const modelsToTry = getCandidateModelsForProvider("anthropic", customKey.model);
-    const endpoint = "https://api.anthropic.com/v1/messages";
-    let lastAnthropicErr: any = null;
-
-    for (const targetModel of modelsToTry) {
-      try {
-        const body = {
-          model: targetModel,
-          max_tokens: 4096,
-          system: "You are a professional linguistic assistant for German language learning. You must return your response strictly as valid, raw JSON without any markdown code fence wrappers and without conversational preamble.",
-          messages: [{ role: "user", content: params.contents }],
-        };
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            "x-api-key": cleanKey,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(45000),
-        });
-
-        if (!res.ok) {
-          const errText = await res.text();
-          const isAuth = res.status === 401 || res.status === 403;
-          if (isAuth) {
-            const authErr = new Error(`Anthropic authentication failed (${res.status}): ${errText}`);
-            (authErr as any).isAuth = true;
-            throw authErr;
-          }
-          if (customKey.model?.trim()) {
-            throw new Error(`Anthropic error (${res.status}) on model "${targetModel}": ${errText}`);
-          }
-          console.warn(`[Anthropic Fallback] Model "${targetModel}" failed with HTTP ${res.status}: ${errText.slice(0, 100)}. Trying next candidate model...`);
-          lastAnthropicErr = new Error(`Anthropic error (${res.status}): ${errText}`);
-          continue;
-        }
-
-        const data: any = await res.json();
-        const text = data.content?.[0]?.text || "";
-        const tokens =
-          (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0) ||
-          Math.ceil((params.contents.length + text.length) / 4);
-        return { text, tokensUsed: tokens };
-      } catch (err: any) {
-        if (err.isAuth) throw err;
-        lastAnthropicErr = err;
-      }
-    }
-    throw lastAnthropicErr || new Error("All candidate Anthropic models failed.");
-  } else {
-    // OpenAI-compatible providers: openai, groq, deepseek, mistral, openrouter, together, xai, perplexity, cerebras, or ANY custom provider
-    let endpoint = "";
-    const customBase = (customKey.baseUrl || "").trim().replace(/\/+$/, "");
-
-    if (customBase) {
-      if (customBase.endsWith("/chat/completions")) {
-        endpoint = customBase;
-      } else if (customBase.endsWith("/v1") || customBase.endsWith("/v2")) {
-        endpoint = `${customBase}/chat/completions`;
-      } else {
-        endpoint = `${customBase}/v1/chat/completions`;
-      }
-    } else if (provider === "openai") {
-      endpoint = "https://api.openai.com/v1/chat/completions";
-    } else if (provider === "groq") {
-      endpoint = "https://api.groq.com/openai/v1/chat/completions";
-    } else if (provider === "deepseek") {
-      endpoint = "https://api.deepseek.com/chat/completions";
-    } else if (provider === "mistral") {
-      endpoint = "https://api.mistral.ai/v1/chat/completions";
-    } else if (provider === "openrouter") {
-      endpoint = "https://openrouter.ai/api/v1/chat/completions";
-    } else if (provider === "together") {
-      endpoint = "https://api.together.xyz/v1/chat/completions";
-    } else if (provider === "xai") {
-      endpoint = "https://api.x.ai/v1/chat/completions";
-    } else if (provider === "perplexity") {
-      endpoint = "https://api.perplexity.ai/chat/completions";
-    } else if (provider === "cerebras") {
-      endpoint = "https://api.cerebras.ai/v1/chat/completions";
-    } else {
-      endpoint = "http://localhost:11434/v1/chat/completions";
-    }
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${cleanKey}`,
-    };
-    if (provider === "openrouter") {
-      headers["HTTP-Referer"] = "http://localhost:3000";
-      headers["X-Title"] = "German Verb Conjugation Manager";
-    }
-
-    const modelsToTry = getCandidateModelsForProvider(provider, customKey.model);
-    let lastProviderErr: any = null;
-
-    for (const targetModel of modelsToTry) {
-      try {
-        const body: any = {
-          model: targetModel,
-          messages: [
-            {
-              role: "system",
-              content: "You are a professional linguistic assistant for German language learning. You must return your response strictly as valid, raw JSON without any markdown code fence wrappers (such as ```json) and without conversational preamble.",
-            },
-            {
-              role: "user",
-              content: params.contents,
-            },
-          ],
-          temperature: 0.2,
-        };
-
-        if (provider === "openai" || provider === "deepseek" || provider === "groq" || provider === "mistral" || provider === "together") {
-          body.response_format = { type: "json_object" };
-        }
-
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(45000),
-        });
-
-        if (!res.ok) {
-          const errText = await res.text();
-          const isAuth = res.status === 401 || res.status === 403;
-          if (isAuth) {
-            const authErr = new Error(`${provider} authentication failed (${res.status}): ${errText}`);
-            (authErr as any).isAuth = true;
-            throw authErr;
-          }
-          // اگر کاربر خودش نام مدلی را تایپ کرده باشد، خطا را بلافاصله برمی‌گردانیم تا کاربر دقیقاً خطای مدل انتخابی خود را ببیند
-          if (customKey.model?.trim()) {
-            throw new Error(`خطا در درخواست به مدل "${targetModel}" از سرویس ${provider} (${res.status}): ${errText}`);
-          }
-          console.warn(`[${provider} Model Fallback] Model "${targetModel}" returned HTTP ${res.status}: ${errText.slice(0, 100)}. Trying next candidate model...`);
-          lastProviderErr = new Error(`${provider} error (${res.status}): ${errText}`);
-          continue;
-        }
-
-        const data: any = await res.json();
-        const text = data.choices?.[0]?.message?.content || "";
-        const tokens = data.usage?.total_tokens || Math.ceil((params.contents.length + text.length) / 4);
-        return { text, tokensUsed: tokens };
-      } catch (err: any) {
-        if (err.isAuth) throw err;
-        if (customKey.model?.trim()) throw err;
-        lastProviderErr = err;
-      }
-    }
-
-    throw lastProviderErr || new Error(`All candidate models for ${provider} failed.`);
-  }
+  const result = await executeAIProviderCall({
+    key: customKey.key,
+    provider: customKey.provider,
+    baseUrl: customKey.baseUrl,
+    model: customKey.model,
+    contents: params.contents,
+    responseSchema: params.responseSchema,
+    responseMimeType: params.responseMimeType,
+    timeoutMs: 45000,
+    isPing: false,
+  });
+  return { text: result.text, tokensUsed: result.tokensUsed };
 }
 
 async function callGeminiWithFallback(params: {
@@ -828,7 +1023,7 @@ function cleanConjugationPronouns(obj: any): any {
 }
 
 // API: Validate Any AI Provider Key (Gemini, OpenAI, Groq, DeepSeek, Anthropic, OpenRouter, Mistral, Custom)
-app.post(["/api/gemini/validate-key", "/api/keys/validate"], async (req, res) => {
+app.post(["/api/gemini/validate-key", "/api/keys/validate"], aiRateLimiter, async (req, res) => {
   try {
     const { apiKey, provider, baseUrl, model } = req.body;
     if (!apiKey || typeof apiKey !== "string" || !apiKey.trim()) {
@@ -837,183 +1032,47 @@ app.post(["/api/gemini/validate-key", "/api/keys/validate"], async (req, res) =>
     const cleanKey = apiKey.trim();
     const resolvedProvider: ApiKeyProvider = provider || detectProvider(cleanKey);
 
-    if (resolvedProvider === "gemini") {
-      const testClient = new GoogleGenAI({
-        apiKey: cleanKey,
-        httpOptions: { headers: { "User-Agent": "aistudio-build-validate" } },
-      });
+    const result = await executeAIProviderCall({
+      key: cleanKey,
+      provider: resolvedProvider,
+      baseUrl,
+      model,
+      contents: "ping",
+      maxTokens: 2,
+      isPing: true,
+      timeoutMs: 15000,
+    });
 
-      let lastErr = "";
-      const modelsToTest = getCandidateModelsForProvider("gemini", model);
-      for (const m of modelsToTest) {
-        try {
-          const testRes = await testClient.models.generateContent({
-            model: m,
-            contents: "ping",
-            config: { maxOutputTokens: 2 },
-          });
-          if (testRes && testRes.text) {
-            return res.json({
-              valid: true,
-              model: m,
-              provider: "gemini",
-              message: "اتصال به گوگل جمینای با موفقیت برقرار شد.",
-            });
-          }
-        } catch (err: any) {
-          lastErr = err.message || "خطا در تست کلید";
-          const errStr = lastErr.toLowerCase();
-          if (
-            errStr.includes("401") ||
-            errStr.includes("invalid") ||
-            errStr.includes("api key not valid")
-          ) {
-            return res.status(401).json({
-              valid: false,
-              provider: "gemini",
-              error: "کلید API نامعتبر است (خطای احراز هویت 401).",
-            });
-          }
-        }
-      }
-      return res.status(400).json({
-        valid: false,
-        provider: "gemini",
-        error: lastErr || "امکان اتصال با این کلید جمینای وجود ندارد.",
-      });
-    } else if (resolvedProvider === "anthropic") {
-      const modelsToTry = getCandidateModelsForProvider("anthropic", model);
-      let lastAnthropicErr = "";
+    const providerNameMap: Record<string, string> = {
+      gemini: "گوگل جمینای",
+      anthropic: "Anthropic Claude",
+      openai: "OpenAI",
+      groq: "Groq Cloud",
+      deepseek: "DeepSeek",
+      mistral: "Mistral AI",
+      openrouter: "OpenRouter",
+      together: "Together AI",
+      xai: "xAI (Grok)",
+      perplexity: "Perplexity",
+      cerebras: "Cerebras",
+      custom: "سرویس سفارشی",
+    };
+    const pName = providerNameMap[resolvedProvider] || resolvedProvider;
 
-      for (const targetModel of modelsToTry) {
-        const testRes = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "x-api-key": cleanKey,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({
-            model: targetModel,
-            max_tokens: 2,
-            messages: [{ role: "user", content: "ping" }],
-          }),
-          signal: AbortSignal.timeout(15000),
-        });
-
-        if (testRes.ok) {
-          return res.json({
-            valid: true,
-            model: targetModel,
-            provider: "anthropic",
-            message: `اتصال به Anthropic Claude برقرار شد (مدل فعال: ${targetModel})`,
-          });
-        }
-
-        const errData = await testRes.text();
-        if (testRes.status === 401 || testRes.status === 403) {
-          return res.status(testRes.status).json({
-            valid: false,
-            provider: "anthropic",
-            error: `خطای احراز هویت کلود (${testRes.status}): کلید نامعتبر است.`,
-          });
-        }
-        lastAnthropicErr = `(${testRes.status}): ${errData.slice(0, 150)}`;
-      }
-
-      return res.status(400).json({
-        valid: false,
-        provider: "anthropic",
-        error: `هیچ‌یک از مدل‌های کلود پاسخگو نبودند: ${lastAnthropicErr}`,
-      });
-    } else {
-      // OpenAI, Groq, DeepSeek, Mistral, OpenRouter, Together, xAI, Perplexity, Cerebras, Custom / Any Provider
-      let endpoint = "";
-      const customBase = (baseUrl || "").trim().replace(/\/+$/, "");
-
-      if (customBase) {
-        if (customBase.endsWith("/chat/completions")) {
-          endpoint = customBase;
-        } else if (customBase.endsWith("/v1") || customBase.endsWith("/v2")) {
-          endpoint = `${customBase}/chat/completions`;
-        } else {
-          endpoint = `${customBase}/v1/chat/completions`;
-        }
-      } else if (resolvedProvider === "openai") {
-        endpoint = "https://api.openai.com/v1/chat/completions";
-      } else if (resolvedProvider === "groq") {
-        endpoint = "https://api.groq.com/openai/v1/chat/completions";
-      } else if (resolvedProvider === "deepseek") {
-        endpoint = "https://api.deepseek.com/chat/completions";
-      } else if (resolvedProvider === "mistral") {
-        endpoint = "https://api.mistral.ai/v1/chat/completions";
-      } else if (resolvedProvider === "openrouter") {
-        endpoint = "https://openrouter.ai/api/v1/chat/completions";
-      } else if (resolvedProvider === "together") {
-        endpoint = "https://api.together.xyz/v1/chat/completions";
-      } else if (resolvedProvider === "xai") {
-        endpoint = "https://api.x.ai/v1/chat/completions";
-      } else if (resolvedProvider === "perplexity") {
-        endpoint = "https://api.perplexity.ai/chat/completions";
-      } else if (resolvedProvider === "cerebras") {
-        endpoint = "https://api.cerebras.ai/v1/chat/completions";
-      } else {
-        endpoint = "http://localhost:11434/v1/chat/completions";
-      }
-
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${cleanKey}`,
-      };
-      if (resolvedProvider === "openrouter") {
-        headers["HTTP-Referer"] = "http://localhost:3000";
-        headers["X-Title"] = "German Verb Conjugation Manager";
-      }
-
-      const modelsToTry = getCandidateModelsForProvider(resolvedProvider, model);
-      let lastErrText = "";
-
-      for (const targetModel of modelsToTry) {
-        const testRes = await fetch(endpoint, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            model: targetModel,
-            messages: [{ role: "user", content: "ping" }],
-            max_tokens: 2,
-          }),
-          signal: AbortSignal.timeout(15000),
-        });
-
-        if (testRes.ok) {
-          return res.json({
-            valid: true,
-            model: targetModel,
-            provider: resolvedProvider,
-            message: `اتصال به ${resolvedProvider} برقرار شد (مدل فعال: ${targetModel})`,
-          });
-        }
-
-        const errText = await testRes.text();
-        if (testRes.status === 401 || testRes.status === 403) {
-          return res.status(testRes.status).json({
-            valid: false,
-            provider: resolvedProvider,
-            error: `خطای احراز هویت در ${resolvedProvider} (${testRes.status}): کلید نامعتبر است.`,
-          });
-        }
-
-        lastErrText = `(${testRes.status}): ${errText.slice(0, 150)}`;
-      }
-
-      return res.status(400).json({
-        valid: false,
-        provider: resolvedProvider,
-        error: `مدل‌های ${resolvedProvider} در دسترس نبودند: ${lastErrText}`,
-      });
-    }
+    return res.json({
+      valid: true,
+      model: result.activeModel,
+      provider: resolvedProvider,
+      message: `اتصال به ${pName} با موفقیت برقرار شد (مدل فعال: ${result.activeModel}).`,
+    });
   } catch (err: any) {
-    return res.status(500).json({ valid: false, error: err.message || "خطای سرور در بررسی کلید" });
+    const isAuth = err.isAuth || false;
+    const statusCode = isAuth ? 401 : 400;
+    return res.status(statusCode).json({
+      valid: false,
+      provider: req.body?.provider || "unknown",
+      error: err.message || "خطا در تست و اعتبارسنجی کلید API.",
+    });
   }
 });
 
@@ -1089,7 +1148,7 @@ CRITICAL RULES:
       error: err.userMessage || err.message || "Failed to analyze vocabulary word.",
       userMessage: err.userMessage,
       reason: reason,
-      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err) } } : {})
     });
   }
 });
@@ -1155,7 +1214,71 @@ Return JSON matching this exact structure:
 `;
 
     const customKeys = parseCustomKeysHeader(req);
-    const geminiResult = await callGeminiWithFallback({ contents: prompt, customKeys });
+    const tensePersonSchema = {
+      type: Type.OBJECT,
+      properties: {
+        S1: { type: Type.ARRAY, items: { type: Type.STRING } },
+        S2: { type: Type.ARRAY, items: { type: Type.STRING } },
+        S3: { type: Type.ARRAY, items: { type: Type.STRING } },
+        P1: { type: Type.ARRAY, items: { type: Type.STRING } },
+        P2: { type: Type.ARRAY, items: { type: Type.STRING } },
+        P3: { type: Type.ARRAY, items: { type: Type.STRING } },
+      },
+      required: ["S1", "S2", "S3", "P1", "P2", "P3"],
+    };
+
+    const geminiResult = await callGeminiWithFallback({
+      contents: prompt,
+      customKeys,
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          infinitive: { type: Type.STRING },
+          bedeutung: { type: Type.STRING },
+          hilfsverb: { type: Type.STRING },
+          prepositions: { type: Type.STRING },
+          example: { type: Type.STRING },
+          notes: { type: Type.STRING },
+          categories: { type: Type.ARRAY, items: { type: Type.STRING } },
+          conjugations: {
+            type: Type.OBJECT,
+            properties: {
+              PRASENS: tensePersonSchema,
+              PERFEKT: tensePersonSchema,
+              PRATERITUM: tensePersonSchema,
+              KONJUNKTIV2_PRATERITUM: tensePersonSchema,
+              FUTUR1: tensePersonSchema,
+              PLUSQUAMPERFEKT: tensePersonSchema,
+              KONJUNKTIV1_PRASENS: tensePersonSchema,
+              FUTUR2: tensePersonSchema,
+              IMPERATIV: tensePersonSchema,
+            },
+            required: [
+              "PRASENS",
+              "PERFEKT",
+              "PRATERITUM",
+              "KONJUNKTIV2_PRATERITUM",
+              "FUTUR1",
+              "PLUSQUAMPERFEKT",
+              "KONJUNKTIV1_PRASENS",
+              "FUTUR2",
+              "IMPERATIV",
+            ],
+          },
+        },
+        required: [
+          "infinitive",
+          "bedeutung",
+          "hilfsverb",
+          "prepositions",
+          "example",
+          "notes",
+          "categories",
+          "conjugations",
+        ],
+      },
+    });
     attachCustomKeyMeta(res, geminiResult);
     let data = parseCleanJson(geminiResult.text);
     data = cleanConjugationPronouns(data);
@@ -1170,7 +1293,7 @@ Return JSON matching this exact structure:
       error: err.userMessage || err.message || "Failed to analyze verb.",
       userMessage: err.userMessage,
       reason: reason,
-      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err) } } : {})
     });
   }
 });
@@ -1189,6 +1312,7 @@ ${JSON.stringify(items, null, 2)}
 
 Return a JSON object with key "items" containing the completed list of objects.
 Each object must have:
+- id: Original id from input object (preserve exactly for matching)
 - article: "der" | "die" | "das" | "none"
 - word: Clean German word (without article inside the word string)
 - meaning: Persian translations (all major meanings)
@@ -1213,7 +1337,7 @@ Each object must have:
       error: err.userMessage || err.message || "Failed to process batch vocabulary.",
       userMessage: err.userMessage,
       reason: reason,
-      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err) } } : {})
     });
   }
 });
@@ -1228,7 +1352,7 @@ app.post("/api/gemini/batch-verb-fill", async (req, res) => {
 
     const prompt = `You are a German verb conjugation expert.
 Fill in any missing fields (bedeutung in Persian, hilfsverb, prepositions, categories array from ['regular', 'irregular', 'separable', 'reflexive', 'akkusativ', 'dativ'], complete conjugations for ALL persons across PRASENS, PRATERITUM, PERFEKT, KONJUNKTIV2_PRATERITUM, FUTUR1, PLUSQUAMPERFEKT, KONJUNKTIV1_PRASENS, FUTUR2, IMPERATIV) for the following German verbs.
-CRITICAL: DO NOT INCLUDE SUBJECT PRONOUNS (ich, du, er, sie, es, wir, ihr, Sie) IN THE CONJUGATION VALUES! Return ONLY the conjugated verb forms.
+CRITICAL: DO NOT INCLUDE SUBJECT PRONOUNS (ich, du, er, sie, es, wir, ihr, Sie) IN THE CONJUGATION VALUES! Return ONLY the conjugated verb forms. Preserve the original "id" or "infinitive" property for exact client-side mapping.
 ${JSON.stringify(items, null, 2)}
 
 Return a JSON object with key "items" containing the completed list of verb items.
@@ -1252,7 +1376,7 @@ Return a JSON object with key "items" containing the completed list of verb item
       error: err.userMessage || err.message || "Failed to process batch verbs.",
       userMessage: err.userMessage,
       reason: reason,
-      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err) } } : {})
     });
   }
 });
@@ -1388,7 +1512,7 @@ Return JSON:
       error: err.userMessage || err.message || "Failed to generate synonym group.",
       userMessage: err.userMessage,
       reason: reason,
-      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err) } } : {})
     });
   }
 });
@@ -1533,8 +1657,11 @@ Return valid JSON:
         Array.isArray(data.usedTargetItems) ? data.usedTargetItems : []
       );
       for (const item of targetItems) {
-        const cleanItem = item.replace(/^(der|die|das|ein|eine)\s+/i, "").trim().toLowerCase();
-        if (text.toLowerCase().includes(cleanItem)) {
+        const cleanItem = item.replace(/^(der|die|das|ein|eine)\s+/i, "").trim();
+        if (!cleanItem) continue;
+        const escaped = cleanItem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const regex = new RegExp(`(^|[^a-zA-ZäöüßÄÖÜ])(${escaped})([^a-zA-ZäöüßÄÖÜ]|$)`, "i");
+        if (regex.test(text)) {
           usedSet.add(item);
         }
       }
@@ -1552,7 +1679,7 @@ Return valid JSON:
       error: err.userMessage || err.message || "Failed to generate story.",
       userMessage: err.userMessage,
       reason: reason,
-      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err), stack: err.stack, full: String(err) } } : {})
+      ...(reason === "unknown" ? { debugRaw: { message: err.message || String(err) } } : {})
     });
   }
 });

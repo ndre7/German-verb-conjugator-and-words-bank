@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import { dbService } from "../DatabaseService";
 import { geminiFetch } from "../services/apiKeyService";
-import { SynonymAntonymGroup, ArticleType, SynonymAntonymType, PartOfSpeech, VocabularyItem } from "../types";
+import { SynonymAntonymGroup, SynonymAntonymItem, ArticleType, SynonymAntonymType, PartOfSpeech, VocabularyItem } from "../types";
 import { Locale } from "../translations";
 
 interface SynonymAntonymManagerProps {
@@ -43,14 +43,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
   const [formTitle, setFormTitle] = useState("");
   const [formType, setFormType] = useState<SynonymAntonymType>("synonym");
   const [formNotes, setFormNotes] = useState("");
-  const [formItems, setFormItems] = useState<{
-    word: string;
-    article?: ArticleType;
-    partOfSpeech?: PartOfSpeech;
-    meaning?: string;
-    comparative?: string;
-    superlative?: string;
-  }>([
+  const [formItems, setFormItems] = useState<SynonymAntonymItem[]>([
     { word: "", article: "none", partOfSpeech: "noun", meaning: "", comparative: "", superlative: "" },
     { word: "", article: "none", partOfSpeech: "noun", meaning: "", comparative: "", superlative: "" }
   ]);
@@ -66,6 +59,9 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
 
   useEffect(() => {
     loadGroups();
+    const handleSync = () => loadGroups();
+    window.addEventListener("synonym-antonym-changed", handleSync);
+    return () => window.removeEventListener("synonym-antonym-changed", handleSync);
   }, []);
 
   const loadGroups = async () => {
@@ -122,10 +118,10 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
         if (d.notes) setFormNotes(d.notes);
         showToast(locale === "fa" ? "اطلاعات گروه، آرتیکل‌ها، نوع واژه و نکات با AI تکمیل شدند ✨" : "Group filled with AI ✨");
       } else {
-        alert(result.userMessage || result.error || "خطا در هوش مصنوعی");
+        showToast(result.userMessage || result.error || (locale === "fa" ? "خطا در هوش مصنوعی" : "AI error"));
       }
     } catch (err: any) {
-      alert("خطا: " + (err.message || err));
+      showToast((locale === "fa" ? "خطا: " : "Error: ") + (err.message || err));
     } finally {
       setAiLoading(false);
     }
@@ -173,10 +169,10 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
         setAiTopicInput("");
         showToast(locale === "fa" ? `گروه جدید "${newGrp.title}" با هوش مصنوعی ساخته شد ✨` : `New group created with AI ✨`);
       } else {
-        alert(result.userMessage || result.error || "خطا در ساخت گروه با هوش مصنوعی");
+        showToast(result.userMessage || result.error || (locale === "fa" ? "خطا در ساخت گروه با هوش مصنوعی" : "AI group creation error"));
       }
     } catch (err: any) {
-      alert("خطا: " + (err.message || err));
+      showToast((locale === "fa" ? "خطا: " : "Error: ") + (err.message || err));
     } finally {
       setAiLoading(false);
     }
@@ -223,7 +219,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
 
   const handleRemoveItemRow = (index: number) => {
     if (formItems.length <= 1) {
-      alert(locale === "fa" ? "حداقل یک واژه باید در فرم باشد." : "At least 1 item required.");
+      showToast(locale === "fa" ? "حداقل یک واژه باید در فرم باشد." : "At least 1 item required.");
       return;
     }
     setFormItems(prev => prev.filter((_, idx) => idx !== index));
@@ -258,7 +254,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
       }));
 
     if (validItems.length < 1) {
-      alert(
+      showToast(
         locale === "fa"
           ? "لطفاً حداقل یک واژه برای این گروه وارد کنید."
           : "Please enter at least 1 word for this group."
@@ -292,7 +288,17 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
       ? `آیا از حذف گروه "${group.title}" اطمینان دارید؟`
       : `Delete group "${group.title}"?`;
 
-    if (window.confirm(confirmMsg)) {
+    // Try confirm safely, defaulting to true if iframe blocks confirm
+    let confirmed = true;
+    try {
+      if (typeof window !== "undefined" && typeof window.confirm === "function") {
+        confirmed = window.confirm(confirmMsg);
+      }
+    } catch {
+      confirmed = true;
+    }
+
+    if (confirmed) {
       await dbService.deleteSynonymAntonymGroup(group.id);
       await loadGroups();
       showToast(locale === "fa" ? `گروه "${group.title}" با موفقیت حذف شد.` : `Group deleted.`);
@@ -335,7 +341,7 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
           : `Word "${cleanWord}" added to main Vocabulary Bank ✨`
       );
     } catch (err: any) {
-      alert("خطا در افزودن واژه: " + err.message);
+      showToast((locale === "fa" ? "خطا در افزودن واژه: " : "Error adding word: ") + err.message);
     }
   };
 

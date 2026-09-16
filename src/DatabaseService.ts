@@ -459,7 +459,7 @@ export class DatabaseService {
             const splitIdx = cellKey.indexOf("_");
             if (splitIdx > 0) {
               const tense = cellKey.substring(0, splitIdx);
-              const person = splitIdx + 1 < cellKey.length ? (cellKey.substring(splitIdx + 1) as keyof ConjugationPerson) : "S1" as any;
+              const person = (splitIdx + 1 < cellKey.length ? cellKey.substring(splitIdx + 1) : "S1") as keyof ConjugationPerson;
 
               if (!mergedConjugations[tense]) {
                 mergedConjugations[tense] = { S1: [], S2: [], S3: [], P1: [], P2: [], P3: [] };
@@ -556,7 +556,7 @@ export class DatabaseService {
           const splitIdx = cellKey.indexOf("_");
           if (splitIdx > 0) {
             const tense = cellKey.substring(0, splitIdx);
-            const person = splitIdx + 1 < cellKey.length ? (cellKey.substring(splitIdx + 1) as keyof ConjugationPerson) : "S1" as any;
+            const person = (splitIdx + 1 < cellKey.length ? cellKey.substring(splitIdx + 1) : "S1") as keyof ConjugationPerson;
 
             if (!mergedConjugations[tense]) {
               mergedConjugations[tense] = { S1: [], S2: [], S3: [], P1: [], P2: [], P3: [] };
@@ -755,6 +755,10 @@ export class DatabaseService {
       descEn = `Edited conjugation of "${capitalizedVerb}"`;
       descFa = `صرف فعل "${capitalizedVerb}" ویرایش شد`;
       descDe = `Konjugation von "${capitalizedVerb}" bearbeitet`;
+    } else if (fields.infinitive !== undefined) {
+      descEn = `Renamed verb "${capitalizedVerb}" to "${fields.infinitive}"`;
+      descFa = `نام فعل "${capitalizedVerb}" به "${fields.infinitive}" تغییر یافت`;
+      descDe = `Verb "${capitalizedVerb}" in "${fields.infinitive}" umbenannt`;
     } else {
       descEn = `Modified "${capitalizedVerb}"`;
       descFa = `فعل "${capitalizedVerb}" ویرایش شد`;
@@ -769,7 +773,8 @@ export class DatabaseService {
       descFa,
       descEn,
       descDe,
-      previousOverride
+      previousOverride,
+      fields
     };
 
     const currentLogs = await this.getChangeLogs();
@@ -783,6 +788,23 @@ export class DatabaseService {
     if (!targetLog) return;
 
     const key = targetLog.verb.toLowerCase().trim();
+
+    if (targetLog.fields && targetLog.fields.infinitive) {
+      const newKey = targetLog.fields.infinitive.toLowerCase().trim();
+      if (newKey !== key) {
+        if (!this.useInMemoryFallback) {
+          try {
+            await db.open();
+            await db.overrides.delete(newKey);
+          } catch (e) {
+            delete this.inMemoryOverrides[newKey];
+          }
+        } else {
+          delete this.inMemoryOverrides[newKey];
+        }
+      }
+    }
+
     if (targetLog.previousOverride === null) {
       if (!this.useInMemoryFallback) {
         try {
@@ -937,6 +959,9 @@ export class DatabaseService {
       updatedOrder.unshift(newKey);
     }
     await this.saveCustomOrder(updatedOrder);
+
+    // Log the change for History undo
+    await this.logChange(oldInfinitive, "field_edit", existing || null, { infinitive: newInfinitive.trim() });
   }
 
   /**
@@ -1108,7 +1133,7 @@ export class DatabaseService {
   }
 
   /**
-   * Delete a category and remove it from any verb overrides
+   * Delete a category and remove it from any verb overrides and vocabulary tags within a single transaction
    */
   public async deleteCategory(id: string): Promise<void> {
     if (this.useInMemoryFallback) {
@@ -1118,16 +1143,51 @@ export class DatabaseService {
           ov.categories = ov.categories.filter(c => c !== id);
         }
       }
+      if (this.inMemoryVocabularies) {
+        for (const voc of this.inMemoryVocabularies) {
+          if (voc.tags && voc.tags.includes(id)) {
+            voc.tags = voc.tags.filter(t => t !== id);
+          }
+        }
+      }
       return;
     }
     try {
-      await db.categories.delete(id);
-      // Clean up verbs referencing this category
-      const overrides = await db.overrides.toArray();
-      for (const ov of overrides) {
+      await db.open();
+      await db.transaction("rw", db.categories, db.overrides, db.vocabularies, async () => {
+        await db.categories.delete(id);
+
+        // Clean up verb overrides referencing this category
+        const overrides = await db.overrides.toArray();
+        for (const ov of overrides) {
+          if (ov.categories && ov.categories.includes(id)) {
+            const updatedCats = ov.categories.filter(c => c !== id);
+            await db.overrides.update(ov.infinitive, { categories: updatedCats });
+          }
+        }
+
+        // Clean up vocabulary tags referencing this category
+        const vocabs = await db.vocabularies.toArray();
+        for (const voc of vocabs) {
+          if (voc.tags && voc.tags.includes(id)) {
+            const updatedTags = voc.tags.filter(t => t !== id);
+            await db.vocabularies.update(voc.id, { tags: updatedTags });
+          }
+        }
+      });
+
+      // Keep in-memory cache in sync
+      this.inMemoryCategories = this.inMemoryCategories.filter(c => c.id !== id);
+      for (const [key, ov] of Object.entries(this.inMemoryOverrides)) {
         if (ov.categories && ov.categories.includes(id)) {
-          const updatedCats = ov.categories.filter(c => c !== id);
-          await this.saveOverride(ov.infinitive, { categories: updatedCats });
+          ov.categories = ov.categories.filter(c => c !== id);
+        }
+      }
+      if (this.inMemoryVocabularies) {
+        for (const voc of this.inMemoryVocabularies) {
+          if (voc.tags && voc.tags.includes(id)) {
+            voc.tags = voc.tags.filter(t => t !== id);
+          }
         }
       }
     } catch (dbErr) {
@@ -1137,6 +1197,13 @@ export class DatabaseService {
       for (const [key, ov] of Object.entries(this.inMemoryOverrides)) {
         if (ov.categories && ov.categories.includes(id)) {
           ov.categories = ov.categories.filter(c => c !== id);
+        }
+      }
+      if (this.inMemoryVocabularies) {
+        for (const voc of this.inMemoryVocabularies) {
+          if (voc.tags && voc.tags.includes(id)) {
+            voc.tags = voc.tags.filter(t => t !== id);
+          }
         }
       }
     }
@@ -1664,6 +1731,9 @@ export class DatabaseService {
       try {
         localStorage.setItem("g_verb_syn_ant_groups", JSON.stringify(current));
       } catch (e) {}
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("synonym-antonym-changed"));
+      }
       return;
     }
 
@@ -1671,6 +1741,9 @@ export class DatabaseService {
       await db.synonymAntonymGroups.put(group);
     } catch (e) {
       console.warn("Error saving synonym/antonym group to DB", e);
+    }
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("synonym-antonym-changed"));
     }
   }
 
@@ -1689,6 +1762,9 @@ export class DatabaseService {
       await db.synonymAntonymGroups.delete(id);
     } catch (e) {
       console.warn("Error deleting synonym/antonym group from DB", e);
+    }
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("synonym-antonym-changed"));
     }
   }
 

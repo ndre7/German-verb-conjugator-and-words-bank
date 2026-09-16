@@ -31,7 +31,8 @@ import {
   Sparkles,
   Bookmark,
   KeyRound,
-  Sliders
+  Sliders,
+  AlertCircle
 } from "lucide-react";
 import { dbService, db } from "./DatabaseService";
 import { unzipSync } from "fflate";
@@ -117,9 +118,27 @@ export default function App() {
     }
   };
 
+  const [pendingBackupText, setPendingBackupText] = useState<string | null>(null);
+
   const handleImportFullBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      const text = evt.target?.result as string;
+      if (text) {
+        setPendingBackupText(text);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const confirmFullBackupImport = async () => {
+    if (!pendingBackupText) return;
+    const text = pendingBackupText;
+    setPendingBackupText(null);
 
     setBackupImporting(true);
     setBackupStatusMessage(
@@ -128,29 +147,24 @@ export default function App() {
         : "Processing and restoring complete backup data..."
     );
 
-    const reader = new FileReader();
-    reader.onload = async (evt) => {
-      try {
-        const text = evt.target?.result as string;
-        const success = await dbService.importFullBackupJSON(text);
-        if (success) {
-          setBackupStatusMessage(
-            locale === "fa"
-              ? "بازیابی اطلاعات بکاپ با موفقیت 100٪ انجام شد! تمام افعال، صرف‌ها، واژگان، گروه‌ها و تغییرات به‌روزرسانی شدند ✨"
-              : "Complete backup restored successfully! Reloading view..."
-          );
-          setTimeout(() => {
-            window.location.reload();
-          }, 1800);
-        }
-      } catch (err: any) {
-        alert(locale === "fa" ? "خطا در خواندن فایل بکاپ: " + err.message : "Backup error: " + err.message);
-        setBackupStatusMessage(null);
-      } finally {
-        setBackupImporting(false);
+    try {
+      const success = await dbService.importFullBackupJSON(text);
+      if (success) {
+        setBackupStatusMessage(
+          locale === "fa"
+            ? "بازیابی اطلاعات بکاپ با موفقیت 100٪ انجام شد! تمام افعال، صرف‌ها، واژگان، گروه‌ها و تغییرات به‌روزرسانی شدند ✨"
+            : "Complete backup restored successfully! Reloading view..."
+        );
+        setTimeout(() => {
+          window.location.reload();
+        }, 1800);
       }
-    };
-    reader.readAsText(file);
+    } catch (err: any) {
+      alert(locale === "fa" ? "خطا در خواندن فایل بکاپ: " + err.message : "Backup error: " + err.message);
+      setBackupStatusMessage(null);
+    } finally {
+      setBackupImporting(false);
+    }
   };
 
   useEffect(() => {
@@ -1408,6 +1422,48 @@ export default function App() {
                   <span>{backupImporting ? (locale === "fa" ? "در حال بازخوانی..." : "Importing...") : (locale === "fa" ? "بازیابی بکاپ در دستگاه" : "Restore Backup File")}</span>
                 </label>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Full Backup Restore Confirmation Modal */}
+      {pendingBackupText !== null && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto no-print font-vazir">
+          <div className={`bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-md p-6 space-y-4 animate-in fade-in zoom-in-95 duration-200 ${isRtl ? "text-right" : "text-left"}`}>
+            <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-amber-600 flex items-center gap-2">
+                <AlertCircle className="w-5 h-5 text-amber-600" />
+                {locale === "fa" ? "هشدار بازیابی نسخه پشتیبان" : locale === "de" ? "Backup wiederherstellen" : "Confirm Backup Restore"}
+              </h3>
+              <button onClick={() => setPendingBackupText(null)} className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-slate-700 leading-relaxed">
+              {locale === "fa"
+                ? "بازیابی این نسخه پشتیبان، تمام افعال، صرف‌ها، واژگان، دسته‌بندی‌ها و تنظیمات فعلی را با داده‌های فایل پشتیبان جایگزین خواهد کرد. آیا مایل به ادامه هستید؟"
+                : locale === "de"
+                ? "Durch das Wiederherstellen dieser Sicherung werden alle aktuellen Verben, Konjugationen, Vokabeln und Einstellungen überschrieben. Möchten Sie fortfahren?"
+                : "Restoring this backup will replace all current verbs, conjugations, vocabulary, categories, and settings with the backup data. Are you sure you want to proceed?"}
+            </p>
+
+            <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
+              <button
+                type="button"
+                onClick={() => setPendingBackupText(null)}
+                className="px-4 py-2 border border-slate-200 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-50 cursor-pointer"
+              >
+                {locale === "fa" ? "انصراف" : locale === "de" ? "Abbrechen" : "Cancel"}
+              </button>
+              <button
+                type="button"
+                onClick={confirmFullBackupImport}
+                className="px-5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
+              >
+                {locale === "fa" ? "تایید و بازیابی" : locale === "de" ? "Wiederherstellen" : "Confirm & Restore"}
+              </button>
             </div>
           </div>
         </div>

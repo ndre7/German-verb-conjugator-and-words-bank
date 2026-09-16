@@ -1,0 +1,333 @@
+name: Build Windows Desktop (Electron)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache Electron binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: electron-cache-${{ runner.os }}-el332-eb2518
+
+      - name: Install project dependencies
+        run: bun install
+
+      - name: Build frontend (Vite)
+        run: bunx vite build
+
+      - name: Create vite shim (graceful pass-through for packaged build)
+        shell: bash
+        run: |
+          mkdir -p ci-shims
+          cat > ci-shims/vite.js <<'EOF'
+          module.exports = {
+            createServer: async () => ({
+              middlewares: function viteDisabledMiddleware(req, res, next) { next(); },
+              httpServer: null,
+              transformIndexHtml: async (_url, html) => html,
+              ssrLoadModule: async () => { throw new Error("SSR is disabled in the packaged desktop build"); },
+            }),
+          };
+          EOF
+
+      - name: Bundle AI proxy server (esbuild -> standalone CJS)
+        shell: bash
+        run: |
+          mkdir -p stage
+          bunx esbuild server.ts --bundle --platform=node --format=cjs --alias:vite=./ci-shims/vite.js --external:@modelcontextprotocol/sdk --outfile=stage/server.cjs
+
+      - name: Assemble Electron app (proxy-aware main process)
+        shell: bash
+        run: |
+          mkdir -p stage/app
+          cp -r dist/. stage/app/
+          cp stage/app/index.html stage/index.html
+          cat > stage/main.js <<'EOF'
+          const { app, BrowserWindow } = require("electron");
+          const http = require("http");
+          const fs = require("fs");
+          const path = require("path");
+
+          const API_HOST = "127.0.0.1";
+          let WEB_PORT = 61000 + Math.floor(Math.random() * 15000);
+          let API_PORT = 41000 + Math.floor(Math.random() * 15000);
+
+          let logFd = null;
+          function logLine() {
+            var parts = [];
+            for (var i = 0; i < arguments.length; i++) {
+              var a = arguments[i];
+              if (a instanceof Error) parts.push(a.stack || String(a));
+              else if (typeof a === "object" && a !== null) { try { parts.push(JSON.stringify(a)); } catch (e) { parts.push(String(a)); } }
+              else parts.push(String(a));
+            }
+            var line = "[" + new Date().toISOString() + "] " + parts.join(" ") + "\n";
+            try { process.stdout.write(line); } catch (e) {}
+            try {
+              if (logFd === null) {
+                var dir = app.getPath("userData");
+                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+                logFd = fs.openSync(path.join(dir, "desktop.log"), "a");
+              }
+              fs.writeSync(logFd, line);
+            } catch (e) {}
+          }
+
+          process.on("uncaughtException", function (err) { logLine("[FATAL] uncaughtException:", err); });
+          process.on("unhandledRejection", function (reason) { logLine("[FATAL] unhandledRejection:", reason); });
+
+          process.env.NODE_ENV = "production";
+
+          // ---------------- Proxy support (VPN / system proxy) ----------------
+          function normalizeProxyUrl(raw) {
+            var p = String(raw || "").trim();
+            if (!p) return null;
+            if (/\.pac$/i.test(p)) return null; // PAC files are not supported by ProxyAgent
+            if (!/^https?:\/\//i.test(p)) p = "http://" + p;
+            return p;
+          }
+
+          function readWindowsSystemProxy() {
+            try {
+              var execSync = require("child_process").execSync;
+              var key = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+              var enableOut = execSync('reg query "' + key + '" /v ProxyEnable', { encoding: "utf8", timeout: 4000 });
+              if (!/0x1/.test(enableOut)) return null;
+              var serverOut = execSync('reg query "' + key + '" /v ProxyServer', { encoding: "utf8", timeout: 4000 });
+              var m = serverOut.match(/ProxyServer\s+REG_SZ\s+(\S+)/i);
+              if (!m) return null;
+              var p = m[1].trim();
+              if (p.indexOf(";") !== -1 || p.indexOf("=") !== -1) {
+                var parts = p.split(";").map(function (s) { return s.split("="); });
+                var httpsPart = parts.filter(function (x) { return x[0] === "https"; })[0];
+                var httpPart = parts.filter(function (x) { return x[0] === "http"; })[0];
+                p = (httpsPart && httpsPart[1]) || (httpPart && httpPart[1]) || "";
+              }
+              return normalizeProxyUrl(p);
+            } catch (e) {
+              return null;
+            }
+          }
+
+          function detectProxyUrl() {
+            if (process.env.GERMAN_APP_NO_PROXY === "1") return null;
+            if (process.env.GERMAN_APP_PROXY) return normalizeProxyUrl(process.env.GERMAN_APP_PROXY);
+            var envP = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+            if (envP) return normalizeProxyUrl(envP);
+            return readWindowsSystemProxy();
+          }
+
+          function applyProxyToNodeFetch(proxyUrl) {
+            try {
+              var undici = require("undici");
+              var agent = new undici.ProxyAgent(proxyUrl);
+              var originalFetch = globalThis.fetch;
+              var loopbackRe = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i;
+              globalThis.fetch = function proxyAwareFetch(input, init) {
+                try {
+                  var url = "";
+                  if (typeof input === "string") url = input;
+                  else if (input && input.url) url = input.url;
+                  if (loopbackRe.test(url)) return originalFetch(input, init);
+                  return undici.fetch(input, Object.assign({}, init || {}, { dispatcher: agent }));
+                } catch (e) {
+                  return originalFetch(input, init);
+                }
+              };
+              logLine("[desktop] Node fetch routed through proxy:", proxyUrl);
+            } catch (err) {
+              logLine("[desktop] Failed to apply proxy to Node fetch:", err);
+            }
+          }
+          // --------------------------------------------------------------------
+
+          const MIME = {
+            ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".mjs": "text/javascript",
+            ".css": "text/css", ".json": "application/json", ".svg": "image/svg+xml",
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+            ".webp": "image/webp", ".ico": "image/x-icon",
+            ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf"
+          };
+
+          function proxyToApi(req, res) {
+            var upstream = http.request(
+              { host: API_HOST, port: API_PORT, path: req.url, method: req.method,
+                headers: Object.assign({}, req.headers, { host: API_HOST + ":" + API_PORT }) },
+              function (up) { res.writeHead(up.statusCode || 502, up.headers); up.pipe(res); }
+            );
+            upstream.on("error", function (err) {
+              if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ success: false, error: "AI server not running: " + err.message }));
+            });
+            req.pipe(upstream);
+          }
+
+          function serveStatic(req, res) {
+            var pathname = "/index.html";
+            try { pathname = decodeURIComponent(new URL(req.url, "http://localhost").pathname); } catch (e) {}
+            if (pathname === "/") pathname = "/index.html";
+            var root = path.join(__dirname, "app");
+            var filePath = path.normalize(path.join(root, pathname));
+            if (filePath.indexOf(root) !== 0) { res.writeHead(403); return res.end("Forbidden"); }
+            fs.readFile(filePath, function (err, data) {
+              if (err) {
+                if (path.extname(pathname)) { res.writeHead(404); return res.end("Not found"); }
+                fs.readFile(path.join(root, "index.html"), function (err2, indexData) {
+                  if (err2) { res.writeHead(404); return res.end("Not found"); }
+                  res.writeHead(200, { "Content-Type": MIME[".html"] });
+                  res.end(indexData);
+                });
+                return;
+              }
+              res.writeHead(200, { "Content-Type": MIME[path.extname(filePath).toLowerCase()] || "application/octet-stream" });
+              res.end(data);
+            });
+          }
+
+          function startWebServer() {
+            return new Promise(function (resolve, reject) {
+              var server = http.createServer(function (req, res) {
+                if (req.url && req.url.indexOf("/api/") === 0) return proxyToApi(req, res);
+                return serveStatic(req, res);
+              });
+              server.on("error", function (err) { reject(err); });
+              server.listen(WEB_PORT, API_HOST, function () { resolve(server); });
+            });
+          }
+
+          function startApiServer() {
+            try {
+              process.env.PORT = String(API_PORT);
+              require("./server.cjs");
+              logLine("[desktop] AI proxy server loaded on port " + API_PORT);
+            } catch (err) {
+              logLine("[desktop] AI proxy server failed to start (app remains usable offline):", err);
+            }
+          }
+
+          function createWindow() {
+            var win = new BrowserWindow({
+              width: 1280, height: 860, minWidth: 940, minHeight: 600,
+              show: false,
+              backgroundColor: "#0f172a",
+              webPreferences: { contextIsolation: true, nodeIntegration: false }
+            });
+
+            var target = "http://" + API_HOST + ":" + WEB_PORT + "/";
+            var shown = false;
+            win.once("ready-to-show", function () { shown = true; win.show(); });
+            setTimeout(function () {
+              if (!shown) { logLine("[desktop] failsafe: forcing window show"); win.show(); }
+            }, 8000);
+
+            win.webContents.on("did-fail-load", function (event, code, desc, url, isMain) {
+              if (!isMain) return;
+              logLine("[desktop] did-fail-load " + code + " " + desc + " " + url + " - retrying");
+              setTimeout(function () {
+                win.loadURL(target).catch(function (err) { logLine("[desktop] reload failed:", err); });
+              }, 1200);
+            });
+
+            win.loadURL(target).catch(function (err) { logLine("[desktop] loadURL error:", err); });
+            win.on("closed", function () { logLine("[desktop] window closed"); });
+          }
+
+          var gotLock = app.requestSingleInstanceLock();
+          if (!gotLock) {
+            app.quit();
+          } else {
+            app.on("second-instance", function () {
+              var wins = BrowserWindow.getAllWindows();
+              if (wins.length > 0) { if (wins[0].isMinimized()) wins[0].restore(); wins[0].focus(); }
+            });
+            app.setAppUserModelId("com.ndre7.germanverbmanager");
+
+            app.whenReady().then(async function () {
+              var proxyUrl = detectProxyUrl();
+              if (proxyUrl) {
+                applyProxyToNodeFetch(proxyUrl);
+              } else {
+                logLine("[desktop] No proxy detected - AI calls will use direct connection");
+              }
+
+              logLine("[desktop] Electron ready. Starting web server on port " + WEB_PORT + "...");
+              var started = false;
+              for (var i = 0; i < 20; i++) {
+                try { await startWebServer(); started = true; break; }
+                catch (err) { logLine("[desktop] port " + WEB_PORT + " busy, trying next"); WEB_PORT++; }
+              }
+              if (!started) {
+                logLine("[desktop] FATAL: could not bind any web port");
+              }
+
+              createWindow();
+              logLine("[desktop] window created -> " + "http://" + API_HOST + ":" + WEB_PORT + "/");
+
+              startApiServer();
+            });
+
+            app.on("window-all-closed", function () { app.quit(); });
+          }
+          EOF
+          cat > stage/package.json <<'EOF'
+          {
+            "name": "german-verb-manager",
+            "version": "1.1.0",
+            "description": "German Verb Conjugator & Words Bank - Windows Desktop",
+            "author": "ndre7",
+            "main": "main.js",
+            "dependencies": {
+              "undici": "6.21.1"
+            },
+            "devDependencies": {
+              "electron": "33.2.0",
+              "electron-builder": "25.1.8"
+            },
+            "build": {
+              "appId": "com.ndre7.germanverbmanager",
+              "productName": "German Verb Manager",
+              "directories": { "output": "release" },
+              "files": ["main.js", "server.cjs", "app/**", "index.html"],
+              "win": { "target": ["nsis", "portable"] },
+              "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true }
+            }
+          }
+          EOF
+
+      - name: Install Electron tooling
+        working-directory: stage
+        run: npm install --no-fund --no-audit
+
+      - name: Package Windows executables (Installer + Portable)
+        working-directory: stage
+        run: npx electron-builder --win nsis portable
+
+      - name: Upload Windows build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: German-Verb-Manager-Windows
+          path: stage/release/*.exe
+          if-no-files-found: error

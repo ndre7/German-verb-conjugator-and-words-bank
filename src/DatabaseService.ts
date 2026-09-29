@@ -726,6 +726,33 @@ export class DatabaseService {
     await this.saveCustomOrder(updatedOrder);
   }
 
+  /**
+   * Update an existing verb WITHOUT modifying verbs_custom_order.
+   * Preserves the verb's exact position in the custom order list (B2).
+   */
+  public async updateVerb(verbData: {
+    infinitive: string;
+    bedeutung?: string;
+    hilfsverb?: string;
+    categories?: string[];
+    cellOverrides?: Record<string, string>;
+  }): Promise<void> {
+    const rawInf = (verbData.infinitive || "").trim();
+    if (!rawInf) return;
+    const key = canonicalVerbKey(rawInf);
+
+    // Save override with isDeleted: false and canonical infinitive
+    await this.saveOverride(key, {
+      infinitive: key,
+      bedeutung: verbData.bedeutung || "",
+      hilfsverb: verbData.hilfsverb || "haben",
+      categories: verbData.categories && verbData.categories.length > 0 ? verbData.categories : ["regular"],
+      cellOverrides: verbData.cellOverrides || {},
+      isDeleted: false
+    });
+    // Deliberately do NOT touch verbs_custom_order so the position is strictly preserved
+  }
+
   public async transferVocabVerbToVerbTable(item: VocabularyItem): Promise<boolean> {
     const inf = (item.word || "").toLowerCase().trim();
     if (!inf) return false;

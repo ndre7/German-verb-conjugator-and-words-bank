@@ -26,7 +26,9 @@ import {
 } from "lucide-react";
 import { dbService, db } from "../DatabaseService";
 import { geminiFetch } from "../services/apiKeyService";
+import { aiFillJob } from "../services/aiFillJob";
 import { Tense, TENSE_ORDER, type VerbItem, type Category } from "../types";
+import { sortBySearchRank } from "../utils/searchRanking";
 import CategoryManager from "./CategoryManager";
 
 interface VerbTableProps {
@@ -284,93 +286,104 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
 
   const handleBulkAiEnrichVerbs = async () => {
     if (selectedVerbIds.size === 0) return;
-    const selectedItems = verbs.filter(v => selectedVerbIds.has(v.infinitive));
+    const selectedItems = verbs.filter((v) => selectedVerbIds.has(v.infinitive));
     if (selectedItems.length === 0) return;
 
-    setVerbAiLoading(true);
-    showToast(locale === "fa" ? `در حال استخراج و تحلیل صرف‌های کامل ${selectedItems.length} فعل...` : `Enriching ${selectedItems.length} verbs with AI...`, 0);
+    setSelectedVerbIds(new Set());
+    showToast(
+      locale === "fa"
+        ? `شروع تکمیل ${selectedItems.length} فعل در پس‌زمینه...`
+        : `Started background AI fill for ${selectedItems.length} verbs...`,
+      3000
+    );
 
-    try {
-      const CHUNK_SIZE = 5;
-      const BATCH_REQUEST_DELAY_MS = 2000;
-      const delayMs = (ms: number) => new Promise((res) => setTimeout(res, ms));
-
-      let updatedCount = 0;
-
-      for (let i = 0; i < selectedItems.length; i += CHUNK_SIZE) {
-        if (i > 0) await delayMs(BATCH_REQUEST_DELAY_MS);
-        const chunk = selectedItems.slice(i, i + CHUNK_SIZE);
-
+    await aiFillJob.start<VerbItem>({
+      type: "verb",
+      items: selectedItems,
+      getItemId: (v) => v.infinitive,
+      getItemWord: (v) => v.infinitive,
+      processBatch: async (chunk, signal) => {
         const res = await geminiFetch("/api/gemini/batch-verb-fill", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ items: chunk })
+          body: JSON.stringify({ items: chunk }),
+          signal,
         });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => null);
+          const err = new Error(errData?.userMessage || errData?.error || `HTTP ${res.status}`);
+          (err as any).status = res.status;
+          throw err;
+        }
+        const data = await res.json();
+        if (!data.success || !Array.isArray(data.items)) {
+          throw new Error("Invalid response format from batch verb fill");
+        }
+        return data.items;
+      },
+      onBatchDone: async (enrichedItems, originalBatch) => {
+        for (let idx = 0; idx < enrichedItems.length; idx++) {
+          const enriched = enrichedItems[idx];
+          const orig =
+            originalBatch[idx] ||
+            originalBatch.find(
+              (c) => c.infinitive.toLowerCase() === (enriched.infinitive || enriched.word || "").toLowerCase()
+            );
+          if (orig) {
+            const cellOverrides: Record<string, string> = { ...orig.cellOverrides };
 
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && Array.isArray(data.items)) {
-            for (let idx = 0; idx < data.items.length; idx++) {
-              const enriched = data.items[idx];
-              const orig = chunk[idx] || chunk.find(c => c.infinitive.toLowerCase() === (enriched.infinitive || enriched.word || "").toLowerCase());
-              if (orig) {
-                const cellOverrides: Record<string, string> = { ...orig.cellOverrides };
-
-                if (enriched.conjugations) {
-                  const tensesKeys = [
-                    "PRASENS", "PERFEKT", "PRATERITUM", "KONJUNKTIV2_PRATERITUM",
-                    "FUTUR1", "PLUSQUAMPERFEKT", "KONJUNKTIV1_PRASENS", "FUTUR2", "IMPERATIV"
-                  ];
-                  for (const tKey of tensesKeys) {
-                    const tenseObj = enriched.conjugations[tKey];
-                    if (tenseObj) {
-                      for (const pKey of ["S1", "S2", "S3", "P1", "P2", "P3"]) {
-                        if (tenseObj[pKey]) {
-                          const val = Array.isArray(tenseObj[pKey]) ? tenseObj[pKey].join(", ") : tenseObj[pKey];
-                          if (val) {
-                            cellOverrides[`${tKey}_${pKey}`] = val;
-                          }
-                        }
+            if (enriched.conjugations) {
+              const tensesKeys = [
+                "PRASENS",
+                "PERFEKT",
+                "PRATERITUM",
+                "KONJUNKTIV2_PRATERITUM",
+                "FUTUR1",
+                "PLUSQUAMPERFEKT",
+                "KONJUNKTIV1_PRASENS",
+                "FUTUR2",
+                "IMPERATIV",
+              ];
+              for (const tKey of tensesKeys) {
+                const tenseObj = enriched.conjugations[tKey];
+                if (tenseObj) {
+                  for (const pKey of ["S1", "S2", "S3", "P1", "P2", "P3"]) {
+                    if (tenseObj[pKey]) {
+                      const val = Array.isArray(tenseObj[pKey]) ? tenseObj[pKey].join(", ") : tenseObj[pKey];
+                      if (val) {
+                        cellOverrides[`${tKey}_${pKey}`] = val;
                       }
                     }
                   }
                 }
-
-                const correctedInfinitive = (enriched.infinitive && typeof enriched.infinitive === "string" && enriched.infinitive.trim())
-                  ? enriched.infinitive.trim()
-                  : orig.infinitive;
-
-                if (orig.infinitive !== correctedInfinitive) {
-                  await dbService.renameVerbInfinitive(orig.infinitive, correctedInfinitive);
-                }
-
-                await dbService.addVerb({
-                  infinitive: correctedInfinitive,
-                  bedeutung: enriched.bedeutung || orig.bedeutung,
-                  hilfsverb: enriched.hilfsverb === "sein" ? "sein" : (orig.hilfsverb || "haben"),
-                  categories: Array.isArray(enriched.categories) && enriched.categories.length > 0 ? enriched.categories : orig.categories,
-                  cellOverrides
-                });
-                updatedCount++;
               }
             }
+
+            const correctedInfinitive =
+              enriched.infinitive && typeof enriched.infinitive === "string" && enriched.infinitive.trim()
+                ? enriched.infinitive.trim()
+                : orig.infinitive;
+
+            if (orig.infinitive !== correctedInfinitive) {
+              await dbService.renameVerbInfinitive(orig.infinitive, correctedInfinitive);
+            }
+
+            // B2: updateVerb preserves position in verbs_custom_order!
+            await dbService.updateVerb({
+              infinitive: correctedInfinitive,
+              bedeutung: enriched.bedeutung || orig.bedeutung,
+              hilfsverb: enriched.hilfsverb === "sein" ? "sein" : (orig.hilfsverb || "haben"),
+              categories:
+                Array.isArray(enriched.categories) && enriched.categories.length > 0
+                  ? enriched.categories
+                  : orig.categories,
+              cellOverrides,
+            });
           }
         }
-      }
-
-      await loadVerbsList();
-      setSelectedVerbIds(new Set());
-      showToast(
-        locale === "fa"
-          ? `تعداد ${updatedCount} فعل با موفقیت غنی‌سازی شدند (قابل بازگشت از تاریخچه) ✨`
-          : `${updatedCount} verbs enriched with AI (revertible via History) ✨`,
-        3500
-      );
-    } catch (err: any) {
-      showToast((locale === "fa" ? "خطا در هوش مصنوعی افعال: " : "Verb AI error: ") + (err.message || err), 4000);
-    } finally {
-      setVerbAiLoading(false);
-    }
+        await loadVerbsList();
+      },
+    });
   };
 
   // AI State for Verbs
@@ -474,7 +487,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
           await dbService.renameVerbInfinitive(verbItem.infinitive, correctedInfinitive);
         }
 
-        await dbService.addVerb({
+        await dbService.updateVerb({
           infinitive: correctedInfinitive,
           bedeutung: d.bedeutung || verbItem.bedeutung,
           hilfsverb: d.hilfsverb === "sein" ? "sein" : "haben",
@@ -762,47 +775,80 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       if (enableAiVerbJsonImport && itemsArray.length > 0) {
         setVerbJsonImportSuccess(
           locale === "fa"
-            ? `در حال تحلیل و استخراج صرف‌های کامل ${itemsArray.length} فعل با هوش مصنوعی... (لطفاً کمی شکیبا باشید)`
-            : "Enriching verb tenses and meanings with AI..."
+            ? `در حال تحلیل و استخراج صرف‌های کامل ${itemsArray.length} فعل با هوش مصنوعی در پس‌زمینه...`
+            : `Enriching ${itemsArray.length} verbs with AI in the background...`
         );
 
-        const enrichedList: any[] = [];
-        const CHUNK_SIZE = 5;
-        const BATCH_REQUEST_DELAY_MS = 2000;
-        const delayMs = (ms: number) => new Promise((res) => setTimeout(res, ms));
-
-        for (let i = 0; i < itemsArray.length; i += CHUNK_SIZE) {
-          if (i > 0) {
-            await delayMs(BATCH_REQUEST_DELAY_MS);
-          }
-          const chunk = itemsArray.slice(i, i + CHUNK_SIZE);
-          try {
-            const aiRes = await geminiFetch("/api/gemini/batch-verb-fill", {
+        await aiFillJob.start<any>({
+          type: "verb",
+          items: itemsArray,
+          getItemId: (v) => v.infinitive || v.word || v.verb || "",
+          getItemWord: (v) => v.infinitive || v.word || v.verb || "",
+          processBatch: async (chunk, signal) => {
+            const res = await geminiFetch("/api/gemini/batch-verb-fill", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ items: chunk })
+              body: JSON.stringify({ items: chunk }),
+              signal,
             });
-            if (aiRes.ok) {
-              const aiData = await aiRes.json();
-              if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
-                enrichedList.push(...aiData.items);
-                continue;
+            if (!res.ok) {
+              const errData = await res.json().catch(() => null);
+              throw new Error(errData?.userMessage || errData?.error || `HTTP ${res.status}`);
+            }
+            const aiData = await res.json();
+            if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
+              return aiData.items;
+            }
+            return chunk;
+          },
+          onBatchDone: async (enrichedItems, originalBatch) => {
+            for (let idx = 0; idx < enrichedItems.length; idx++) {
+              const raw = enrichedItems[idx] || originalBatch[idx];
+              const inf = String(raw.infinitive || raw.word || raw.verb || "").trim();
+              if (!inf) continue;
+
+              const cellOverrides: Record<string, string> = { ...raw.cellOverrides };
+              if (raw.conjugations) {
+                const tensesKeys = [
+                  "PRASENS", "PERFEKT", "PRATERITUM", "KONJUNKTIV2_PRATERITUM",
+                  "FUTUR1", "PLUSQUAMPERFEKT", "KONJUNKTIV1_PRASENS", "FUTUR2", "IMPERATIV"
+                ];
+                for (const tKey of tensesKeys) {
+                  const tenseObj = raw.conjugations[tKey];
+                  if (tenseObj) {
+                    for (const pKey of ["S1", "S2", "S3", "P1", "P2", "P3"]) {
+                      if (tenseObj[pKey]) {
+                        const val = Array.isArray(tenseObj[pKey]) ? tenseObj[pKey].join(", ") : tenseObj[pKey];
+                        if (val) {
+                          cellOverrides[`${tKey}_${pKey}`] = val;
+                        }
+                      }
+                    }
+                  }
+                }
               }
-            } else {
-              const errData = await aiRes.json().catch(() => null);
-              if (errData?.userMessage) {
-                console.warn("Batch AI verb chunk warning:", errData.userMessage);
+
+              const existsInDb = verbs.some(v => v.infinitive.toLowerCase().trim() === inf.toLowerCase().trim());
+              const verbPayload = {
+                infinitive: inf,
+                bedeutung: raw.bedeutung || raw.meaning || "",
+                hilfsverb: raw.hilfsverb === "sein" ? "sein" : "haben",
+                categories: Array.from(new Set([...(Array.isArray(raw.categories) ? raw.categories : ["regular"]), ...verbJsonImportTags])),
+                cellOverrides
+              };
+
+              if (existsInDb) {
+                await dbService.updateVerb(verbPayload);
+              } else {
+                await dbService.addVerb(verbPayload);
               }
             }
-          } catch (err) {
-            console.warn("Batch AI verb chunk error during JSON import, falling back to raw chunk items:", err);
-          }
-          enrichedList.push(...chunk);
-        }
+            await loadVerbsList();
+          },
+        });
 
-        if (enrichedList.length > 0) {
-          itemsArray = enrichedList;
-        }
+        setTimeout(() => setShowVerbJsonModal(false), 1500);
+        return;
       }
 
       let countSuccess = 0;
@@ -817,11 +863,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         if (!inf) continue;
 
         const infKey = inf.toLowerCase();
-        if (committedVerbs.has(infKey)) {
-          postEnrichDuplicates++;
-          continue;
-        }
-        committedVerbs.add(infKey);
+        const isExisting = committedVerbs.has(infKey);
 
         const cellOverrides: Record<string, string> = { ...raw.cellOverrides };
 
@@ -845,13 +887,21 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
           }
         }
 
-        await dbService.addVerb({
+        const verbPayload = {
           infinitive: inf,
           bedeutung: raw.bedeutung || raw.meaning || "",
           hilfsverb: raw.hilfsverb === "sein" ? "sein" : "haben",
           categories: Array.from(new Set([...(Array.isArray(raw.categories) ? raw.categories : ["regular"]), ...verbJsonImportTags])),
           cellOverrides
-        });
+        };
+
+        if (isExisting) {
+          await dbService.updateVerb(verbPayload);
+          postEnrichDuplicates++;
+        } else {
+          committedVerbs.add(infKey);
+          await dbService.addVerb(verbPayload);
+        }
         countSuccess++;
       }
 
@@ -938,7 +988,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
 
     const isExactMatch = selectedVerb && (selectedVerb || "").toLowerCase().trim() === query;
 
-    return verbs.filter((v) => {
+    const filtered = verbs.filter((v) => {
       let matchesSearch = false;
 
       if (isExactMatch) {
@@ -964,6 +1014,15 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         ? activeFilterIds.every((id) => v.categories.includes(id))
         : true;
       return matchesSearch && matchesCategory;
+    });
+
+    return sortBySearchRank(filtered, query, (v) => {
+      const iv = indexedVerbsMap.get((v.infinitive || "").toLowerCase().trim());
+      return {
+        primary: v.infinitive || "",
+        secondary: v.bedeutung || "",
+        extras: iv ? [iv.conjugationsLower] : undefined,
+      };
     });
   }, [verbs, searchQuery, selectedVerb, activeFilterIds, categoriesLookupMap, indexedVerbsMap]);
 

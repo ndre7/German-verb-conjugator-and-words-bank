@@ -578,7 +578,10 @@ function parseCleanJson(text: string): any {
         }
       }
     }
-    throw initialErr;
+    const shortRaw = text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+    const diagErr = new Error(`Failed to parse AI JSON response: ${(initialErr as any)?.message || initialErr}. Raw snippet: "${shortRaw}"`);
+    (diagErr as any).isParseError = true;
+    throw diagErr;
   }
 }
 
@@ -605,6 +608,7 @@ interface ExecuteAIProviderCallOptions {
   responseSchema?: any;
   responseMimeType?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 interface ExecuteAIProviderCallResult {
@@ -642,6 +646,9 @@ async function executeAIProviderCall(
     let lastGeminiErr: any = null;
 
     for (const model of modelsToTry) {
+      if (options.signal?.aborted) {
+        throw new Error("Client aborted request");
+      }
       if (Date.now() >= operationDeadline) {
         const timeoutErr = new Error(`Gemini operation timed out after ${operationTimeoutMs}ms`);
         timeoutErr.name = "TimeoutError";
@@ -650,13 +657,21 @@ async function executeAIProviderCall(
 
       try {
         const remainingMs = Math.max(1000, operationDeadline - Date.now());
+        const perCallSignal = options.signal
+          ? AbortSignal.any([AbortSignal.timeout(remainingMs), options.signal])
+          : AbortSignal.timeout(remainingMs);
         const config: any = {
-          abortSignal: AbortSignal.timeout(remainingMs),
+          abortSignal: perCallSignal,
           httpOptions: { timeout: remainingMs },
         };
         if (options.isPing) {
           config.maxOutputTokens = options.maxTokens || 2;
         } else {
+          // A1. Explicit output budget & thinkingConfig disable for non-ping calls
+          config.maxOutputTokens = options.maxTokens || 16384;
+          if (/2\.5|3\.\d/.test(model)) {
+            config.thinkingConfig = { thinkingBudget: 0 };
+          }
           config.responseMimeType = options.responseMimeType || "application/json";
           if (options.responseSchema) {
             config.responseSchema = options.responseSchema;
@@ -673,17 +688,29 @@ async function executeAIProviderCall(
           `Gemini request timed out on model ${model}`
         );
 
-        if (response && response.text) {
-          const tokenCount =
-            (response as any).usageMetadata?.totalTokenCount ||
-            Math.ceil((options.contents.length + response.text.length) / 4);
-          return {
-            text: response.text,
-            tokensUsed: tokenCount,
-            activeModel: model,
-            resolvedProvider,
-          };
+        // A3. Truncation detection
+        const finishReason = response?.candidates?.[0]?.finishReason || (response as any)?.finishReason;
+        if (finishReason === "MAX_TOKENS") {
+          const truncErr = new Error("Output truncated (MAX_TOKENS)");
+          (truncErr as any).isTruncated = true;
+          throw truncErr;
         }
+
+        // A4. Empty response check
+        const text = response?.text?.trim() || "";
+        if (!text) {
+          throw new Error("Empty response from model");
+        }
+
+        const tokenCount =
+          (response as any).usageMetadata?.totalTokenCount ||
+          Math.ceil((options.contents.length + text.length) / 4);
+        return {
+          text: response?.text || text,
+          tokensUsed: tokenCount,
+          activeModel: model,
+          resolvedProvider,
+        };
       } catch (err: any) {
         lastGeminiErr = err;
         const errStr = (err.message || err.toString() || "").toLowerCase();
@@ -731,29 +758,48 @@ async function executeAIProviderCall(
             if (delaySeconds > 0 && delaySeconds <= 10 && remainingForRetry > delaySeconds * 1000 + 1000) {
               await new Promise((r) => setTimeout(r, Math.ceil(delaySeconds * 1000)));
               const finalRemainingMs = Math.max(1000, operationDeadline - Date.now());
+              const retrySignal = options.signal
+                ? AbortSignal.any([AbortSignal.timeout(finalRemainingMs), options.signal])
+                : AbortSignal.timeout(finalRemainingMs);
+              const retryConfig: any = {
+                responseMimeType: options.responseMimeType || "application/json",
+                abortSignal: retrySignal,
+                httpOptions: { timeout: finalRemainingMs },
+                maxOutputTokens: options.maxTokens || 16384,
+                ...(options.responseSchema ? { responseSchema: options.responseSchema } : {}),
+              };
+              if (/2\.5|3\.\d/.test(model)) {
+                retryConfig.thinkingConfig = { thinkingBudget: 0 };
+              }
               const retryRes = await withTimeoutPromise(
                 customClient.models.generateContent({
                   model,
                   contents: options.contents,
-                  config: {
-                    responseMimeType: options.responseMimeType || "application/json",
-                    abortSignal: AbortSignal.timeout(finalRemainingMs),
-                    httpOptions: { timeout: finalRemainingMs },
-                    ...(options.responseSchema ? { responseSchema: options.responseSchema } : {}),
-                  },
+                  config: retryConfig,
                 }),
                 finalRemainingMs,
                 `Gemini retry timed out on model ${model}`
               );
-              if (retryRes && retryRes.text) {
-                const count = (retryRes as any).usageMetadata?.totalTokenCount || Math.ceil((options.contents.length + retryRes.text.length) / 4);
-                return {
-                  text: retryRes.text,
-                  tokensUsed: count,
-                  activeModel: model,
-                  resolvedProvider,
-                };
+
+              const retryFinishReason = retryRes?.candidates?.[0]?.finishReason || (retryRes as any)?.finishReason;
+              if (retryFinishReason === "MAX_TOKENS") {
+                const truncErr = new Error("Output truncated (MAX_TOKENS)");
+                (truncErr as any).isTruncated = true;
+                throw truncErr;
               }
+
+              const retryText = retryRes?.text?.trim() || "";
+              if (!retryText) {
+                throw new Error("Empty response from model");
+              }
+
+              const count = (retryRes as any).usageMetadata?.totalTokenCount || Math.ceil((options.contents.length + retryText.length) / 4);
+              return {
+                text: retryRes?.text || retryText,
+                tokensUsed: count,
+                activeModel: model,
+                resolvedProvider,
+              };
             }
             const quotaErr = new Error(`Quota exhausted for Gemini key: ${err.message}`);
             (quotaErr as any).isQuota = true;
@@ -769,6 +815,9 @@ async function executeAIProviderCall(
     let lastAnthropicErr: any = null;
 
     for (const targetModel of modelsToTry) {
+      if (options.signal?.aborted) {
+        throw new Error("Client aborted request");
+      }
       try {
         const body: any = {
           model: targetModel,
@@ -779,6 +828,10 @@ async function executeAIProviderCall(
           body.system = "You are a professional linguistic assistant for German language learning. You must return your response strictly as valid, raw JSON without any markdown code fence wrappers and without conversational preamble.";
         }
 
+        const perCallSignal = options.signal
+          ? AbortSignal.any([AbortSignal.timeout(options.timeoutMs || 45000), options.signal])
+          : AbortSignal.timeout(options.timeoutMs || 45000);
+
         const res = await fetch(endpoint, {
           method: "POST",
           headers: {
@@ -788,7 +841,7 @@ async function executeAIProviderCall(
           },
           body: JSON.stringify(body),
           redirect: "manual",
-          signal: AbortSignal.timeout(options.timeoutMs || 45000),
+          signal: perCallSignal,
         });
 
         if (!res.ok) {
@@ -809,7 +862,19 @@ async function executeAIProviderCall(
         }
 
         const data: any = await res.json();
-        const text = data.content?.[0]?.text || "";
+        // A3. Truncation detection on Anthropic
+        if (data.stop_reason === "max_tokens") {
+          const truncErr = new Error("Output truncated (max_tokens)");
+          (truncErr as any).isTruncated = true;
+          throw truncErr;
+        }
+
+        const text = (data.content?.[0]?.text || "").trim();
+        // A4. Empty response check
+        if (!text) {
+          throw new Error("Empty response from model");
+        }
+
         const tokens =
           (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0) ||
           Math.ceil((options.contents.length + text.length) / 4);
@@ -841,8 +906,18 @@ async function executeAIProviderCall(
 
     const modelsToTry = getCandidateModelsForProvider(resolvedProvider, options.model);
     let lastProviderErr: any = null;
+    let modelAttempts = 0;
+    const isBatch = (options.contents || "").length > 2000;
 
     for (const targetModel of modelsToTry) {
+      if (options.signal?.aborted) {
+        throw new Error("Client aborted request");
+      }
+      // A6. Batch model-fallback limit: try at most 2 models for batch requests
+      if (isBatch && ++modelAttempts > 2) {
+        break;
+      }
+
       try {
         const body: any = {
           model: targetModel,
@@ -861,8 +936,9 @@ async function executeAIProviderCall(
           temperature: 0.2,
         };
 
+        // A8. Batch max_tokens headroom (8192 for batch, 4096 otherwise)
         if (!options.isPing) {
-          body.max_tokens = options.maxTokens || 4096;
+          body.max_tokens = options.maxTokens || (isBatch ? 8192 : 4096);
         } else if (options.maxTokens) {
           body.max_tokens = options.maxTokens;
         }
@@ -871,12 +947,16 @@ async function executeAIProviderCall(
           body.response_format = { type: "json_object" };
         }
 
+        const perCallSignal = options.signal
+          ? AbortSignal.any([AbortSignal.timeout(options.timeoutMs || 45000), options.signal])
+          : AbortSignal.timeout(options.timeoutMs || 45000);
+
         const res = await fetch(endpoint, {
           method: "POST",
           headers,
           body: JSON.stringify(body),
           redirect: "manual",
-          signal: AbortSignal.timeout(options.timeoutMs || 45000),
+          signal: perCallSignal,
         });
 
         if (!res.ok) {
@@ -897,7 +977,20 @@ async function executeAIProviderCall(
         }
 
         const data: any = await res.json();
-        const text = data.choices?.[0]?.message?.content || "";
+        // A3. Truncation detection on OpenAI-compatible
+        const choice = data.choices?.[0];
+        if (choice?.finish_reason === "length") {
+          const truncErr = new Error("Output truncated (length)");
+          (truncErr as any).isTruncated = true;
+          throw truncErr;
+        }
+
+        const text = (choice?.message?.content || "").trim();
+        // A4. Empty response check
+        if (!text) {
+          throw new Error("Empty response from model");
+        }
+
         const tokens = data.usage?.total_tokens || Math.ceil((options.contents.length + text.length) / 4);
         return {
           text,
@@ -924,6 +1017,8 @@ async function executeCustomKeyCall(
     responseSchema?: any;
     responseMimeType?: string;
     timeoutMs?: number;
+    maxTokens?: number;
+    signal?: AbortSignal;
   }
 ): Promise<{ text: string; tokensUsed: number; activeModel?: string; resolvedProvider?: ApiKeyProvider }> {
   const isBatch = (params.contents || "").length > 2000;
@@ -937,6 +1032,8 @@ async function executeCustomKeyCall(
     responseSchema: params.responseSchema,
     responseMimeType: params.responseMimeType,
     timeoutMs,
+    maxTokens: params.maxTokens,
+    signal: params.signal,
     isPing: false,
   });
   return {
@@ -953,6 +1050,8 @@ async function callGeminiWithFallback(params: {
   responseMimeType?: string;
   customKeys?: CustomApiKeyInput[];
   timeoutMs?: number;
+  maxTokens?: number;
+  signal?: AbortSignal;
 }): Promise<GeminiCallResult> {
   const chainStart = Date.now();
   const isBatch = (params.contents || "").length > 2000;
@@ -977,6 +1076,9 @@ async function callGeminiWithFallback(params: {
     );
 
     for (const customKey of validCustomKeys) {
+      if (params.signal?.aborted) {
+        throw new Error("Client aborted request");
+      }
       if (Date.now() - chainStart > 150000) {
         console.warn(`[AI Chain Deadline] Elapsed ${Date.now() - chainStart}ms exceeded 150000ms chain limit. Breaking out.`);
         break;
@@ -998,6 +1100,8 @@ async function callGeminiWithFallback(params: {
           responseSchema: params.responseSchema,
           responseMimeType: params.responseMimeType,
           timeoutMs: remainingTime,
+          maxTokens: params.maxTokens,
+          signal: params.signal,
         });
 
         if (result && result.text) {
@@ -1066,6 +1170,9 @@ async function callGeminiWithFallback(params: {
 
     // Inner loop: Iterate over models for current account
     for (const model of GEMINI_FALLBACK_MODELS) {
+      if (params.signal?.aborted) {
+        throw new Error("Client aborted request");
+      }
       if (skipAccount) break;
 
       if (Date.now() - chainStart > 150000) {
@@ -1087,11 +1194,18 @@ async function callGeminiWithFallback(params: {
         }
 
         const remainingMs = Math.max(1000, overallDeadline - Date.now());
+        const perCallSignal = params.signal
+          ? AbortSignal.any([AbortSignal.timeout(remainingMs), params.signal])
+          : AbortSignal.timeout(remainingMs);
         const config: any = {
           responseMimeType: params.responseMimeType || "application/json",
-          abortSignal: AbortSignal.timeout(remainingMs),
+          abortSignal: perCallSignal,
           httpOptions: { timeout: remainingMs },
+          maxOutputTokens: params.maxTokens || 16384,
         };
+        if (/2\.5|3\.\d/.test(model)) {
+          config.thinkingConfig = { thinkingBudget: 0 };
+        }
         if (params.responseSchema) {
           config.responseSchema = params.responseSchema;
         }
@@ -1106,19 +1220,29 @@ async function callGeminiWithFallback(params: {
           `Gemini request timed out on model ${model}`
         );
 
-        if (response && response.text) {
-          const totalTokens =
-            (response as any).usageMetadata?.totalTokenCount ||
-            Math.ceil((params.contents.length + response.text.length) / 4);
-          console.log(`[Env Gemini Fallback] Served request with account: ${label}, Model: ${model}, Tokens: ${totalTokens}`);
-          return {
-            text: response.text,
-            tokensUsed: totalTokens,
-            usedProvider: "gemini",
-            usedModel: model,
-            fallbackUsed: validCustomKeys.length > 0,
-          };
+        const finishReason = response?.candidates?.[0]?.finishReason || (response as any)?.finishReason;
+        if (finishReason === "MAX_TOKENS") {
+          const truncErr = new Error("Output truncated (MAX_TOKENS)");
+          (truncErr as any).isTruncated = true;
+          throw truncErr;
         }
+
+        const text = response?.text?.trim() || "";
+        if (!text) {
+          throw new Error("Empty response from model");
+        }
+
+        const totalTokens =
+          (response as any).usageMetadata?.totalTokenCount ||
+          Math.ceil((params.contents.length + text.length) / 4);
+        console.log(`[Env Gemini Fallback] Served request with account: ${label}, Model: ${model}, Tokens: ${totalTokens}`);
+        return {
+          text: response?.text || text,
+          tokensUsed: totalTokens,
+          usedProvider: "gemini",
+          usedModel: model,
+          fallbackUsed: validCustomKeys.length > 0,
+        };
       } catch (err: any) {
         lastError = err;
         const errStr = (err.message || err.toString() || "").toLowerCase();
@@ -1368,8 +1492,12 @@ function cleanConjugationPronouns(obj: any): any {
   return obj;
 }
 
+// TODO: add Firebase JWT auth before public deployment — server keys burn quota.
+
 // API: Validate Any AI Provider Key (Gemini, OpenAI, Groq, DeepSeek, Anthropic, OpenRouter, Mistral, Custom)
 app.post("/api/gemini/validate-key", async (req, res) => {
+  const ac = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
   try {
     const { apiKey, provider, baseUrl, model } = req.body;
     if (!apiKey || typeof apiKey !== "string" || !apiKey.trim()) {
@@ -1387,6 +1515,7 @@ app.post("/api/gemini/validate-key", async (req, res) => {
       maxTokens: 2,
       isPing: true,
       timeoutMs: 15000,
+      signal: ac.signal,
     });
 
     const providerNameMap: Record<string, string> = {
@@ -1424,6 +1553,8 @@ app.post("/api/gemini/validate-key", async (req, res) => {
 
 // API: Auto-fill Vocabulary Details
 app.post("/api/gemini/vocab-fill", async (req, res) => {
+  const ac = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
   try {
     const { word, meaning, currentData } = req.body;
     const cleanWord = typeof word === "string" ? word.trim() : "";
@@ -1466,6 +1597,7 @@ CRITICAL RULES:
     const geminiResult = await callGeminiWithFallback({
       contents: prompt,
       customKeys,
+      signal: ac.signal,
       responseSchema: {
         type: Type.OBJECT,
         properties: {
@@ -1501,6 +1633,8 @@ CRITICAL RULES:
 
 // API: Auto-fill Verb Details & Conjugations
 app.post("/api/gemini/verb-fill", async (req, res) => {
+  const ac = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
   try {
     const { infinitive, bedeutung, currentData } = req.body;
     const cleanInfinitive = typeof infinitive === "string" ? infinitive.trim() : "";
@@ -1576,6 +1710,7 @@ Return JSON matching this exact structure:
     const geminiResult = await callGeminiWithFallback({
       contents: prompt,
       customKeys,
+      signal: ac.signal,
       responseMimeType: "application/json",
       responseSchema: {
         type: Type.OBJECT,
@@ -1646,6 +1781,8 @@ Return JSON matching this exact structure:
 
 // API: Batch Auto-fill Vocabulary Items (JSON Import or Batch Enrich)
 app.post("/api/gemini/batch-vocab-fill", async (req, res) => {
+  const ac = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
   try {
     const { items } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
@@ -1669,7 +1806,12 @@ Each object must have:
 `;
 
     const customKeys = parseCustomKeysHeader(req);
-    const geminiResult = await callGeminiWithFallback({ contents: prompt, customKeys });
+    const geminiResult = await callGeminiWithFallback({
+      contents: prompt,
+      customKeys,
+      signal: ac.signal,
+      maxTokens: 16384,
+    });
     attachCustomKeyMeta(res, geminiResult);
     const parsed = parseCleanJson(geminiResult.text);
     res.json({ success: true, items: extractItemsFromAIResponse(parsed) });
@@ -1690,6 +1832,8 @@ Each object must have:
 
 // API: Batch Auto-fill Verbs (JSON Import or Batch Enrich)
 app.post("/api/gemini/batch-verb-fill", async (req, res) => {
+  const ac = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
   try {
     const { items } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
@@ -1705,7 +1849,12 @@ Return a JSON object with key "items" containing the completed list of verb item
 `;
 
     const customKeys = parseCustomKeysHeader(req);
-    const geminiResult = await callGeminiWithFallback({ contents: prompt, customKeys });
+    const geminiResult = await callGeminiWithFallback({
+      contents: prompt,
+      customKeys,
+      signal: ac.signal,
+      maxTokens: 16384,
+    });
     attachCustomKeyMeta(res, geminiResult);
     let parsed = parseCleanJson(geminiResult.text);
     const extractedVerbItems = extractItemsFromAIResponse(parsed);
@@ -1728,6 +1877,8 @@ Return a JSON object with key "items" containing the completed list of verb item
 
 // API: Generate or Complete Synonym / Antonym / Word Family / Semantic Field / Comparative Adjective Groups
 app.post("/api/gemini/synonyms-generate", async (req, res) => {
+  const ac = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
   try {
     const { mode, topic, currentGroup, existingWords, type } = req.body;
 
@@ -1843,7 +1994,7 @@ Return JSON:
     }
 
     const customKeys = parseCustomKeysHeader(req);
-    const geminiResult = await callGeminiWithFallback({ contents: prompt, customKeys });
+    const geminiResult = await callGeminiWithFallback({ contents: prompt, customKeys, signal: ac.signal });
     attachCustomKeyMeta(res, geminiResult);
     const data = parseCleanJson(geminiResult.text);
     res.json({ success: true, data });
@@ -1864,6 +2015,8 @@ Return JSON:
 
 // API: Generate German Story with Target Vocabulary & Verbs
 app.post("/api/gemini/story-generate", async (req, res) => {
+  const ac = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
   try {
     const { targetItems, cefrLevel } = req.body;
     if (!Array.isArray(targetItems) || targetItems.length === 0) {
@@ -1946,6 +2099,7 @@ Return valid JSON:
     const geminiResult = await callGeminiWithFallback({
       contents: prompt,
       customKeys,
+      signal: ac.signal,
       responseSchema: {
         type: Type.OBJECT,
         properties: {

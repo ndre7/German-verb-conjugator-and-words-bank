@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   BookOpen,
   BookMarked,
@@ -46,8 +46,22 @@ import { StoryPractice } from "./components/StoryPractice";
 import { ConjugationPractice } from "./components/ConjugationPractice";
 import { translations, Locale } from "./translations";
 import { type AppChangeLog, type VocabChangeLog } from "./types";
+import { aiFillJob } from "./services/aiFillJob";
 
 export default function App() {
+  // Read initial locale from localStorage or default to English
+  const [locale, setLocale] = useState<Locale>(() => {
+    const saved = localStorage.getItem("g_verb_locale");
+    if (saved === "fa" || saved === "de" || saved === "en") {
+      return saved as Locale;
+    }
+    return "en";
+  });
+
+  useEffect(() => {
+    localStorage.setItem("g_verb_locale", locale);
+  }, [locale]);
+
   const [activeTab, setActiveTab] = useState<"conjugator" | "vocabulary" | "practice" | "settings" | "history">("conjugator");
   const [vocabSubTab, setVocabSubTab] = useState<"bank" | "synonym_antonym" | "categories">("bank");
   const [practiceSubTab, setPracticeSubTab] = useState<"conjugation" | "story" | "saved_stories">("conjugation");
@@ -86,6 +100,73 @@ export default function App() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<boolean>(false);
 
   const [showScrollTop, setShowScrollTop] = useState(false);
+
+  // Global AI Fill Job Manager State (B1.1)
+  const [jobState, setJobState] = useState(() => ({
+    status: aiFillJob.status,
+    batch: aiFillJob.batch,
+    totalBatches: aiFillJob.totalBatches,
+    totalItems: aiFillJob.totalItems,
+    succeededCount: aiFillJob.succeededCount,
+    failedCount: aiFillJob.failed.length,
+    estimatedRemainingSeconds: aiFillJob.estimatedRemainingSeconds,
+    errorMessage: aiFillJob.errorMessage,
+  }));
+
+  const [jobFinishNotice, setJobFinishNotice] = useState<{
+    type: "success" | "warning";
+    message: string;
+    canRetry: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    const unsub = aiFillJob.subscribe(() => {
+      setJobState({
+        status: aiFillJob.status,
+        batch: aiFillJob.batch,
+        totalBatches: aiFillJob.totalBatches,
+        totalItems: aiFillJob.totalItems,
+        succeededCount: aiFillJob.succeededCount,
+        failedCount: aiFillJob.failed.length,
+        estimatedRemainingSeconds: aiFillJob.estimatedRemainingSeconds,
+        errorMessage: aiFillJob.errorMessage,
+      });
+    });
+    return unsub;
+  }, []);
+
+  const prevJobStatusRef = useRef(jobState.status);
+  useEffect(() => {
+    const prev = prevJobStatusRef.current;
+    prevJobStatusRef.current = jobState.status;
+
+    if (prev === "running" && jobState.status !== "running") {
+      const currentT = translations[locale] || translations.en;
+      if (jobState.status === "complete") {
+        setJobFinishNotice({
+          type: "success",
+          message: currentT.jobAllComplete || "همه کامل شد ✨",
+          canRetry: false,
+        });
+      } else if (jobState.status === "partial") {
+        const msg = (currentT.jobPartialComplete || "{succeeded} از {total} کامل شد، {failed} ناموفق")
+          .replace("{succeeded}", String(jobState.succeededCount))
+          .replace("{total}", String(jobState.totalItems))
+          .replace("{failed}", String(jobState.failedCount));
+        setJobFinishNotice({
+          type: "warning",
+          message: msg,
+          canRetry: jobState.failedCount > 0,
+        });
+      } else if (jobState.status === "stopped") {
+        setJobFinishNotice({
+          type: "warning",
+          message: `${currentT.jobStoppedGlobal || "عملیات متوقف شد:"} ${jobState.errorMessage || ""}`,
+          canRetry: true,
+        });
+      }
+    }
+  }, [jobState.status, jobState.succeededCount, jobState.totalItems, jobState.failedCount, jobState.errorMessage, locale]);
 
   // Global Backup & Restore Modal states
   const [showGlobalBackupModal, setShowGlobalBackupModal] = useState(false);
@@ -176,19 +257,6 @@ export default function App() {
     window.addEventListener("scroll", handleScroll, { passive: true });
     return () => window.removeEventListener("scroll", handleScroll);
   }, []);
-
-  // Read initial locale from localStorage or default to English
-  const [locale, setLocale] = useState<Locale>(() => {
-    const saved = localStorage.getItem("g_verb_locale");
-    if (saved === "fa" || saved === "de" || saved === "en") {
-      return saved as Locale;
-    }
-    return "en";
-  });
-
-  useEffect(() => {
-    localStorage.setItem("g_verb_locale", locale);
-  }, [locale]);
 
   useEffect(() => {
     const env = dbService.getEnvironment();
@@ -1527,6 +1595,95 @@ export default function App() {
                 className="px-5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
               >
                 {locale === "fa" ? "تایید و بازیابی" : locale === "de" ? "Wiederherstellen" : "Confirm & Restore"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Global AI Fill Job Result Notification Card (B1.1) */}
+      {jobFinishNotice && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 max-w-lg w-full px-4 animate-in fade-in slide-in-from-bottom-4 duration-300 no-print font-vazir">
+          <div className="bg-slate-900 text-white rounded-2xl shadow-2xl p-4 flex items-center justify-between gap-3 border border-slate-700">
+            <div className="flex items-center gap-2.5 text-xs font-medium">
+              {jobFinishNotice.type === "success" ? (
+                <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0" />
+              ) : (
+                <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />
+              )}
+              <span>{jobFinishNotice.message}</span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {jobFinishNotice.canRetry && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setJobFinishNotice(null);
+                    aiFillJob.retryFailed();
+                  }}
+                  className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1 cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>{t.jobRetryFailedBtn || "تلاش مجدد ناموفق‌ها"}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setJobFinishNotice(null)}
+                className="p-1 text-slate-400 hover:text-white rounded-lg cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Global AI Fill Progress Bar (fixed at bottom on ALL tabs - B1.1) */}
+      {jobState.status === "running" && (
+        <div className="fixed bottom-0 left-0 right-0 z-50 bg-slate-900/95 backdrop-blur-md text-white border-t border-purple-500/30 px-4 py-2.5 shadow-2xl no-print font-vazir">
+          <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2.5">
+            <div className="flex items-center gap-3 w-full sm:w-auto">
+              <Sparkles className="w-4 h-4 text-purple-400 animate-spin shrink-0" />
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-bold text-purple-200">
+                  {(t.jobBatchProgress || "دسته‌ی {batch} از {totalBatches}")
+                    .replace("{batch}", String(jobState.batch || 1))
+                    .replace("{totalBatches}", String(jobState.totalBatches || 1))}
+                </span>
+                {jobState.estimatedRemainingSeconds > 0 && (
+                  <span className="text-slate-400">
+                    ({(t.jobEstimatedRemaining || "زمان تخمینی باقیمانده: ~{seconds} ثانیه")
+                      .replace("{seconds}", String(jobState.estimatedRemainingSeconds))})
+                  </span>
+                )}
+                {jobState.succeededCount > 0 && (
+                  <span className="text-emerald-400 font-mono text-[11px]">
+                    ({jobState.succeededCount} / {jobState.totalItems})
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Progress bar and Cancel button */}
+            <div className="flex items-center gap-3 w-full sm:w-80">
+              <div className="flex-1 bg-slate-800 rounded-full h-2 overflow-hidden border border-slate-700">
+                <div
+                  className="bg-gradient-to-r from-purple-500 to-indigo-500 h-full rounded-full transition-all duration-300"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.max(5, Math.round(((jobState.batch || 1) / Math.max(1, jobState.totalBatches || 1)) * 100))
+                    )}%`,
+                  }}
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => aiFillJob.cancel()}
+                className="px-2.5 py-1 bg-rose-600/80 hover:bg-rose-600 text-white rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0"
+              >
+                {t.jobCancelBtn || "لغو"}
               </button>
             </div>
           </div>

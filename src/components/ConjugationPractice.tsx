@@ -32,6 +32,7 @@ import {
 } from "../types";
 import { translations, Locale } from "../translations";
 import { isAnswerCorrect, extractCandidatesFromCell } from "../utils/answerNormalization";
+import { sortBySearchRank } from "../utils/searchRanking";
 
 interface ConjugationPracticeProps {
   locale: Locale;
@@ -260,10 +261,16 @@ export function ConjugationPractice({ locale, isRtl }: ConjugationPracticeProps)
   // Filter suggestions
   const suggestions = useMemo(() => {
     if (!debouncedSearch) return [];
-    const q = (debouncedSearch || "").toLowerCase();
-    return allVerbs
-      .filter((v) => (v.infinitive || "").toLowerCase().includes(q) || (v.bedeutung && (v.bedeutung || "").toLowerCase().includes(q)))
-      .slice(0, 8);
+    const q = (debouncedSearch || "").toLowerCase().trim();
+    const matched = allVerbs.filter(
+      (v) =>
+        (v.infinitive || "").toLowerCase().includes(q) ||
+        (v.bedeutung && (v.bedeutung || "").toLowerCase().includes(q))
+    );
+    return sortBySearchRank(matched, q, (v) => ({
+      primary: v.infinitive || "",
+      secondary: v.bedeutung || "",
+    })).slice(0, 8);
   }, [allVerbs, debouncedSearch]);
 
   // Add a verb to the practice list
@@ -735,11 +742,19 @@ export function ConjugationPractice({ locale, isRtl }: ConjugationPracticeProps)
   const filteredGroupedStats = useMemo(() => {
     const query = debouncedStatsSearch.trim().toLowerCase();
     if (!query) return groupedStats;
-    return groupedStats.filter(([infinitive]) => {
+    const filtered = groupedStats.filter(([infinitive]) => {
       const verbObj = verbsMap.get(infinitive);
       const infMatch = infinitive.toLowerCase().includes(query);
       const meaningMatch = verbObj?.bedeutung ? verbObj.bedeutung.toLowerCase().includes(query) : false;
       return infMatch || meaningMatch;
+    });
+
+    return sortBySearchRank(filtered, query, ([infinitive]) => {
+      const verbObj = verbsMap.get(infinitive);
+      return {
+        primary: infinitive,
+        secondary: verbObj?.bedeutung || "",
+      };
     });
   }, [groupedStats, debouncedStatsSearch, verbsMap]);
 
@@ -1525,7 +1540,7 @@ export function ConjugationPractice({ locale, isRtl }: ConjugationPracticeProps)
                           {session.wrongCount} {t.sessionWrongLabel || "غلط"}
                         </span>
                         <span className="px-2.5 py-1 rounded-xl bg-slate-100 text-slate-700 font-mono">
-                          {totalCells} {t.sessionTotalCells || "کل سلولها"}
+                          {totalCells} {t.sessionTotalCells || "کل سلول‌ها"}
                         </span>
                       </div>
                     </div>

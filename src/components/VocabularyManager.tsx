@@ -29,7 +29,9 @@ import {
 } from "lucide-react";
 import { dbService } from "../DatabaseService";
 import { geminiFetch } from "../services/apiKeyService";
+import { aiFillJob } from "../services/aiFillJob";
 import { VocabularyItem, ArticleType, PartOfSpeech, VocabularyCategory, getVocabLexicalKey } from "../types";
+import { sortBySearchRank } from "../utils/searchRanking";
 import { translations, Locale } from "../translations";
 import VocabularyCategoryManager from "./VocabularyCategoryManager";
 import SynonymAntonymManager from "./SynonymAntonymManager";
@@ -349,68 +351,68 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
   const handleBulkAiEnrichVocabs = async () => {
     if (selectedVocabIds.size === 0) return;
-    const selectedItems = vocabularies.filter(v => selectedVocabIds.has(v.id));
+    const selectedItems = vocabularies.filter((v) => selectedVocabIds.has(v.id));
     if (selectedItems.length === 0) return;
 
-    setAiLoading(true);
-    showToast(locale === "fa" ? `در حال تحلیل و تکمیل ${selectedItems.length} واژه با هوش مصنوعی...` : `Enriching ${selectedItems.length} words with AI...`);
+    setSelectedVocabIds(new Set());
+    showToast(
+      locale === "fa"
+        ? `شروع تکمیل ${selectedItems.length} واژه در پس‌زمینه...`
+        : `Started background AI fill for ${selectedItems.length} words...`
+    );
 
-    try {
-      const CHUNK_SIZE = 10;
-      const BATCH_REQUEST_DELAY_MS = 2000;
-      const delayMs = (ms: number) => new Promise(res => setTimeout(res, ms));
-
-      let updatedCount = 0;
-
-      for (let i = 0; i < selectedItems.length; i += CHUNK_SIZE) {
-        if (i > 0) await delayMs(BATCH_REQUEST_DELAY_MS);
-        const chunk = selectedItems.slice(i, i + CHUNK_SIZE);
-
+    await aiFillJob.start<VocabularyItem>({
+      type: "vocab",
+      items: selectedItems,
+      getItemId: (v) => v.id,
+      getItemWord: (v) => v.word,
+      processBatch: async (chunk, signal) => {
         const res = await geminiFetch("/api/gemini/batch-vocab-fill", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ items: chunk })
+          body: JSON.stringify({ items: chunk }),
+          signal,
         });
-
-        if (res.ok) {
-          const data = await res.json();
-          const items = extractItemsFromAIResponse(data.items !== undefined ? data.items : data);
-          if (data.success && items.length > 0) {
-            for (const enriched of items) {
-              const enrichedWord = enriched.word || enriched.german || enriched.infinitive || "";
-              const orig = chunk.find(c => (c.word || "").toLowerCase() === (enrichedWord || "").toLowerCase() || c.id === enriched.id);
-              if (orig) {
-                const updatedItem: VocabularyItem = {
-                  ...orig,
-                  article: (enriched.article && ["der","die","das","none"].includes(enriched.article)) ? enriched.article : orig.article,
-                  word: enrichedWord || orig.word,
-                  meaning: enriched.meaning || orig.meaning,
-                  plural: normalizePluralField(enriched.plural !== undefined ? enriched.plural : orig.plural),
-                  partOfSpeech: enriched.partOfSpeech || orig.partOfSpeech,
-                  example: enriched.example ? cleanGermanExample(enriched.example) : orig.example,
-                  notes: enriched.notes || orig.notes,
-                  updatedAt: Date.now()
-                };
-                await dbService.saveVocabulary(updatedItem);
-                updatedCount++;
-              }
-            }
+        if (!res.ok) {
+          const errData = await res.json().catch(() => null);
+          const err = new Error(errData?.userMessage || errData?.error || `HTTP ${res.status}`);
+          (err as any).status = res.status;
+          throw err;
+        }
+        const data = await res.json();
+        const items = extractItemsFromAIResponse(data.items !== undefined ? data.items : data);
+        if (!data.success || items.length === 0) {
+          throw new Error("No items returned from batch vocabulary fill");
+        }
+        return items;
+      },
+      onBatchDone: async (enrichedItems, originalBatch) => {
+        for (const enriched of enrichedItems) {
+          const enrichedWord = enriched.word || enriched.german || enriched.infinitive || "";
+          const orig = originalBatch.find(
+            (c) => (c.word || "").toLowerCase() === (enrichedWord || "").toLowerCase() || c.id === enriched.id
+          );
+          if (orig) {
+            const updatedItem: VocabularyItem = {
+              ...orig,
+              article:
+                enriched.article && ["der", "die", "das", "none"].includes(enriched.article)
+                  ? enriched.article
+                  : orig.article,
+              word: enrichedWord || orig.word,
+              meaning: enriched.meaning || orig.meaning,
+              plural: normalizePluralField(enriched.plural !== undefined ? enriched.plural : orig.plural),
+              partOfSpeech: enriched.partOfSpeech || orig.partOfSpeech,
+              example: enriched.example ? cleanGermanExample(enriched.example) : orig.example,
+              notes: enriched.notes || orig.notes,
+              updatedAt: Date.now(),
+            };
+            await dbService.saveVocabulary(updatedItem);
           }
         }
-      }
-
-      await loadData();
-      setSelectedVocabIds(new Set());
-      showToast(
-        locale === "fa"
-          ? `تعداد ${updatedCount} واژه با هوش مصنوعی بروزرسانی شدند (قابل بازگشت از تاریخچه) ✨`
-          : `${updatedCount} words enriched with AI (revertible via History) ✨`
-      );
-    } catch (err: any) {
-      showToast((locale === "fa" ? "خطا در هوش مصنوعی: " : "AI error: ") + (err.message || err));
-    } finally {
-      setAiLoading(false);
-    }
+        await loadData();
+      },
+    });
   };
 
   // AI Fill Single Word in Add/Edit Modal
@@ -1029,60 +1031,84 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
       itemsArray = newCandidates;
 
-      // If AI enrich is enabled, send to Gemini API
+      // If AI enrich is enabled, send to Gemini API via aiFillJob
       if (enableAiJsonImport && itemsArray.length > 0) {
         setJsonImportSuccess(
           locale === "fa"
-            ? `${summaryMsg}\nدر حال تحلیل و تکمیل ${itemsArray.length} واژه جدید با هوش مصنوعی... (لطفاً چند لحظه شکیبا باشید)`
-            : `${summaryMsg}\nEnriching ${itemsArray.length} new vocabulary items with AI...`
+            ? `${summaryMsg}\nدر حال تحلیل و تکمیل ${itemsArray.length} واژه جدید با هوش مصنوعی در پس‌زمینه...`
+            : `${summaryMsg}\nEnriching ${itemsArray.length} new vocabulary items with AI in the background...`
         );
 
-        const enrichedList: any[] = [];
-        const CHUNK_SIZE = 10;
-        const BATCH_REQUEST_DELAY_MS = 2000;
-        const delayMs = (ms: number) => new Promise((res) => setTimeout(res, ms));
-
-        for (let i = 0; i < itemsArray.length; i += CHUNK_SIZE) {
-          if (i > 0) {
-            await delayMs(BATCH_REQUEST_DELAY_MS);
-          }
-          const chunk = itemsArray.slice(i, i + CHUNK_SIZE);
-          const batchKey = chunk.map((c) => (c.word || c.id || "").toLowerCase().trim()).sort().join("|");
-          if (processedBatchKeys.current.has(batchKey)) {
-            console.log("[Batch] already processed, skipping:", batchKey.slice(0, 40));
-            continue;
-          }
-
-          try {
-            const aiRes = await geminiFetch("/api/gemini/batch-vocab-fill", {
+        await aiFillJob.start<any>({
+          type: "vocab",
+          items: itemsArray,
+          getItemId: (v) => v.word || v.id || "",
+          getItemWord: (v) => v.word || "",
+          processBatch: async (chunk, signal) => {
+            const res = await geminiFetch("/api/gemini/batch-vocab-fill", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ items: chunk }),
+              signal,
             });
-            if (aiRes.ok) {
-              const aiData = await aiRes.json();
-              const extractedItems = extractItemsFromAIResponse(aiData.items !== undefined ? aiData.items : aiData);
-              if (aiData.success && extractedItems.length > 0) {
-                processedBatchKeys.current.add(batchKey);
-                enrichedList.push(...extractedItems);
-                continue;
-              }
-            } else {
-              const errData = await aiRes.json().catch(() => null);
-              if (errData?.userMessage) {
-                console.warn("Batch AI vocab chunk warning:", errData.userMessage);
-              }
+            if (!res.ok) {
+              const errData = await res.json().catch(() => null);
+              throw new Error(errData?.userMessage || errData?.error || `HTTP ${res.status}`);
             }
-          } catch (err) {
-            console.warn("Batch AI chunk error during JSON import, falling back to raw chunk items:", err);
-          }
-          // On failure: do NOT add to the set (so fallback path can still process it)
-          enrichedList.push(...chunk);
-        }
+            const aiData = await res.json();
+            const extractedItems = extractItemsFromAIResponse(aiData.items !== undefined ? aiData.items : aiData);
+            if (aiData.success && extractedItems.length > 0) {
+              return extractedItems;
+            }
+            return chunk;
+          },
+          onBatchDone: async (enrichedItems, originalBatch) => {
+            const freshVocabs = await dbService.getVocabularies();
+            const committedKeys = new Set(
+              freshVocabs.map(
+                (v) =>
+                  `${(v.word || "").replace(/^(der|die|das)\s+/i, "").toLowerCase().trim()}|${(v.article || "none").toLowerCase()}|${(v.partOfSpeech || "noun").toLowerCase()}`
+              )
+            );
 
-        if (enrichedList.length > 0) {
-          itemsArray = enrichedList;
-        }
+            for (let idx = 0; idx < enrichedItems.length; idx++) {
+              const raw = enrichedItems[idx] || originalBatch[idx];
+              let rawWord = String(raw.word || raw.german || "").trim();
+              if (!rawWord) continue;
+              let art: ArticleType = (raw.article && ["der", "die", "das", "none"].includes(raw.article)) ? raw.article : "none";
+              if (art === "none") {
+                if (/^der\s+/i.test(rawWord)) art = "der";
+                else if (/^die\s+/i.test(rawWord)) art = "die";
+                else if (/^das\s+/i.test(rawWord)) art = "das";
+              }
+              const cleanWord = rawWord.replace(/^(der|die|das)\s+/i, "").trim();
+              if (!cleanWord) continue;
+              const pos: PartOfSpeech = (raw.partOfSpeech as PartOfSpeech) || (art !== "none" ? "noun" : "expression");
+              const normKey = `${cleanWord.toLowerCase()}|${art.toLowerCase()}|${pos.toLowerCase()}`;
+              if (committedKeys.has(normKey)) continue;
+              committedKeys.add(normKey);
+
+              const newVocabItem: VocabularyItem = {
+                id: `vocab_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                article: art,
+                word: cleanWord,
+                meaning: String(raw.meaning || raw.persian || "").trim(),
+                plural: normalizePluralField(raw.plural),
+                partOfSpeech: pos,
+                example: raw.example ? cleanGermanExample(raw.example) : "",
+                notes: String(raw.notes || "").trim(),
+                tags: Array.isArray(raw.tags) && raw.tags.length > 0 ? raw.tags : jsonImportTags,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+              };
+              await dbService.saveVocabulary(newVocabItem);
+            }
+            await loadData();
+          },
+        });
+
+        setTimeout(() => setShowJsonImportModal(false), 1500);
+        return;
       }
 
       let countSuccess = 0;
@@ -1216,26 +1242,38 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
   };
 
   // Filter Logic
-  const filteredVocabularies = vocabularies.filter((item) => {
-    if (articleFilter !== "all" && item.article !== articleFilter) return false;
-    if (posFilter !== "all" && item.partOfSpeech !== posFilter) return false;
+  const filteredVocabularies = useMemo(() => {
+    const filtered = vocabularies.filter((item) => {
+      if (articleFilter !== "all" && item.article !== articleFilter) return false;
+      if (posFilter !== "all" && item.partOfSpeech !== posFilter) return false;
 
-    // Filter by selected tags (AND logic: word must contain ALL selected tags)
-    if (selectedTagFilters.length > 0) {
-      const hasAllTags = item.tags && selectedTagFilters.every(t => item.tags!.includes(t));
-      if (!hasAllTags) return false;
+      // Filter by selected tags (AND logic: word must contain ALL selected tags)
+      if (selectedTagFilters.length > 0) {
+        const hasAllTags = item.tags && selectedTagFilters.every(t => item.tags!.includes(t));
+        if (!hasAllTags) return false;
+      }
+
+      if (searchQuery && searchQuery.trim()) {
+        const q = searchQuery.toLowerCase().trim();
+        const matchWord = (item.word || "").toLowerCase().includes(q);
+        const matchMeaning = (item.meaning || "").toLowerCase().includes(q);
+        const matchPlural = (item.plural || "").toLowerCase().includes(q);
+        const matchExample = (item.example || "").toLowerCase().includes(q);
+        return matchWord || matchMeaning || matchPlural || matchExample;
+      }
+      return true;
+    });
+
+    if (!searchQuery || !searchQuery.trim()) {
+      return filtered;
     }
 
-    if (searchQuery && searchQuery.trim()) {
-      const q = searchQuery.toLowerCase().trim();
-      const matchWord = (item.word || "").toLowerCase().includes(q);
-      const matchMeaning = (item.meaning || "").toLowerCase().includes(q);
-      const matchPlural = (item.plural || "").toLowerCase().includes(q);
-      const matchExample = (item.example || "").toLowerCase().includes(q);
-      return matchWord || matchMeaning || matchPlural || matchExample;
-    }
-    return true;
-  });
+    return sortBySearchRank(filtered, searchQuery, (item) => ({
+      primary: item.word || "",
+      secondary: item.meaning || "",
+      extras: [item.plural || "", item.example || ""],
+    }));
+  }, [vocabularies, articleFilter, posFilter, selectedTagFilters, searchQuery]);
 
   // Pagination Logic
   const totalPages = Math.ceil(filteredVocabularies.length / itemsPerPage) || 1;

@@ -90,6 +90,7 @@ export interface AppChangeLog {
 
 export interface VocabChangeLog {
   id: string;
+  itemId?: string; // Immutable record ID of affected vocabulary item
   timestamp: number;
   word: string;
   type: "vocab_add" | "vocab_delete" | "vocab_edit";
@@ -167,5 +168,77 @@ export interface SavedStory {
   totalWordCount: number;
   cefrLevel: CefrLevel;
   createdAt: number;
+}
+
+export const getVocabLexicalKey = (
+  word: string,
+  article?: ArticleType | string,
+  partOfSpeech?: PartOfSpeech | string
+): string => {
+  const cleanWord = (word || "").replace(/^(der|die|das)\s+/i, "").toLowerCase().trim();
+  const art = (article || "none").toLowerCase().trim();
+  const pos = (partOfSpeech || "noun").toLowerCase().trim();
+  return `${cleanWord}_${art}_${pos}`;
+};
+
+export function normalizePluralField(p: string | undefined | null): string {
+  const trimmed = (p || "").trim().toLowerCase();
+  if (
+    !trimmed ||
+    [
+      "none",
+      "null",
+      "-",
+      "–",
+      "n/a",
+      "no plural",
+      "بدون جمع",
+      "ohne plural",
+      "ohne plural / nur singular",
+      "nur singular",
+    ].includes(trimmed)
+  ) {
+    return "–";
+  }
+  return (p || "").trim();
+}
+
+export type PracticeTense =
+  | "PRASENS"
+  | "PERFEKT"
+  | "PRATERITUM"
+  | "KONJUNKTIV2_PRATERITUM"
+  | "FUTUR1"
+  | "PLUSQUAMPERFEKT"
+  | "KONJUNKTIV1_PRASENS"
+  | "FUTUR2"
+  | "IMPERATIV";
+
+export interface ConjugationPracticeStat {
+  id: string; // `${infinitive}|${tense}|${person}` e.g. "sein|IMPERATIV|du"
+  infinitive: string; // lowercase, trimmed
+  tense: PracticeTense;
+  person: "S1" | "S2" | "S3" | "P1" | "P2" | "P3";
+  wrongCount: number;
+  lastWrongAt: number; // epoch ms
+  lastUserAnswer: string;
+  lastCorrectAnswer: string;
+}
+
+export interface PracticeSession {
+  id: string; // `session_${Date.now()}_${rand}`
+  startedAt: number;
+  completedAt: number;
+  verbInfinitives: string[]; // ordered list of infinitives in this session
+  tenses: PracticeTense[]; // tenses selected for this session
+  totalCells: number;
+  correctCount: number; // cells correct on FIRST check
+  wrongCount: number; // cells wrong on FIRST check
+  isFavorite: boolean;
+  // Backward compatibility with legacy stored sessions
+  date?: number;
+  verbList?: string[];
+  selectedTenses?: PracticeTense[];
+  totalChecked?: number;
 }
 

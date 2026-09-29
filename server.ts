@@ -1,34 +1,77 @@
 import express from "express";
 import path from "path";
+import dns from "dns";
+import net from "net";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import { detectProvider } from "./src/shared/providers";
 
 const app = express();
-app.set("trust proxy", true); // Cloud Run frontend proxy trust
+// Bound trust proxy to immediate reverse-proxy hop (Cloud Run / standard ingress)
+// Avoids trusting arbitrary downstream x-forwarded-for headers (BUG-30)
+app.set("trust proxy", 1);
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
 app.use(express.json({ limit: "10mb" }));
 
 // In-memory sliding window rate limiter for AI endpoints (protect server resources & quotas)
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_MAX = 60; // 60 requests per minute
+const RATE_LIMIT_MAX = 60; // 60 requests per minute per client identity
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+
+// Aggregate server-wide budget across all callers to protect backend environment quotas
+let aggregateRequestCount = 0;
+let aggregateResetTime = Date.now() + RATE_LIMIT_WINDOW_MS;
+const AGGREGATE_RATE_LIMIT_MAX = 240; // 240 reqs/min global ceiling
 
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of rateLimitMap) {
     if (now > v.resetTime) rateLimitMap.delete(k);
   }
-}, 5 * 60 * 1000).unref();
+  if (now > aggregateResetTime) {
+    aggregateRequestCount = 0;
+    aggregateResetTime = now + RATE_LIMIT_WINDOW_MS;
+  }
+}, 60 * 1000).unref();
 
 function aiRateLimiter(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const ip = req.ip || req.headers["x-forwarded-for"]?.toString() || "unknown";
   const now = Date.now();
-  const entry = rateLimitMap.get(ip);
 
+  // 1. Check server-wide aggregate budget
+  if (now > aggregateResetTime) {
+    aggregateRequestCount = 0;
+    aggregateResetTime = now + RATE_LIMIT_WINDOW_MS;
+  }
+  if (aggregateRequestCount >= AGGREGATE_RATE_LIMIT_MAX) {
+    return res.status(429).json({
+      success: false,
+      error: "ظرفیت پردازش سرور به حداکثر رسیده است. لطفاً چند لحظه دیگر تلاش کنید.",
+      userMessage: "ظرفیت پردازش هوش مصنوعی سرور به طور موقت تکمیل شده است. لطفاً یک دقیقه دیگر تلاش کنید.",
+      reason: "quota_exhausted",
+    });
+  }
+
+  // 2. Client identity derivation: trust 1-hop reverse proxy req.ip safely (BUG-30)
+  const clientIp = (req.ip || req.socket.remoteAddress || "127.0.0.1").replace(/^::ffff:/, "");
+
+  // Supplement IP with authenticated user identity if custom keys are provided
+  let clientKey = `ip:${clientIp}`;
+  const customHeader = req.headers["x-custom-api-keys"];
+  if (typeof customHeader === "string" && customHeader.trim()) {
+    try {
+      const parsed = JSON.parse(customHeader);
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.key) {
+        const keyHash = String(parsed[0].id || parsed[0].key).slice(-8);
+        clientKey = `auth:${keyHash}:${clientIp}`;
+      }
+    } catch {}
+  }
+
+  const entry = rateLimitMap.get(clientKey);
   if (!entry || now > entry.resetTime) {
-    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS });
+    rateLimitMap.set(clientKey, { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS });
+    aggregateRequestCount++;
     return next();
   }
 
@@ -36,12 +79,13 @@ function aiRateLimiter(req: express.Request, res: express.Response, next: expres
     return res.status(429).json({
       success: false,
       error: "تعداد درخواست‌های ارسالی بیش از حد مجاز است. لطفاً کمی بعد تلاش فرمایید.",
-      userMessage: "تعداد درخواست‌های ارسالی بیش از حد مجاز است. لطفاً یک دقیقه دیگر دوباره تلاش کنید.",
+      userMessage: "تعداد درخواست‌های ارسالی شما بیش از سقف مجاز است. لطفاً یک دقیقه دیگر دوباره تلاش کنید.",
       reason: "quota_exhausted",
     });
   }
 
   entry.count++;
+  aggregateRequestCount++;
   return next();
 }
 
@@ -174,10 +218,34 @@ export interface CustomApiKeyInput {
 export interface GeminiCallResult {
   text: string;
   usedCustomKeyId?: string;
+  usedProvider?: string;
+  usedModel?: string;
   tokensUsed: number;
+  fallbackUsed?: boolean;
 }
 
 export { detectProvider };
+
+// Helper to bound async operations to an explicit timeout deadline
+async function withTimeoutPromise<T>(
+  promise: Promise<T>,
+  ms: number,
+  message = "Operation timed out"
+): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(message);
+      err.name = "TimeoutError";
+      reject(err);
+    }, ms);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
 
 // In-memory process-lifetime cache of models confirmed retired/unavailable per account (404 / no longer available)
 // Key format: `${accountLabel}:${modelName}`
@@ -264,10 +332,66 @@ function getOrderedGeminiClients(): GeminiClientEntry[] {
   return cachedGeminiClients;
 }
 
-// SSRF Protection: Validate custom base URL
-function validateCustomBaseUrl(baseUrl: string): string {
+// SSRF Protection & Server Egress Policy: Validate and resolve custom AI endpoints (BUG-21)
+const ALLOW_LOCAL_AI_ENDPOINTS = process.env.ALLOW_LOCAL_AI_ENDPOINTS === "true";
+
+// Approved public hosted AI providers that bypass dynamic DNS resolution
+const APPROVED_HOSTED_DOMAINS = new Set([
+  "api.openai.com",
+  "api.groq.com",
+  "api.deepseek.com",
+  "api.mistral.ai",
+  "openrouter.ai",
+  "api.together.xyz",
+  "api.x.ai",
+  "api.perplexity.ai",
+  "api.cerebras.ai",
+  "api.anthropic.com",
+  "generativelanguage.googleapis.com",
+]);
+
+// Classify IP address against private, loopback, link-local, and reserved ranges
+function isRestrictedIpAddress(ip: string): { restricted: boolean; reason?: string } {
+  const normalized = ip.replace(/^::ffff:/i, "");
+
+  if (net.isIPv4(normalized)) {
+    const parts = normalized.split(".").map(Number);
+    if (parts.length !== 4 || parts.some((p) => isNaN(p) || p < 0 || p > 255)) {
+      return { restricted: true, reason: "invalid_ipv4" };
+    }
+    const [a, b] = parts;
+    if (a === 127) return { restricted: true, reason: "loopback" };
+    if (a === 0) return { restricted: true, reason: "unspecified" };
+    if (a === 10) return { restricted: true, reason: "private_10" };
+    if (a === 172 && b >= 16 && b <= 31) return { restricted: true, reason: "private_172" };
+    if (a === 192 && b === 168) return { restricted: true, reason: "private_192" };
+    if (a === 169 && b === 254) return { restricted: true, reason: "link_local_metadata" };
+    if (a === 100 && b >= 64 && b <= 127) return { restricted: true, reason: "cgnat" };
+    if (normalized === "255.255.255.255") return { restricted: true, reason: "broadcast" };
+    return { restricted: false };
+  }
+
+  if (net.isIPv6(normalized)) {
+    const lower = normalized.toLowerCase();
+    if (lower === "::1") return { restricted: true, reason: "loopback" };
+    if (lower === "::") return { restricted: true, reason: "unspecified" };
+    if (lower.startsWith("fe80:") || lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) {
+      return { restricted: true, reason: "link_local_metadata" };
+    }
+    if (lower.startsWith("fc") || lower.startsWith("fd")) {
+      return { restricted: true, reason: "private_ula" };
+    }
+    return { restricted: false };
+  }
+
+  return { restricted: true, reason: "unknown_ip_format" };
+}
+
+// Complete Server Egress Policy: Validate and resolve destination URLs
+async function validateAndResolveEgressUrl(baseUrl: string): Promise<string> {
   const trimmed = baseUrl.trim();
   if (!trimmed) return "";
+
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(trimmed);
@@ -276,44 +400,101 @@ function validateCustomBaseUrl(baseUrl: string): string {
   }
 
   const hostname = parsedUrl.hostname.toLowerCase();
-  const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 
-  if (parsedUrl.protocol === "http:") {
-    if (!isLocalhost) {
-      throw new Error("HTTP protocol is only allowed for localhost/127.0.0.1. Remote APIs must use HTTPS.");
-    }
-  } else if (parsedUrl.protocol !== "https:") {
-    throw new Error("Only HTTP or HTTPS protocols are permitted.");
-  }
-
+  // 1. Textual cloud metadata and reserved domains check
   const isCloudMetadata =
     hostname === "169.254.169.254" ||
     hostname === "metadata.google.internal" ||
     hostname === "metadata.google" ||
     hostname === "metadata" ||
-    hostname.endsWith(".internal");
+    hostname.endsWith(".internal") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".arpa") ||
+    hostname.endsWith(".onion");
 
   if (isCloudMetadata) {
-    throw new Error("Access to internal metadata services is prohibited.");
+    throw new Error("Access to internal or cloud metadata services is strictly prohibited.");
   }
 
-  if (!isLocalhost) {
-    const isPrivateIp =
-      /^10\./.test(hostname) ||
-      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname) ||
-      /^192\.168\./.test(hostname) ||
-      /^169\.254\./.test(hostname) ||
-      hostname === "0.0.0.0";
-    if (isPrivateIp) {
-      throw new Error("Access to private network IP addresses is restricted.");
+  // 2. Identify loopback addresses
+  const isLocalhostText =
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]" ||
+    hostname === "::1" ||
+    hostname.startsWith("127.");
+
+  if (isLocalhostText && !ALLOW_LOCAL_AI_ENDPOINTS) {
+    throw new Error(
+      "Localhost/loopback destinations are restricted in hosted mode. In hosted environments, localhost refers to the backend container, not your browser device. To use local models, enable explicit local mode (ALLOW_LOCAL_AI_ENDPOINTS=true) or use a secure public HTTPS endpoint."
+    );
+  }
+
+  // 3. Enforce protocol policy
+  if (parsedUrl.protocol === "http:") {
+    if (!isLocalhostText || !ALLOW_LOCAL_AI_ENDPOINTS) {
+      throw new Error("HTTP protocol is restricted. All remote AI endpoints must use HTTPS.");
+    }
+  } else if (parsedUrl.protocol !== "https:") {
+    throw new Error(`Protocol "${parsedUrl.protocol}" is not permitted. Only HTTPS (or local HTTP) is allowed.`);
+  }
+
+  // 4. Port policy
+  const port = parsedUrl.port ? parseInt(parsedUrl.port, 10) : parsedUrl.protocol === "https:" ? 443 : 80;
+  const blockedPorts = [PORT, 22, 25, 111, 445, 2049, 2375, 2376, 5432, 6379, 9200, 27017];
+  if (blockedPorts.includes(port)) {
+    throw new Error(`Connection to internal/database port ${port} is prohibited.`);
+  }
+
+  // 5. Approved hosted domains bypass DNS resolution check
+  if (APPROVED_HOSTED_DOMAINS.has(hostname)) {
+    return trimmed.replace(/\/+$/, "");
+  }
+
+  // 6. Resolved network destination policy (DNS rebinding / private IP protection)
+  const isDirectIp = net.isIP(hostname);
+  if (isDirectIp) {
+    const check = isRestrictedIpAddress(hostname);
+    if (check.restricted) {
+      if (check.reason === "loopback" && ALLOW_LOCAL_AI_ENDPOINTS) {
+        // Allowed in explicit local-model mode
+      } else {
+        throw new Error(
+          `Destination IP "${hostname}" is restricted (${check.reason}). Access blocked by server egress policy.`
+        );
+      }
+    }
+  } else {
+    // Resolve destination hostname addresses to prevent DNS rebinding attacks
+    try {
+      const records = await dns.promises.lookup(hostname, { all: true });
+      if (!records || records.length === 0) {
+        throw new Error(`Could not resolve hostname "${hostname}".`);
+      }
+      for (const record of records) {
+        const check = isRestrictedIpAddress(record.address);
+        if (check.restricted) {
+          if (check.reason === "loopback" && ALLOW_LOCAL_AI_ENDPOINTS) {
+            continue;
+          }
+          throw new Error(
+            `Destination "${hostname}" resolves to restricted IP "${record.address}" (${check.reason}). Access blocked by server egress policy.`
+          );
+        }
+      }
+    } catch (dnsErr: any) {
+      if (dnsErr.message && dnsErr.message.includes("blocked by server egress policy")) {
+        throw dnsErr;
+      }
+      throw new Error(`DNS resolution failed for custom endpoint host "${hostname}": ${dnsErr.message}`);
     }
   }
 
   return trimmed.replace(/\/+$/, "");
 }
 
-function resolveChatEndpoint(provider: string, rawBaseUrl?: string): string {
-  const customBase = rawBaseUrl ? validateCustomBaseUrl(rawBaseUrl) : "";
+async function resolveChatEndpoint(provider: string, rawBaseUrl?: string): Promise<string> {
+  const customBase = rawBaseUrl ? await validateAndResolveEgressUrl(rawBaseUrl) : "";
   if (customBase) {
     if (customBase.endsWith("/chat/completions")) return customBase;
     if (customBase.endsWith("/v1") || customBase.endsWith("/v2")) return `${customBase}/chat/completions`;
@@ -329,7 +510,8 @@ function resolveChatEndpoint(provider: string, rawBaseUrl?: string): string {
     case "xai": return "https://api.x.ai/v1/chat/completions";
     case "perplexity": return "https://api.perplexity.ai/chat/completions";
     case "cerebras": return "https://api.cerebras.ai/v1/chat/completions";
-    default: return "http://localhost:11434/v1/chat/completions";
+    default:
+      throw new Error(`Custom or unrecognized AI provider "${provider}" requires an explicit HTTPS baseUrl.`);
   }
 }
 
@@ -400,6 +582,18 @@ function parseCleanJson(text: string): any {
   }
 }
 
+function extractItemsFromAIResponse(parsed: any): any[] {
+  if (!parsed) return [];
+  if (Array.isArray(parsed)) return parsed;
+  if (Array.isArray(parsed.items)) return parsed.items;
+  if (Array.isArray(parsed.data)) return parsed.data;
+  if (Array.isArray(parsed.results)) return parsed.results;
+  if (Array.isArray(parsed.words)) return parsed.words;
+  if (Array.isArray(parsed.vocabularies)) return parsed.vocabularies;
+  if (parsed && typeof parsed === "object" && (parsed.word || parsed.german || parsed.infinitive)) return [parsed];
+  return [];
+}
+
 interface ExecuteAIProviderCallOptions {
   key: string;
   provider?: ApiKeyProvider;
@@ -428,9 +622,15 @@ async function executeAIProviderCall(
   const resolvedProvider: ApiKeyProvider = options.provider || detectProvider(cleanKey);
 
   if (resolvedProvider === "gemini") {
+    const operationTimeoutMs = options.timeoutMs || 45000;
+    const operationDeadline = Date.now() + operationTimeoutMs;
+
     const customClient = new GoogleGenAI({
       apiKey: cleanKey,
-      httpOptions: { headers: { "User-Agent": options.isPing ? "aistudio-build-validate" : "aistudio-build-custom" } },
+      httpOptions: {
+        timeout: operationTimeoutMs,
+        headers: { "User-Agent": options.isPing ? "aistudio-build-validate" : "aistudio-build-custom" },
+      },
     });
 
     const modelsToTry = options.isPing
@@ -442,8 +642,18 @@ async function executeAIProviderCall(
     let lastGeminiErr: any = null;
 
     for (const model of modelsToTry) {
+      if (Date.now() >= operationDeadline) {
+        const timeoutErr = new Error(`Gemini operation timed out after ${operationTimeoutMs}ms`);
+        timeoutErr.name = "TimeoutError";
+        throw timeoutErr;
+      }
+
       try {
-        const config: any = {};
+        const remainingMs = Math.max(1000, operationDeadline - Date.now());
+        const config: any = {
+          abortSignal: AbortSignal.timeout(remainingMs),
+          httpOptions: { timeout: remainingMs },
+        };
         if (options.isPing) {
           config.maxOutputTokens = options.maxTokens || 2;
         } else {
@@ -453,11 +663,15 @@ async function executeAIProviderCall(
           }
         }
 
-        const response = await customClient.models.generateContent({
-          model,
-          contents: options.contents,
-          config,
-        });
+        const response = await withTimeoutPromise(
+          customClient.models.generateContent({
+            model,
+            contents: options.contents,
+            config,
+          }),
+          remainingMs,
+          `Gemini request timed out on model ${model}`
+        );
 
         if (response && response.text) {
           const tokenCount =
@@ -474,6 +688,16 @@ async function executeAIProviderCall(
         lastGeminiErr = err;
         const errStr = (err.message || err.toString() || "").toLowerCase();
         const errStatus = err.status || err.code || 0;
+        const isTimeout =
+          err.name === "TimeoutError" ||
+          err.name === "AbortError" ||
+          errStr.includes("timeout") ||
+          errStr.includes("aborted");
+
+        if (isTimeout) {
+          throw err;
+        }
+
         const isAuth =
           errStatus === 401 ||
           errStatus === 403 ||
@@ -503,16 +727,24 @@ async function executeAIProviderCall(
             let delaySeconds = 0;
             const retryMatch = errStr.match(/retry in\s+([\d.]+)\s*s/i) || errStr.match(/retrydelay['":\s]+([\d.]+)/i);
             if (retryMatch) delaySeconds = parseFloat(retryMatch[1]);
-            if (delaySeconds > 0 && delaySeconds <= 10) {
+            const remainingForRetry = operationDeadline - Date.now();
+            if (delaySeconds > 0 && delaySeconds <= 10 && remainingForRetry > delaySeconds * 1000 + 1000) {
               await new Promise((r) => setTimeout(r, Math.ceil(delaySeconds * 1000)));
-              const retryRes = await customClient.models.generateContent({
-                model,
-                contents: options.contents,
-                config: {
-                  responseMimeType: options.responseMimeType || "application/json",
-                  ...(options.responseSchema ? { responseSchema: options.responseSchema } : {}),
-                },
-              });
+              const finalRemainingMs = Math.max(1000, operationDeadline - Date.now());
+              const retryRes = await withTimeoutPromise(
+                customClient.models.generateContent({
+                  model,
+                  contents: options.contents,
+                  config: {
+                    responseMimeType: options.responseMimeType || "application/json",
+                    abortSignal: AbortSignal.timeout(finalRemainingMs),
+                    httpOptions: { timeout: finalRemainingMs },
+                    ...(options.responseSchema ? { responseSchema: options.responseSchema } : {}),
+                  },
+                }),
+                finalRemainingMs,
+                `Gemini retry timed out on model ${model}`
+              );
               if (retryRes && retryRes.text) {
                 const count = (retryRes as any).usageMetadata?.totalTokenCount || Math.ceil((options.contents.length + retryRes.text.length) / 4);
                 return {
@@ -596,7 +828,7 @@ async function executeAIProviderCall(
     throw lastAnthropicErr || new Error("All candidate Anthropic models failed.");
   } else {
     // OpenAI-compatible providers: openai, groq, deepseek, mistral, openrouter, together, xai, perplexity, cerebras, or ANY custom provider
-    const endpoint = resolveChatEndpoint(resolvedProvider, options.baseUrl);
+    const endpoint = await resolveChatEndpoint(resolvedProvider, options.baseUrl);
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -691,20 +923,28 @@ async function executeCustomKeyCall(
     contents: string;
     responseSchema?: any;
     responseMimeType?: string;
+    timeoutMs?: number;
   }
-): Promise<{ text: string; tokensUsed: number }> {
+): Promise<{ text: string; tokensUsed: number; activeModel?: string; resolvedProvider?: ApiKeyProvider }> {
+  const isBatch = (params.contents || "").length > 2000;
+  const timeoutMs = params.timeoutMs || (isBatch ? 180000 : 120000);
   const result = await executeAIProviderCall({
     key: customKey.key,
-    provider: customKey.provider,
+    provider: (customKey.provider as ApiKeyProvider) || undefined,
     baseUrl: customKey.baseUrl,
     model: customKey.model,
     contents: params.contents,
     responseSchema: params.responseSchema,
     responseMimeType: params.responseMimeType,
-    timeoutMs: 120000,
+    timeoutMs,
     isPing: false,
   });
-  return { text: result.text, tokensUsed: result.tokensUsed };
+  return {
+    text: result.text,
+    tokensUsed: result.tokensUsed,
+    activeModel: result.activeModel,
+    resolvedProvider: result.resolvedProvider,
+  };
 }
 
 async function callGeminiWithFallback(params: {
@@ -712,14 +952,113 @@ async function callGeminiWithFallback(params: {
   responseSchema?: any;
   responseMimeType?: string;
   customKeys?: CustomApiKeyInput[];
+  timeoutMs?: number;
 }): Promise<GeminiCallResult> {
-  const clients = getOrderedGeminiClients();
-  let lastError: any = null;
+  const chainStart = Date.now();
+  const isBatch = (params.contents || "").length > 2000;
+  const totalBudgetMs = params.timeoutMs || (isBatch ? 180000 : 120000);
+  const overallDeadline = chainStart + totalBudgetMs;
 
+  let lastError: any = null;
   let encounteredQuota = false;
   let encounteredModelUnavailable = false;
   let encounteredAuth = false;
   let encounteredTimeout = false;
+
+  // PRIORITY 1: Explicit user-configured custom API keys (BUG-24, BUG-25, BUG-IMP-03)
+  // When the user specifies custom providers/keys, honor that explicit selection first.
+  const validCustomKeys = (params.customKeys || []).filter(
+    (k) => k && k.enabled !== false && typeof k.key === "string" && k.key.trim().length > 5
+  );
+
+  if (validCustomKeys.length > 0) {
+    console.log(
+      `[AI Provider Priority] Honoring user-selected provider configuration (${validCustomKeys.length} key(s))...`
+    );
+
+    for (const customKey of validCustomKeys) {
+      if (Date.now() - chainStart > 150000) {
+        console.warn(`[AI Chain Deadline] Elapsed ${Date.now() - chainStart}ms exceeded 150000ms chain limit. Breaking out.`);
+        break;
+      }
+      if (Date.now() >= overallDeadline) {
+        encounteredTimeout = true;
+        break;
+      }
+
+      const provider = customKey.provider || detectProvider(customKey.key);
+      const remainingTime = Math.max(1000, overallDeadline - Date.now());
+
+      try {
+        console.log(
+          `[Custom Key] Trying key "${customKey.name || customKey.id}" (Provider: ${provider}, Model: ${customKey.model || "default"})`
+        );
+        const result = await executeCustomKeyCall(customKey, {
+          contents: params.contents,
+          responseSchema: params.responseSchema,
+          responseMimeType: params.responseMimeType,
+          timeoutMs: remainingTime,
+        });
+
+        if (result && result.text) {
+          console.log(
+            `[Custom Key] Served request with key "${customKey.name || customKey.id}" (Provider: ${result.resolvedProvider || provider}, Model: ${result.activeModel || customKey.model || "default"}, Tokens: ${result.tokensUsed})`
+          );
+          return {
+            text: result.text,
+            tokensUsed: result.tokensUsed,
+            usedCustomKeyId: customKey.id,
+            usedProvider: result.resolvedProvider || provider,
+            usedModel: result.activeModel || customKey.model || "default",
+            fallbackUsed: false,
+          };
+        }
+      } catch (err: any) {
+        lastError = err;
+        const isAuth = !!err.isAuth;
+        const isQuota = !!err.isQuota;
+        const isTimeout =
+          err.name === "AbortError" ||
+          err.name === "TimeoutError" ||
+          /timeout|aborted/i.test(String(err.message || ""));
+
+        if (isAuth) {
+          encounteredAuth = true;
+          console.warn(
+            `[AI Explicit Provider Auth Error] Key "${customKey.name || customKey.id}" (${provider}) unauthorized. Trying next candidate...`
+          );
+          continue;
+        }
+
+        if (isQuota) {
+          encounteredQuota = true;
+          console.warn(
+            `[AI Explicit Provider Quota Error] Key "${customKey.name || customKey.id}" (${provider}) quota exhausted. Trying next candidate...`
+          );
+          continue;
+        }
+
+        if (isTimeout) {
+          encounteredTimeout = true;
+          console.warn(
+            `[AI Explicit Provider Timeout] Key "${customKey.name || customKey.id}" (${provider}) timed out after ${remainingTime}ms.`
+          );
+          continue;
+        }
+
+        console.warn(
+          `[AI Explicit Provider Error] Key "${customKey.name || customKey.id}" (${provider}) failed: ${err.message}. Trying next candidate...`
+        );
+      }
+    }
+
+    console.warn(
+      "[AI Cross-Provider Failover] Explicit user-selected provider(s) failed or timed out. Falling back to server backup accounts..."
+    );
+  }
+
+  // PRIORITY 2: Server environment Gemini accounts (as primary if no custom keys, or as failover if custom keys failed)
+  const clients = getOrderedGeminiClients();
 
   // Outer loop: Iterate over accounts (Primary -> account-2 -> account-3 -> ...)
   for (const { client, label } of clients) {
@@ -729,6 +1068,11 @@ async function callGeminiWithFallback(params: {
     for (const model of GEMINI_FALLBACK_MODELS) {
       if (skipAccount) break;
 
+      if (Date.now() - chainStart > 150000) {
+        console.warn(`[AI Chain Deadline] Elapsed ${Date.now() - chainStart}ms exceeded 150000ms chain limit during env accounts.`);
+        break;
+      }
+
       // Check if model is already known to be retired/unavailable for this specific account in process cache
       const accountModelKey = `${label}:${model}`;
       if (retiredModels.has(accountModelKey)) {
@@ -737,33 +1081,59 @@ async function callGeminiWithFallback(params: {
       }
 
       try {
+        if (Date.now() >= overallDeadline) {
+          encounteredTimeout = true;
+          break;
+        }
+
+        const remainingMs = Math.max(1000, overallDeadline - Date.now());
         const config: any = {
           responseMimeType: params.responseMimeType || "application/json",
+          abortSignal: AbortSignal.timeout(remainingMs),
+          httpOptions: { timeout: remainingMs },
         };
         if (params.responseSchema) {
           config.responseSchema = params.responseSchema;
         }
 
-        const response = await client.models.generateContent({
-          model,
-          contents: params.contents,
-          config,
-        });
+        const response = await withTimeoutPromise(
+          client.models.generateContent({
+            model,
+            contents: params.contents,
+            config,
+          }),
+          remainingMs,
+          `Gemini request timed out on model ${model}`
+        );
 
         if (response && response.text) {
           const totalTokens =
             (response as any).usageMetadata?.totalTokenCount ||
             Math.ceil((params.contents.length + response.text.length) / 4);
-          console.log(`[Gemini Success] Account: ${label}, Model: ${model}, Tokens: ${totalTokens}`);
+          console.log(`[Env Gemini Fallback] Served request with account: ${label}, Model: ${model}, Tokens: ${totalTokens}`);
           return {
             text: response.text,
             tokensUsed: totalTokens,
+            usedProvider: "gemini",
+            usedModel: model,
+            fallbackUsed: validCustomKeys.length > 0,
           };
         }
       } catch (err: any) {
         lastError = err;
         const errStr = (err.message || err.toString() || "").toLowerCase();
         const errStatus = err.status || err.code || 0;
+        const isTimeout =
+          err.name === "TimeoutError" ||
+          err.name === "AbortError" ||
+          errStr.includes("timeout") ||
+          errStr.includes("aborted");
+
+        if (isTimeout) {
+          encounteredTimeout = true;
+          console.warn(`[Gemini Timeout] Account "${label}", Model "${model}" timed out.`);
+          continue;
+        }
 
         // 1. Auth/Key error (401, 403, invalid key) -> skip entire account immediately
         const isAuthError =
@@ -827,26 +1197,33 @@ async function callGeminiWithFallback(params: {
             delaySeconds = parseFloat(retryMatch[1]);
           }
 
+          const remainingForRetry = overallDeadline - Date.now();
           // If retry delay is short (<= 10 seconds), wait and retry ONCE for the same model/account
-          if (delaySeconds > 0 && delaySeconds <= 10) {
+          if (delaySeconds > 0 && delaySeconds <= 10 && remainingForRetry > delaySeconds * 1000 + 1000) {
             console.log(
               `[Gemini Retry Delay] Short retry delay detected (${delaySeconds}s). Waiting and retrying model "${model}" on account "${label}"...`
             );
             await new Promise((r) => setTimeout(r, Math.ceil(delaySeconds * 1000)));
 
             try {
+              const finalRemainingMs = Math.max(1000, overallDeadline - Date.now());
               const config: any = {
                 responseMimeType: params.responseMimeType || "application/json",
+                abortSignal: AbortSignal.timeout(finalRemainingMs),
+                httpOptions: { timeout: finalRemainingMs },
               };
               if (params.responseSchema) {
                 config.responseSchema = params.responseSchema;
               }
-
-              const retryResponse = await client.models.generateContent({
-                model,
-                contents: params.contents,
-                config,
-              });
+              const retryResponse = await withTimeoutPromise(
+                client.models.generateContent({
+                  model,
+                  contents: params.contents,
+                  config,
+                }),
+                finalRemainingMs,
+                `Gemini retry timed out on model ${model}`
+              );
 
               if (retryResponse && retryResponse.text) {
                 const totalTokens =
@@ -856,6 +1233,9 @@ async function callGeminiWithFallback(params: {
                 return {
                   text: retryResponse.text,
                   tokensUsed: totalTokens,
+                  usedProvider: "gemini",
+                  usedModel: model,
+                  fallbackUsed: validCustomKeys.length > 0,
                 };
               }
             } catch (retryErr: any) {
@@ -911,80 +1291,16 @@ async function callGeminiWithFallback(params: {
     }
   }
 
-  // Outer loop 2: Secondary failover to User-provided custom API keys from settings
-  const validCustomKeys = (params.customKeys || []).filter(
-    (k) => k && k.enabled !== false && typeof k.key === "string" && k.key.trim().length > 5
-  );
-
-  if (validCustomKeys.length > 0) {
-    console.log(
-      `[AI Custom Key Loop] Processing ${validCustomKeys.length} user-provided custom key(s)...`
-    );
-
-    for (const customKey of validCustomKeys) {
-      const provider = customKey.provider || detectProvider(customKey.key);
-      try {
-        console.log(
-          `[AI Custom Key Try] Key "${customKey.name || customKey.id}" (Provider: ${provider})`
-        );
-        const result = await executeCustomKeyCall(customKey, params);
-        if (result && result.text) {
-          console.log(
-            `[AI Custom Key Success] Key: "${customKey.name || customKey.id}", Provider: ${provider}, Tokens: ${result.tokensUsed}`
-          );
-          return {
-            text: result.text,
-            usedCustomKeyId: customKey.id,
-            tokensUsed: result.tokensUsed,
-          };
-        }
-      } catch (err: any) {
-        lastError = err;
-        const isAuth = !!err.isAuth;
-        const isQuota = !!err.isQuota;
-        const isTimeout = err.name === "AbortError" || /timeout|aborted/i.test(String(err.message || ""));
-
-        if (isAuth) {
-          encounteredAuth = true;
-          console.warn(
-            `[AI Custom Key Auth Error] Key "${customKey.name || customKey.id}" (${provider}) unauthorized. Skipping to next key.`
-          );
-          continue;
-        }
-
-        if (isQuota) {
-          encounteredQuota = true;
-          console.warn(
-            `[AI Custom Key Quota Error] Key "${customKey.name || customKey.id}" (${provider}) quota exhausted. Skipping to next key.`
-          );
-          continue;
-        }
-
-        if (isTimeout) {
-          encounteredTimeout = true;
-          console.warn(
-            `[AI Custom Key Timeout] Key "${customKey.name || customKey.id}" (${provider}) timed out. Trying next key...`
-          );
-          continue;
-        }
-
-        console.warn(
-          `[AI Custom Key Error] Key "${customKey.name || customKey.id}" (${provider}) failed: ${err.message}. Trying next key...`
-        );
-      }
-    }
-  }
-
   // Determine primary failure reason across all attempts
   let primaryReason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "unknown" = "unknown";
-  if (encounteredQuota) {
+  if (encounteredTimeout || Date.now() >= overallDeadline) {
+    primaryReason = "timeout";
+  } else if (encounteredQuota) {
     primaryReason = "quota_exhausted";
   } else if (encounteredModelUnavailable) {
     primaryReason = "model_unavailable";
   } else if (encounteredAuth) {
     primaryReason = "auth_error";
-  } else if (encounteredTimeout) {
-    primaryReason = "timeout";
   }
 
   const finalMsg = lastError?.message || "All AI accounts, models, and custom keys failed to generate content.";
@@ -1011,9 +1327,21 @@ function parseCustomKeysHeader(req: express.Request): CustomApiKeyInput[] {
 function attachCustomKeyMeta(res: express.Response, result: GeminiCallResult) {
   if (result.usedCustomKeyId) {
     res.setHeader("x-used-custom-key-id", result.usedCustomKeyId);
-    res.setHeader("x-used-token-count", result.tokensUsed.toString());
   }
-  res.setHeader("Access-Control-Expose-Headers", "x-used-custom-key-id, x-used-token-count");
+  if (result.usedProvider) {
+    res.setHeader("x-used-provider", result.usedProvider);
+  }
+  if (result.usedModel) {
+    res.setHeader("x-used-model", result.usedModel);
+  }
+  if (typeof result.fallbackUsed === "boolean") {
+    res.setHeader("x-fallback-used", result.fallbackUsed ? "true" : "false");
+  }
+  res.setHeader("x-used-token-count", (result.tokensUsed || 0).toString());
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "x-used-custom-key-id, x-used-token-count, x-used-provider, x-used-model, x-fallback-used"
+  );
 }
 
 // Helper function to strip German pronouns from conjugation output strings
@@ -1344,7 +1672,7 @@ Each object must have:
     const geminiResult = await callGeminiWithFallback({ contents: prompt, customKeys });
     attachCustomKeyMeta(res, geminiResult);
     const parsed = parseCleanJson(geminiResult.text);
-    res.json({ success: true, items: parsed.items || [] });
+    res.json({ success: true, items: extractItemsFromAIResponse(parsed) });
   } catch (err: any) {
     const reason = err.reason || "unknown";
     if (reason === "unknown") {
@@ -1380,10 +1708,9 @@ Return a JSON object with key "items" containing the completed list of verb item
     const geminiResult = await callGeminiWithFallback({ contents: prompt, customKeys });
     attachCustomKeyMeta(res, geminiResult);
     let parsed = parseCleanJson(geminiResult.text);
-    if (Array.isArray(parsed.items)) {
-      parsed.items = parsed.items.map((vItem: any) => cleanConjugationPronouns(vItem));
-    }
-    res.json({ success: true, items: parsed.items || [] });
+    const extractedVerbItems = extractItemsFromAIResponse(parsed);
+    const cleanedVerbItems = extractedVerbItems.map((vItem: any) => cleanConjugationPronouns(vItem));
+    res.json({ success: true, items: cleanedVerbItems });
   } catch (err: any) {
     const reason = err.reason || "unknown";
     if (reason === "unknown") {
@@ -1654,7 +1981,8 @@ Return valid JSON:
         const cleanItem = item.replace(/^(der|die|das|ein|eine)\s+/i, "").trim();
         if (cleanItem.length < 3) continue;
 
-        const regex = new RegExp(`(?<!\\*\\*)(?<![a-zA-ZäöüßÄÖÜ])(${cleanItem})(?![a-zA-ZäöüßÄÖÜ])(?!\\*\\*)`, "gi");
+        const escaped = cleanItem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const regex = new RegExp(`(?<!\\*\\*)(?<![a-zA-ZäöüßÄÖÜ])(${escaped})(?![a-zA-ZäöüßÄÖÜ])(?!\\*\\*)`, "gi");
         if (regex.test(text)) {
           text = text.replace(regex, "**$1**");
         }

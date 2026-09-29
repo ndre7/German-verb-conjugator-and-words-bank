@@ -186,7 +186,7 @@ export const StoryPractice: React.FC<StoryPracticeProps> = ({
     for (const voc of dbVocabs) {
       if (!voc.word) continue;
       list.push({
-        id: `vocab_${voc.id || voc.word.toLowerCase().trim()}`,
+        id: `vocab_${voc.id || (voc.word || "").toLowerCase().trim()}`,
         word: voc.word.trim(),
         type: "vocab",
         typeLabel: locale === "fa" ? "واژه" : locale === "de" ? "Wort" : "Word",
@@ -200,14 +200,14 @@ export const StoryPractice: React.FC<StoryPracticeProps> = ({
 
   // Filtered list for manual selection
   const filteredManualItems = useMemo(() => {
-    const q = manualSearch.toLowerCase().trim();
+    const q = (manualSearch || "").toLowerCase().trim();
     return allSelectableItems.filter((item) => {
       if (manualFilterType === "verb" && item.type !== "verb") return false;
       if (manualFilterType === "vocab" && item.type !== "vocab") return false;
       if (!q) return true;
       return (
-        item.word.toLowerCase().includes(q) ||
-        (item.meaning && item.meaning.toLowerCase().includes(q))
+        (item.word || "").toLowerCase().includes(q) ||
+        (item.meaning && (item.meaning || "").toLowerCase().includes(q))
       );
     });
   }, [allSelectableItems, manualSearch, manualFilterType]);
@@ -579,14 +579,14 @@ export const StoryPractice: React.FC<StoryPracticeProps> = ({
 
   // Filtered saved stories
   const filteredSavedStories = useMemo(() => {
-    const q = savedSearch.toLowerCase().trim();
+    const q = (savedSearch || "").toLowerCase().trim();
     return savedStories.filter((s) => {
       if (savedLevelFilter !== "all" && s.cefrLevel !== savedLevelFilter) return false;
       if (!q) return true;
       return (
-        s.title.toLowerCase().includes(q) ||
-        s.storyGerman.toLowerCase().includes(q) ||
-        (s.storyPersian && s.storyPersian.toLowerCase().includes(q))
+        (s.title || "").toLowerCase().includes(q) ||
+        (s.storyGerman || "").toLowerCase().includes(q) ||
+        (s.storyPersian && (s.storyPersian || "").toLowerCase().includes(q))
       );
     });
   }, [savedStories, savedSearch, savedLevelFilter]);
@@ -1213,7 +1213,7 @@ export const StoryPractice: React.FC<StoryPracticeProps> = ({
                       const clean = word.replace(/^(der|die|das|ein|eine)\s+/i, "").trim().toLowerCase();
                       const isUsed =
                         currentStory.usedTargetItems.includes(word) ||
-                        currentStory.storyGerman.toLowerCase().includes(clean);
+                        (currentStory.storyGerman || "").toLowerCase().includes(clean);
                       return (
                         <span
                           key={idx}

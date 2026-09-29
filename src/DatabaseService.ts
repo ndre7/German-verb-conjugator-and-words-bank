@@ -1,5 +1,5 @@
 import Dexie, { type Table } from "dexie";
-import { Tense, type UserOverride, type Category, type TenseConjugations, type VerbItem, type ConjugationPerson, type AppChangeLog, type VocabChangeLog, type VocabularyItem, type ArticleType, type PartOfSpeech, type VocabularyCategory, type SynonymAntonymGroup, type SavedStory } from "./types";
+import { Tense, type UserOverride, type Category, type TenseConjugations, type VerbItem, type ConjugationPerson, type AppChangeLog, type VocabChangeLog, type VocabularyItem, type ArticleType, type PartOfSpeech, type VocabularyCategory, type SynonymAntonymGroup, type SavedStory, normalizePluralField, type ConjugationPracticeStat, type PracticeTense, type PracticeSession } from "./types";
 import sampleDb from "./German_DB_sample_file.json";
 
 // ----------------------------------------------------
@@ -13,6 +13,8 @@ export class VerbConjugationDatabase extends Dexie {
   vocabCategories!: Table<VocabularyCategory, string>;
   synonymAntonymGroups!: Table<SynonymAntonymGroup, string>;
   savedStories!: Table<SavedStory, string>;
+  conjugationPracticeStats!: Table<ConjugationPracticeStat, string>;
+  practiceSessions!: Table<PracticeSession, string>;
 
   constructor() {
     super("GermanVerbManagerDB");
@@ -22,33 +24,57 @@ export class VerbConjugationDatabase extends Dexie {
       settings: "key",
     });
     this.version(2).stores({
-      overrides: "infinitive, sortOrder",
-      categories: "id, name",
-      settings: "key",
       vocabularies: "id, word, article, partOfSpeech"
     });
     this.version(3).stores({
-      overrides: "infinitive, sortOrder",
-      categories: "id, name",
-      settings: "key",
-      vocabularies: "id, word, article, partOfSpeech",
       vocabCategories: "id, name",
       synonymAntonymGroups: "id, title, type"
     });
     this.version(4).stores({
+      savedStories: "id, title, createdAt, cefrLevel"
+    });
+    this.version(5).stores({
       overrides: "infinitive, sortOrder",
       categories: "id, name",
       settings: "key",
       vocabularies: "id, word, article, partOfSpeech",
       vocabCategories: "id, name",
       synonymAntonymGroups: "id, title, type",
-      savedStories: "id, title, createdAt, cefrLevel"
+      savedStories: "id, title, createdAt, cefrLevel",
+      conjugationPracticeStats: "id, infinitive, tense, person, wrongCount",
+      practiceSessions: "id, startedAt, completedAt, isFavorite",
     });
   }
 }
 
 export const db = new VerbConjugationDatabase();
 
+// ----------------------------------------------------
+// Identity & Parsing Canonical Helpers
+// ----------------------------------------------------
+export function canonicalVerbKey(infinitive: string): string {
+  return (infinitive || "").trim().toLowerCase();
+}
+
+const VALID_PERSONS: Array<keyof ConjugationPerson> = ["S1", "S2", "S3", "P1", "P2", "P3"];
+
+export function parseCellOverrideKey(cellKey: string): { tense: string; person: keyof ConjugationPerson } | null {
+  if (!cellKey) return null;
+  const lastUnderscore = cellKey.lastIndexOf("_");
+  if (lastUnderscore <= 0 || lastUnderscore >= cellKey.length - 1) return null;
+
+  const tense = cellKey.substring(0, lastUnderscore);
+  const personStr = cellKey.substring(lastUnderscore + 1);
+
+  if (!VALID_PERSONS.includes(personStr as keyof ConjugationPerson)) {
+    return null;
+  }
+
+  return {
+    tense,
+    person: personStr as keyof ConjugationPerson
+  };
+}
 
 // ----------------------------------------------------
 // DatabaseService Class
@@ -64,6 +90,13 @@ export class DatabaseService {
   private inMemorySettings: Record<string, any> = {};
   private inMemoryOverrides: Record<string, UserOverride> = {};
   private inMemorySavedStories: SavedStory[] = [];
+  private inMemoryConjugationStats: ConjugationPracticeStat[] = [];
+  private inMemoryPracticeSessions: PracticeSession[] = [];
+  // In-memory seed-guard flags to prevent double-seeding race conditions
+  private categoriesSeeded: boolean = false;
+  private vocabulariesSeeded: boolean = false;
+  private vocabCategoriesSeeded: boolean = false;
+  private synonymAntonymGroupsSeeded: boolean = false;
   private inMemoryCategories: Category[] = [
     { id: "regular", name: "Regelmäßig", color: "#10B981" },
     { id: "irregular", name: "Unregelmäßig", color: "#EF4444" },
@@ -87,6 +120,35 @@ export class DatabaseService {
       DatabaseService.instance = new DatabaseService();
     }
     return DatabaseService.instance;
+  }
+
+  /**
+   * Ensures the IndexedDB connection is open.
+   * If an upgrade or schema error occurs (e.g. broken primary key in user's existing DB),
+   * defensively resets (deletes and re-opens) the database so the application recovers gracefully.
+   */
+  public async ensureDbOpen(): Promise<boolean> {
+    if (this.useInMemoryFallback) return false;
+    try {
+      await db.open();
+      return true;
+    } catch (e) {
+      console.warn("[DB] Upgrade failed - resetting local database", e);
+      try {
+        await db.delete();
+      } catch (e2) {
+        console.warn("[DB] Failed to delete corrupted database", e2);
+      }
+      try {
+        await db.open();
+        this.useInMemoryFallback = false;
+        return true;
+      } catch (e3) {
+        console.warn("[DB] Re-open failed after reset, activating in-memory fallback", e3);
+        this.useInMemoryFallback = true;
+        return false;
+      }
+    }
   }
 
   /**
@@ -114,7 +176,39 @@ export class DatabaseService {
     const memVal = this.inMemorySettings[key];
     if (memVal !== undefined) return memVal as T;
 
-    // 2. Check localStorage
+    // 2. Check IndexedDB as authoritative persistent layer if not in fallback mode
+    if (!this.useInMemoryFallback) {
+      try {
+        const isOpen = await this.ensureDbOpen();
+        if (isOpen) {
+          const setting = await db.settings.get(key);
+          if (setting !== undefined && setting !== null) {
+            this.inMemorySettings[key] = setting.value;
+            // Synchronize localStorage secondary cache
+            try {
+              if (typeof window !== "undefined" && window.localStorage) {
+                window.localStorage.setItem(`g_verb_setting_${key}`, JSON.stringify(setting.value));
+              }
+            } catch (e) {}
+            return setting.value as T;
+          } else {
+            // Explicitly absent in IndexedDB: clean any stale secondary cache to prevent resurrecting deleted keys
+            this.inMemorySettings[key] = null;
+            try {
+              if (typeof window !== "undefined" && window.localStorage) {
+                window.localStorage.removeItem(`g_verb_setting_${key}`);
+              }
+            } catch (e) {}
+            return null;
+          }
+        }
+      } catch (e) {
+        console.warn(`IndexedDB read failed for key ${key}, falling back to secondary cache`, e);
+        this.useInMemoryFallback = true;
+      }
+    }
+
+    // 3. Fallback: check localStorage when in fallback mode or after IndexedDB failure
     try {
       if (typeof window !== "undefined" && window.localStorage) {
         const localVal = window.localStorage.getItem(`g_verb_setting_${key}`);
@@ -126,21 +220,6 @@ export class DatabaseService {
       }
     } catch (e) {
       console.warn(`localStorage read failed for key ${key}`, e);
-    }
-
-    // 3. Check IndexedDB
-    if (!this.useInMemoryFallback) {
-      try {
-        await db.open();
-        const setting = await db.settings.get(key);
-        if (setting) {
-          this.inMemorySettings[key] = setting.value;
-          return setting.value as T;
-        }
-      } catch (e) {
-        console.warn(`IndexedDB read failed for key ${key}, falling back`, e);
-        this.useInMemoryFallback = true;
-      }
     }
 
     return null;
@@ -162,8 +241,10 @@ export class DatabaseService {
     // Attempt IndexedDB
     if (!this.useInMemoryFallback) {
       try {
-        await db.open();
-        await db.settings.put({ key, value });
+        const isOpen = await this.ensureDbOpen();
+        if (isOpen) {
+          await db.settings.put({ key, value });
+        }
       } catch (e) {
         console.warn(`IndexedDB write failed for key ${key}, falling back`, e);
         this.useInMemoryFallback = true;
@@ -187,8 +268,10 @@ export class DatabaseService {
     // Clear from IndexedDB
     if (!this.useInMemoryFallback) {
       try {
-        await db.open();
-        await db.settings.delete(key);
+        const isOpen = await this.ensureDbOpen();
+        if (isOpen) {
+          await db.settings.delete(key);
+        }
       } catch (e) {
         console.warn(`IndexedDB delete failed for key ${key}`, e);
       }
@@ -199,13 +282,18 @@ export class DatabaseService {
    * Loads the base database into cache.
    */
   public async loadDatabase(customJsonContent?: string): Promise<Record<string, TenseConjugations>> {
-    // Attempt to open/verify IndexedDB connection to catch SecurityError early
+    // Attempt to open/verify IndexedDB connection with defensive recovery
     if (!this.useInMemoryFallback) {
       try {
         await db.open();
       } catch (e) {
-        console.warn("IndexedDB (Dexie) is not accessible (e.g. running from file:// or restricted webview). Falling back to in-memory mode.", e);
-        this.useInMemoryFallback = true;
+        console.warn("[DB] Upgrade failed - resetting local database", e);
+        try { await db.delete(); } catch (e2) {}
+        try {
+          await db.open();
+        } catch (e3) {
+          this.useInMemoryFallback = true;
+        }
       }
     }
 
@@ -387,30 +475,32 @@ export class DatabaseService {
   public async getAllVerbs(): Promise<VerbItem[]> {
     const infinitivesSet = new Set<string>();
     for (const inf of this.getLoadedInfinitives()) {
-      infinitivesSet.add(inf.toLowerCase().trim());
+      infinitivesSet.add(canonicalVerbKey(inf));
     }
     
     // 1. Get all overrides in one single fast transaction and add their infinitives
     const overridesMap = new Map<string, UserOverride>();
     if (this.useInMemoryFallback) {
       for (const [k, v] of Object.entries(this.inMemoryOverrides)) {
-        overridesMap.set(k, v);
-        infinitivesSet.add(v.infinitive || k);
+        const key = canonicalVerbKey(v.infinitive || k);
+        overridesMap.set(key, v);
+        infinitivesSet.add(key);
       }
     } else {
       try {
         const list = await db.overrides.toArray();
         for (const item of list) {
-          const key = item.infinitive.toLowerCase().trim();
+          const key = canonicalVerbKey(item.infinitive);
           overridesMap.set(key, item);
-          infinitivesSet.add(item.infinitive || key);
+          infinitivesSet.add(key);
         }
       } catch (dbErr) {
         console.warn("Failed to bulk get overrides from IndexedDB, using fallback.", dbErr);
         this.useInMemoryFallback = true;
         for (const [k, v] of Object.entries(this.inMemoryOverrides)) {
-          overridesMap.set(k, v);
-          infinitivesSet.add(v.infinitive || k);
+          const key = canonicalVerbKey(v.infinitive || k);
+          overridesMap.set(key, v);
+          infinitivesSet.add(key);
         }
       }
     }
@@ -420,7 +510,7 @@ export class DatabaseService {
     const tenses = Object.values(Tense);
 
     for (const inf of infinitives) {
-      const key = inf.toLowerCase().trim();
+      const key = canonicalVerbKey(inf);
       const baseConjugations = this.verbsCache[key];
       const override = overridesMap.get(key);
 
@@ -456,11 +546,9 @@ export class DatabaseService {
 
         if (override.cellOverrides) {
           for (const [cellKey, value] of Object.entries(override.cellOverrides)) {
-            const splitIdx = cellKey.indexOf("_");
-            if (splitIdx > 0) {
-              const tense = cellKey.substring(0, splitIdx);
-              const person = (splitIdx + 1 < cellKey.length ? cellKey.substring(splitIdx + 1) : "S1") as keyof ConjugationPerson;
-
+            const parsed = parseCellOverrideKey(cellKey);
+            if (parsed) {
+              const { tense, person } = parsed;
               if (!mergedConjugations[tense]) {
                 mergedConjugations[tense] = { S1: [], S2: [], S3: [], P1: [], P2: [], P3: [] };
               }
@@ -479,16 +567,17 @@ export class DatabaseService {
       }
 
       if (!hasCustomCategories) {
-        categories = this.autoDetectCategories(override?.infinitive || inf, mergedConjugations);
+        categories = this.autoDetectCategories(key, mergedConjugations);
       }
 
       verbs.push({
-        infinitive: override?.infinitive || inf,
+        infinitive: key,
         hilfsverb,
         bedeutung,
         categories,
         conjugations: mergedConjugations,
-        sortOrder
+        sortOrder,
+        cellOverrides: override?.cellOverrides
       });
     }
 
@@ -499,7 +588,8 @@ export class DatabaseService {
    * Fetches a single verb, merging the base cache with IndexedDB manual overrides
    */
   public async getVerb(infinitive: string): Promise<VerbItem | null> {
-    const key = infinitive.toLowerCase().trim();
+    const key = canonicalVerbKey(infinitive);
+    if (!key) return null;
     const baseConjugations = this.verbsCache[key];
 
     // Get user-specific override from IndexedDB with safe fallback
@@ -508,7 +598,22 @@ export class DatabaseService {
       override = this.inMemoryOverrides[key];
     } else {
       try {
+        await db.open();
         override = await db.overrides.get(key);
+        // If not found directly, check for legacy non-canonical record
+        if (!override) {
+          const list = await db.overrides.toArray();
+          const legacy = list.find(o => canonicalVerbKey(o.infinitive) === key);
+          if (legacy) {
+            override = { ...legacy, infinitive: key };
+            try {
+              if (legacy.infinitive !== key) {
+                await db.overrides.delete(legacy.infinitive);
+              }
+              await db.overrides.put(override);
+            } catch (e) {}
+          }
+        }
       } catch (dbErr) {
         console.warn("Failed to get override from IndexedDB, using fallback.", dbErr);
         this.useInMemoryFallback = true;
@@ -552,12 +657,9 @@ export class DatabaseService {
       // Apply cell-by-cell overrides
       if (override.cellOverrides) {
         for (const [cellKey, value] of Object.entries(override.cellOverrides)) {
-          // cellKey format: "TENSE_PERSON", e.g., "PRASENS_S1"
-          const splitIdx = cellKey.indexOf("_");
-          if (splitIdx > 0) {
-            const tense = cellKey.substring(0, splitIdx);
-            const person = (splitIdx + 1 < cellKey.length ? cellKey.substring(splitIdx + 1) : "S1") as keyof ConjugationPerson;
-
+          const parsed = parseCellOverrideKey(cellKey);
+          if (parsed) {
+            const { tense, person } = parsed;
             if (!mergedConjugations[tense]) {
               mergedConjugations[tense] = { S1: [], S2: [], S3: [], P1: [], P2: [], P3: [] };
             }
@@ -580,16 +682,17 @@ export class DatabaseService {
 
     // If no custom categories are specified, auto-classify based on linguistic patterns!
     if (!hasCustomCategories) {
-      categories = this.autoDetectCategories(override?.infinitive || infinitive, mergedConjugations);
+      categories = this.autoDetectCategories(key, mergedConjugations);
     }
 
     return {
-      infinitive: override?.infinitive || infinitive,
+      infinitive: key,
       hilfsverb,
       bedeutung,
       categories,
       conjugations: mergedConjugations,
-      sortOrder
+      sortOrder,
+      cellOverrides: override?.cellOverrides
     };
   }
 
@@ -603,13 +706,13 @@ export class DatabaseService {
     categories?: string[];
     cellOverrides?: Record<string, string>;
   }): Promise<void> {
-    const rawInf = verbData.infinitive.trim();
+    const rawInf = (verbData.infinitive || "").trim();
     if (!rawInf) return;
-    const key = rawInf.toLowerCase();
+    const key = canonicalVerbKey(rawInf);
 
-    // 1. Save override with isDeleted: false
-    await this.saveOverride(rawInf, {
-      infinitive: rawInf,
+    // 1. Save override with isDeleted: false and canonical infinitive
+    await this.saveOverride(key, {
+      infinitive: key,
       bedeutung: verbData.bedeutung || "",
       hilfsverb: verbData.hilfsverb || "haben",
       categories: verbData.categories && verbData.categories.length > 0 ? verbData.categories : ["regular"],
@@ -619,22 +722,51 @@ export class DatabaseService {
 
     // 2. Prepend this verb to customOrder so it appears at the very top of Page 1!
     const currentOrder = await this.getCustomOrder();
-    const updatedOrder = [key, ...currentOrder.filter(k => k !== key)];
+    const updatedOrder = [key, ...currentOrder.filter(k => canonicalVerbKey(k) !== key)];
     await this.saveCustomOrder(updatedOrder);
+  }
+
+  public async transferVocabVerbToVerbTable(item: VocabularyItem): Promise<boolean> {
+    const inf = (item.word || "").toLowerCase().trim();
+    if (!inf) return false;
+    // duplicate check against existing verbs:
+    const all = await this.getAllVerbs();
+    if (all.some(v => (v.infinitive || "").toLowerCase().trim() === inf)) return false;
+    await this.addVerb({
+      infinitive: item.word.trim(),
+      bedeutung: item.meaning || "",
+      hilfsverb: "haben",
+      categories: ["regular"],
+      cellOverrides: {}
+    });
+    return true;
   }
 
   /**
    * Save a cell override or field override to IndexedDB or fallback
    */
   public async saveOverride(infinitive: string, fields: Partial<UserOverride>): Promise<void> {
-    const key = infinitive.toLowerCase().trim();
+    const key = canonicalVerbKey(infinitive);
     let existing: UserOverride | undefined = undefined;
 
     if (this.useInMemoryFallback) {
       existing = this.inMemoryOverrides[key];
     } else {
       try {
+        await db.open();
         existing = await db.overrides.get(key);
+        if (!existing) {
+          const all = await db.overrides.toArray();
+          const legacy = all.find(o => canonicalVerbKey(o.infinitive) === key);
+          if (legacy) {
+            existing = legacy;
+            if (legacy.infinitive !== key) {
+              try {
+                await db.overrides.delete(legacy.infinitive);
+              } catch (e) {}
+            }
+          }
+        }
       } catch (dbErr) {
         console.warn("Database get failed, switching to fallback", dbErr);
         this.useInMemoryFallback = true;
@@ -643,11 +775,12 @@ export class DatabaseService {
     }
 
     const previousOverride = existing ? JSON.parse(JSON.stringify(existing)) : null;
-    const baseExisting = existing || { infinitive: infinitive, cellOverrides: {} };
+    const baseExisting = existing || { infinitive: key, cellOverrides: {} };
 
     const updated: UserOverride = {
       ...baseExisting,
       ...fields,
+      infinitive: key, // Enforce canonical identity as primary key
       cellOverrides: {
         ...(baseExisting.cellOverrides || {}),
         ...(fields.cellOverrides || {})
@@ -668,11 +801,13 @@ export class DatabaseService {
       updated.hilfsverb !== undefined ||
       (updated.categories && updated.categories.length > 0) ||
       updated.sortOrder !== undefined ||
-      updated.isDeleted !== undefined ||
-      updated.infinitive
+      updated.isDeleted !== undefined
     );
 
     if (this.useInMemoryFallback) {
+      if (existing && existing.infinitive && existing.infinitive !== key) {
+        delete this.inMemoryOverrides[existing.infinitive];
+      }
       if (!hasCellOverrides && !hasOtherOverrides) {
         delete this.inMemoryOverrides[key];
       } else {
@@ -680,6 +815,9 @@ export class DatabaseService {
       }
     } else {
       try {
+        if (existing && existing.infinitive && existing.infinitive !== key) {
+          await db.overrides.delete(existing.infinitive);
+        }
         if (!hasCellOverrides && !hasOtherOverrides) {
           await db.overrides.delete(key);
         } else {
@@ -787,24 +925,45 @@ export class DatabaseService {
     const targetLog = logs.find(l => l.id === logId);
     if (!targetLog) return;
 
-    const key = targetLog.verb.toLowerCase().trim();
+    const key = canonicalVerbKey(targetLog.verb);
 
     if (targetLog.fields && targetLog.fields.infinitive) {
-      const newKey = targetLog.fields.infinitive.toLowerCase().trim();
+      const newKey = canonicalVerbKey(targetLog.fields.infinitive);
       if (newKey !== key) {
-        if (!this.useInMemoryFallback) {
-          try {
-            await db.open();
-            await db.overrides.delete(newKey);
-          } catch (e) {
-            delete this.inMemoryOverrides[newKey];
+        // 1. Remove or revert the renamed target
+        const prevDest = (targetLog.fields as any).previousDestOverride;
+        if (prevDest) {
+          if (!this.useInMemoryFallback) {
+            try {
+              await db.open();
+              await db.overrides.put(prevDest);
+            } catch (e) {
+              this.inMemoryOverrides[newKey] = prevDest;
+            }
+          } else {
+            this.inMemoryOverrides[newKey] = prevDest;
           }
         } else {
-          delete this.inMemoryOverrides[newKey];
+          if (!this.useInMemoryFallback) {
+            try {
+              await db.open();
+              await db.overrides.delete(newKey);
+            } catch (e) {
+              delete this.inMemoryOverrides[newKey];
+            }
+          } else {
+            delete this.inMemoryOverrides[newKey];
+          }
         }
+
+        // 2. Restore customOrder
+        const customOrder = await this.getCustomOrder();
+        const updatedOrder = customOrder.map(k => (canonicalVerbKey(k) === newKey ? key : k));
+        await this.saveCustomOrder(updatedOrder);
       }
     }
 
+    // Restore old key override
     if (targetLog.previousOverride === null) {
       if (!this.useInMemoryFallback) {
         try {
@@ -817,15 +976,19 @@ export class DatabaseService {
         delete this.inMemoryOverrides[key];
       }
     } else {
+      const restoredOverride = {
+        ...targetLog.previousOverride,
+        infinitive: key
+      };
       if (!this.useInMemoryFallback) {
         try {
           await db.open();
-          await db.overrides.put(targetLog.previousOverride);
+          await db.overrides.put(restoredOverride);
         } catch (e) {
-          this.inMemoryOverrides[key] = targetLog.previousOverride;
+          this.inMemoryOverrides[key] = restoredOverride;
         }
       } else {
-        this.inMemoryOverrides[key] = targetLog.previousOverride;
+        this.inMemoryOverrides[key] = restoredOverride;
       }
     }
 
@@ -843,13 +1006,14 @@ export class DatabaseService {
   public async logVocabChange(
     word: string,
     type: "vocab_add" | "vocab_delete" | "vocab_edit",
-    previousItem: VocabularyItem | null
+    previousItem: VocabularyItem | null,
+    itemId?: string
   ): Promise<void> {
     let descEn = "";
     let descFa = "";
     let descDe = "";
 
-    const displayWord = word.trim();
+    const displayWord = (word || "").trim();
 
     if (type === "vocab_add") {
       descEn = `Added vocabulary item "${displayWord}"`;
@@ -865,8 +1029,11 @@ export class DatabaseService {
       descDe = `Wort "${displayWord}" bearbeitet`;
     }
 
+    const resolvedItemId = itemId || previousItem?.id;
+
     const newLog: VocabChangeLog = {
       id: "vlog_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now(),
+      itemId: resolvedItemId,
       timestamp: Date.now(),
       word: displayWord,
       type,
@@ -887,11 +1054,17 @@ export class DatabaseService {
     if (!targetLog) return;
 
     if (targetLog.type === "vocab_add") {
-      // Undo add = delete item if exists
-      const allVocabs = await this.getVocabularies();
-      const existing = allVocabs.find(v => v.word.toLowerCase().trim() === targetLog.word.toLowerCase().trim());
-      if (existing) {
-        await this.deleteVocabularyDirect(existing.id);
+      if (targetLog.itemId) {
+        await this.deleteVocabularyDirect(targetLog.itemId);
+      } else {
+        // Fallback for legacy logs without itemId: check for unique match
+        const allVocabs = await this.getVocabularies();
+        const matches = allVocabs.filter(v => (v.word || "").toLowerCase().trim() === (targetLog.word || "").toLowerCase().trim());
+        if (matches.length === 1) {
+          await this.deleteVocabularyDirect(matches[0].id);
+        } else if (matches.length > 1) {
+          console.warn(`Ambiguous vocabulary undo target for word "${targetLog.word}": multiple records share this spelling. Aborting deletion to avoid deleting wrong record.`);
+        }
       }
     } else if (targetLog.type === "vocab_delete" || targetLog.type === "vocab_edit") {
       // Undo delete/edit = restore previous item state
@@ -909,59 +1082,120 @@ export class DatabaseService {
    * Rename/edit the spelling of a verb infinitive
    */
   public async renameVerbInfinitive(oldInfinitive: string, newInfinitive: string): Promise<void> {
-    const oldKey = oldInfinitive.toLowerCase().trim();
-    const newKey = newInfinitive.toLowerCase().trim();
+    const oldKey = canonicalVerbKey(oldInfinitive);
+    const newKey = canonicalVerbKey(newInfinitive);
     if (!newKey || oldKey === newKey) return;
 
-    let existing: UserOverride | undefined = undefined;
+    // 1. Conflict detection: check if target verb already exists
+    const existingTarget = await this.getVerb(newKey);
+    if (existingTarget) {
+      throw new Error(`Cannot rename "${oldInfinitive}" to "${newInfinitive}": a verb with that name already exists.`);
+    }
+
+    // 2. Fetch full current source verb (including base conjugations and any existing overrides)
+    const sourceVerb = await this.getVerb(oldKey);
+    if (!sourceVerb) {
+      throw new Error(`Cannot rename "${oldInfinitive}": verb not found.`);
+    }
+
+    const isBaseVerb = !!this.verbsCache[oldKey];
+
+    // Fetch existing raw override if any
+    let existingOldOverride: UserOverride | undefined = undefined;
     if (this.useInMemoryFallback) {
-      existing = this.inMemoryOverrides[oldKey];
+      existingOldOverride = this.inMemoryOverrides[oldKey];
     } else {
       try {
-        existing = await db.overrides.get(oldKey);
+        await db.open();
+        existingOldOverride = await db.overrides.get(oldKey);
       } catch (e) {
-        existing = this.inMemoryOverrides[oldKey];
+        existingOldOverride = this.inMemoryOverrides[oldKey];
       }
     }
 
-    const baseOverride = existing || { infinitive: oldInfinitive, cellOverrides: {} };
-
-    // Soft delete or remove old key
-    if (this.useInMemoryFallback) {
-      delete this.inMemoryOverrides[oldKey];
-    } else {
-      try {
-        await db.overrides.delete(oldKey);
-      } catch (e) {}
+    // Clone all conjugations from sourceVerb into cellOverrides so that base data is fully preserved
+    const clonedCellOverrides: Record<string, string> = {};
+    if (sourceVerb.conjugations) {
+      for (const [tense, persons] of Object.entries(sourceVerb.conjugations)) {
+        if (persons && typeof persons === "object") {
+          for (const [person, forms] of Object.entries(persons)) {
+            if (Array.isArray(forms) && forms.length > 0) {
+              clonedCellOverrides[`${tense}_${person}`] = forms.join(" ");
+            }
+          }
+        }
+      }
     }
 
-    // Save under new key
+    // If source had manual cellOverrides, ensure they take precedence
+    if (existingOldOverride?.cellOverrides) {
+      Object.assign(clonedCellOverrides, existingOldOverride.cellOverrides);
+    }
+
     const newOverride: UserOverride = {
-      ...baseOverride,
-      infinitive: newInfinitive.trim(),
-      isDeleted: false,
+      infinitive: newKey,
+      hilfsverb: sourceVerb.hilfsverb || "haben",
+      bedeutung: sourceVerb.bedeutung || "",
+      categories: sourceVerb.categories && sourceVerb.categories.length > 0 ? sourceVerb.categories : ["regular"],
+      cellOverrides: clonedCellOverrides,
+      sortOrder: sourceVerb.sortOrder ?? 9999,
+      isDeleted: false
     };
 
+    // 3. Atomically update storage:
+    // If base verb: tombstone oldKey so it no longer appears under oldKey.
+    // If custom verb: delete oldKey.
     if (this.useInMemoryFallback) {
+      if (isBaseVerb) {
+        this.inMemoryOverrides[oldKey] = {
+          infinitive: oldKey,
+          isDeleted: true
+        };
+      } else {
+        delete this.inMemoryOverrides[oldKey];
+      }
       this.inMemoryOverrides[newKey] = newOverride;
     } else {
       try {
-        await db.overrides.put(newOverride);
+        await db.open();
+        await db.transaction("rw", db.overrides, async () => {
+          if (isBaseVerb) {
+            await db.overrides.put({
+              infinitive: oldKey,
+              isDeleted: true
+            });
+          } else {
+            await db.overrides.delete(oldKey);
+          }
+          await db.overrides.put(newOverride);
+        });
       } catch (e) {
+        console.warn("Transaction failed during rename, applying to fallback memory", e);
+        this.useInMemoryFallback = true;
+        if (isBaseVerb) {
+          this.inMemoryOverrides[oldKey] = {
+            infinitive: oldKey,
+            isDeleted: true
+          };
+        } else {
+          delete this.inMemoryOverrides[oldKey];
+        }
         this.inMemoryOverrides[newKey] = newOverride;
       }
     }
 
-    // Update verbs_custom_order
+    // 4. Update verbs_custom_order
     const customOrder = await this.getCustomOrder();
-    const updatedOrder = customOrder.map((k) => (k === oldKey ? newKey : k));
-    if (!updatedOrder.includes(newKey)) {
+    const updatedOrder = customOrder.map((k) => (canonicalVerbKey(k) === oldKey ? newKey : k));
+    if (!updatedOrder.some((k) => canonicalVerbKey(k) === newKey)) {
       updatedOrder.unshift(newKey);
     }
     await this.saveCustomOrder(updatedOrder);
 
-    // Log the change for History undo
-    await this.logChange(oldInfinitive, "field_edit", existing || null, { infinitive: newInfinitive.trim() });
+    // 5. Log the change for History undo
+    await this.logChange(oldKey, "field_edit", existingOldOverride || null, {
+      infinitive: newKey
+    });
   }
 
   /**
@@ -999,16 +1233,23 @@ export class DatabaseService {
     await this.saveSetting("verbs_custom_order", normalized);
   }
 
+  private async ensureDbInitialized(): Promise<boolean> {
+    const isInit = await this.getSetting<boolean>("db_initialized");
+    return !!isInit;
+  }
+
   /**
-   * Retrieve all categories from DB or memory, seeded with defaults if empty
+   * Retrieve all categories from DB or memory, seeded with defaults only on initial run
    */
   public async getCategories(): Promise<Category[]> {
     if (this.useInMemoryFallback) {
       return [...this.inMemoryCategories];
     }
     try {
+      await db.open();
+      const isInit = await this.ensureDbInitialized();
       const list = await db.categories.toArray();
-      if (list.length === 0) {
+      if (!this.categoriesSeeded && !isInit && list.length === 0) {
         const defaults: Category[] = [
           { id: "regular", name: "Regelmäßig", color: "#10B981" },
           { id: "irregular", name: "Unregelmäßig", color: "#EF4444" },
@@ -1019,28 +1260,15 @@ export class DatabaseService {
           { id: "favorites", name: "Favoriten", color: "#F59E0B" },
         ];
         try {
-          await db.categories.bulkAdd(defaults);
+          await db.categories.bulkPut(defaults);
+          this.categoriesSeeded = true;
         } catch (addErr) {
           console.warn("Failed to save default categories to DB", addErr);
         }
+        await this.saveSetting("db_initialized", true);
         return defaults;
       }
-      
-      const missingCategories = [
-        { id: "akkusativ", name: "Akkusativ", color: "#EC4899" },
-        { id: "dativ", name: "Dativ", color: "#06B6D4" },
-        { id: "favorites", name: "Favoriten", color: "#F59E0B" },
-      ];
-
-      for (const cat of missingCategories) {
-        if (!list.some(c => c.id === cat.id)) {
-          try {
-            await db.categories.add(cat);
-            list.push(cat);
-          } catch (e) {}
-        }
-      }
-      
+      this.categoriesSeeded = true;
       return list;
     } catch (dbErr) {
       console.warn("Database getCategories failed, using in-memory defaults", dbErr);
@@ -1232,6 +1460,7 @@ export class DatabaseService {
       try {
         await db.overrides.clear();
         await db.categories.clear();
+        // Note: conjugationPracticeStats are independent of the verb database and MUST survive a DB reset.
       } catch (dbErr) {
         console.warn("Database clear failed during reset, clearing memory fields", dbErr);
       }
@@ -1364,15 +1593,12 @@ export class DatabaseService {
 
   private deduplicateVocabularies(list: VocabularyItem[]): VocabularyItem[] {
     const seenIds = new Set<string>();
-    const seenWords = new Set<string>();
     const result: VocabularyItem[] = [];
 
     for (const item of list) {
-      if (!item || !item.id || !item.word) continue;
-      const normKey = `${item.word.toLowerCase().trim()}_${(item.article || "none").toLowerCase()}_${(item.partOfSpeech || "noun").toLowerCase()}`;
-      if (!seenIds.has(item.id) && !seenWords.has(normKey)) {
+      if (!item || !item.id) continue;
+      if (!seenIds.has(item.id)) {
         seenIds.add(item.id);
-        seenWords.add(normKey);
         result.push(item);
       }
     }
@@ -1389,8 +1615,14 @@ export class DatabaseService {
             this.inMemoryVocabularies = JSON.parse(local);
           }
         } catch (e) {}
-        if (!this.inMemoryVocabularies || this.inMemoryVocabularies.length === 0) {
-          this.inMemoryVocabularies = [...this.defaultSampleVocabularies];
+        if (!this.inMemoryVocabularies) {
+          const isInit = await this.ensureDbInitialized();
+          if (!isInit) {
+            this.inMemoryVocabularies = [...this.defaultSampleVocabularies];
+            await this.saveSetting("db_initialized", true);
+          } else {
+            this.inMemoryVocabularies = [];
+          }
         }
       }
       this.inMemoryVocabularies = this.deduplicateVocabularies(this.inMemoryVocabularies);
@@ -1399,21 +1631,31 @@ export class DatabaseService {
 
     try {
       await db.open();
+      const isInit = await this.ensureDbInitialized();
       const list = await db.vocabularies.toArray();
-      if (!list || list.length === 0) {
-        // Seed default sample vocabularies
-        await db.vocabularies.bulkAdd(this.defaultSampleVocabularies);
+      if (!this.vocabulariesSeeded && !isInit && (!list || list.length === 0)) {
+        // Seed default sample vocabularies only on first initialization
+        await db.vocabularies.bulkPut(this.defaultSampleVocabularies);
+        this.vocabulariesSeeded = true;
         this.inMemoryVocabularies = [...this.defaultSampleVocabularies];
+        await this.saveSetting("db_initialized", true);
         return [...this.defaultSampleVocabularies];
       }
-      const cleanList = this.deduplicateVocabularies(list);
+      this.vocabulariesSeeded = true;
+      const cleanList = this.deduplicateVocabularies(list || []);
       this.inMemoryVocabularies = cleanList;
       return cleanList;
     } catch (e) {
       console.warn("IndexedDB vocabularies fetch failed, falling back to memory", e);
       this.useInMemoryFallback = true;
       if (!this.inMemoryVocabularies) {
-        this.inMemoryVocabularies = [...this.defaultSampleVocabularies];
+        const isInit = await this.ensureDbInitialized();
+        if (!isInit) {
+          this.inMemoryVocabularies = [...this.defaultSampleVocabularies];
+          await this.saveSetting("db_initialized", true);
+        } else {
+          this.inMemoryVocabularies = [];
+        }
       }
       this.inMemoryVocabularies = this.deduplicateVocabularies(this.inMemoryVocabularies);
       return [...this.inMemoryVocabularies];
@@ -1424,6 +1666,7 @@ export class DatabaseService {
     const now = Date.now();
     const preparedItem: VocabularyItem = {
       ...item,
+      plural: normalizePluralField(item.plural),
       updatedAt: now,
       createdAt: item.createdAt || now
     };
@@ -1477,11 +1720,12 @@ export class DatabaseService {
 
     await this.saveVocabularyDirect(item);
 
-    // Log change
+    // Log change with explicit itemId for precise undo targeting
     await this.logVocabChange(
       item.word,
       isNew ? "vocab_add" : "vocab_edit",
-      prevItem
+      prevItem,
+      item.id
     );
   }
 
@@ -1537,7 +1781,8 @@ export class DatabaseService {
         partOfSpeech: "noun",
         createdAt: Date.now(),
         updatedAt: Date.now()
-      }
+      },
+      id
     );
   }
 
@@ -1558,7 +1803,7 @@ export class DatabaseService {
     if (!this.useInMemoryFallback) {
       try {
         await db.vocabularies.clear();
-        await db.vocabularies.bulkAdd(this.defaultSampleVocabularies);
+        await db.vocabularies.bulkPut(this.defaultSampleVocabularies);
       } catch (e) {
         console.warn("Error resetting vocabularies in DB", e);
       }
@@ -1586,20 +1831,29 @@ export class DatabaseService {
         const local = localStorage.getItem("g_verb_vocab_categories");
         if (local) return JSON.parse(local);
       } catch (e) {}
-      return [...this.defaultVocabCategories];
+      const isInit = await this.ensureDbInitialized();
+      if (!isInit) {
+        await this.saveSetting("db_initialized", true);
+        return [...this.defaultVocabCategories];
+      }
+      return [];
     }
 
     try {
       await db.open();
+      const isInit = await this.ensureDbInitialized();
       const list = await db.vocabCategories.toArray();
-      if (!list || list.length === 0) {
-        await db.vocabCategories.bulkAdd(this.defaultVocabCategories);
+      if (!this.vocabCategoriesSeeded && !isInit && (!list || list.length === 0)) {
+        await db.vocabCategories.bulkPut(this.defaultVocabCategories);
+        this.vocabCategoriesSeeded = true;
+        await this.saveSetting("db_initialized", true);
         return [...this.defaultVocabCategories];
       }
-      return list;
+      this.vocabCategoriesSeeded = true;
+      return list || [];
     } catch (e) {
       console.warn("Error getting vocab categories from DB", e);
-      return [...this.defaultVocabCategories];
+      return [];
     }
   }
 
@@ -1629,13 +1883,59 @@ export class DatabaseService {
       try {
         localStorage.setItem("g_verb_vocab_categories", JSON.stringify(filtered));
       } catch (e) {}
+
+      // Clean up tags referencing this category from all vocabulary items
+      const vocabs = await this.getVocabularies();
+      let changed = false;
+      for (const voc of vocabs) {
+        if (voc.tags && voc.tags.includes(id)) {
+          voc.tags = voc.tags.filter(t => t !== id);
+          changed = true;
+        }
+      }
+      if (changed) {
+        this.inMemoryVocabularies = vocabs;
+        try {
+          localStorage.setItem("g_verb_vocabularies", JSON.stringify(vocabs));
+        } catch (e) {}
+      }
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("vocab-data-changed"));
+      }
       return;
     }
 
     try {
-      await db.vocabCategories.delete(id);
+      await db.open();
+      await db.transaction("rw", [db.vocabCategories, db.vocabularies], async () => {
+        await db.vocabCategories.delete(id);
+        const vocabs = await db.vocabularies.toArray();
+        for (const voc of vocabs) {
+          if (voc.tags && voc.tags.includes(id)) {
+            const updatedTags = voc.tags.filter(t => t !== id);
+            await db.vocabularies.update(voc.id, { tags: updatedTags });
+          }
+        }
+      });
+
+      // Synchronize in-memory cache and localStorage
+      if (this.inMemoryVocabularies) {
+        for (const voc of this.inMemoryVocabularies) {
+          if (voc.tags && voc.tags.includes(id)) {
+            voc.tags = voc.tags.filter(t => t !== id);
+          }
+        }
+        try {
+          localStorage.setItem("g_verb_vocabularies", JSON.stringify(this.inMemoryVocabularies));
+        } catch (e) {}
+      }
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("vocab-data-changed"));
+      }
     } catch (e) {
       console.warn("Error deleting vocab category from DB", e);
+      this.useInMemoryFallback = true;
+      await this.deleteVocabCategory(id);
     }
   }
 
@@ -1705,20 +2005,29 @@ export class DatabaseService {
         const local = localStorage.getItem("g_verb_syn_ant_groups");
         if (local) return JSON.parse(local);
       } catch (e) {}
-      return [...this.defaultSynonymAntonymGroups];
+      const isInit = await this.ensureDbInitialized();
+      if (!isInit) {
+        await this.saveSetting("db_initialized", true);
+        return [...this.defaultSynonymAntonymGroups];
+      }
+      return [];
     }
 
     try {
       await db.open();
+      const isInit = await this.ensureDbInitialized();
       const list = await db.synonymAntonymGroups.toArray();
-      if (!list || list.length === 0) {
-        await db.synonymAntonymGroups.bulkAdd(this.defaultSynonymAntonymGroups);
+      if (!this.synonymAntonymGroupsSeeded && !isInit && (!list || list.length === 0)) {
+        await db.synonymAntonymGroups.bulkPut(this.defaultSynonymAntonymGroups);
+        this.synonymAntonymGroupsSeeded = true;
+        await this.saveSetting("db_initialized", true);
         return [...this.defaultSynonymAntonymGroups];
       }
-      return list;
+      this.synonymAntonymGroupsSeeded = true;
+      return list || [];
     } catch (e) {
       console.warn("Error fetching synonym/antonym groups from DB", e);
-      return [...this.defaultSynonymAntonymGroups];
+      return [];
     }
   }
 
@@ -1847,6 +2156,249 @@ export class DatabaseService {
   }
 
   // ----------------------------------------------------
+  // Conjugation Practice Mistake Stats
+  // ----------------------------------------------------
+  public async recordConjugationWrong(
+    infinitive: string,
+    tense: PracticeTense,
+    person: "S1" | "S2" | "S3" | "P1" | "P2" | "P3",
+    userAnswer: string,
+    correctAnswer: string
+  ): Promise<void> {
+    const cleanInf = (infinitive || "").toLowerCase().trim();
+    if (!cleanInf) return;
+    const id = `${cleanInf}|${tense}|${person}`;
+
+    let existing: ConjugationPracticeStat | undefined;
+    try {
+      await db.open();
+      existing = await db.conjugationPracticeStats.get(id);
+    } catch (e) {
+      console.warn("Could not read practice stat from IndexedDB, checking fallback", e);
+    }
+    if (!existing) {
+      existing = this.inMemoryConjugationStats.find((s) => s.id === id);
+    }
+
+    const statItem: ConjugationPracticeStat = {
+      id,
+      infinitive: cleanInf,
+      tense,
+      person,
+      wrongCount: (existing?.wrongCount || 0) + 1,
+      lastWrongAt: Date.now(),
+      lastUserAnswer: userAnswer,
+      lastCorrectAnswer: correctAnswer,
+    };
+
+    try {
+      await db.open();
+      await db.conjugationPracticeStats.put(statItem);
+    } catch (e) {
+      console.warn("Failed to put practice stat in IndexedDB, using fallback", e);
+    }
+
+    this.inMemoryConjugationStats = [
+      statItem,
+      ...this.inMemoryConjugationStats.filter((s) => s.id !== id),
+    ];
+    try {
+      localStorage.setItem("g_conjugation_practice_stats", JSON.stringify(this.inMemoryConjugationStats));
+    } catch (e) {}
+  }
+
+  public async getConjugationStatsForVerb(infinitive: string): Promise<ConjugationPracticeStat[]> {
+    const cleanInf = (infinitive || "").toLowerCase().trim();
+    if (!cleanInf) return [];
+    try {
+      await db.open();
+      // Try indexed query first
+      try {
+        const stats = await db.conjugationPracticeStats.where("infinitive").equals(cleanInf).toArray();
+        if (stats && stats.length > 0) return stats.filter((s) => (s.wrongCount || 0) > 0);
+      } catch (idxErr) {
+        // Fallback to scanning/filtering if index is upgrading
+        const all = await db.conjugationPracticeStats.toArray();
+        const filtered = all.filter((s) => (s.infinitive || "").toLowerCase().trim() === cleanInf && (s.wrongCount || 0) > 0);
+        if (filtered && filtered.length > 0) return filtered;
+      }
+    } catch (e) {
+      console.warn("Could not read practice stats for verb from IndexedDB, using fallback", e);
+    }
+    return this.inMemoryConjugationStats.filter((s) => (s.infinitive || "").toLowerCase().trim() === cleanInf && (s.wrongCount || 0) > 0);
+  }
+
+  public async getAllConjugationStats(): Promise<ConjugationPracticeStat[]> {
+    try {
+      await db.open();
+      const stats = await db.conjugationPracticeStats.toArray();
+      if (stats && stats.length > 0) {
+        const filtered = stats.filter((s) => (s.wrongCount || 0) > 0);
+        this.inMemoryConjugationStats = filtered;
+        return filtered;
+      }
+    } catch (e) {
+      console.warn("Could not read all practice stats from IndexedDB, using fallback", e);
+    }
+    const raw = typeof window !== "undefined" ? localStorage.getItem("g_conjugation_practice_stats") : null;
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        const filtered = Array.isArray(parsed) ? parsed.filter((s: ConjugationPracticeStat) => (s.wrongCount || 0) > 0) : [];
+        this.inMemoryConjugationStats = filtered;
+        return filtered;
+      } catch (e) {}
+    }
+    return this.inMemoryConjugationStats.filter((s) => (s.wrongCount || 0) > 0);
+  }
+
+  public async resetConjugationStatsForVerb(infinitive: string): Promise<void> {
+    const cleanInf = (infinitive || "").toLowerCase().trim();
+    if (!cleanInf) return;
+    try {
+      await db.open();
+      let matching: ConjugationPracticeStat[] = [];
+      try {
+        matching = await db.conjugationPracticeStats.where("infinitive").equals(cleanInf).toArray();
+      } catch (idxErr) {
+        const all = await db.conjugationPracticeStats.toArray();
+        matching = all.filter((s) => (s.infinitive || "").toLowerCase().trim() === cleanInf);
+      }
+      const ids = matching.map((m) => m.id);
+      if (ids.length > 0) {
+        await db.conjugationPracticeStats.bulkDelete(ids);
+      }
+    } catch (e) {
+      console.warn("Failed to reset practice stats in IndexedDB, using fallback", e);
+    }
+    this.inMemoryConjugationStats = this.inMemoryConjugationStats.filter((s) => (s.infinitive || "").toLowerCase().trim() !== cleanInf);
+    try {
+      localStorage.setItem("g_conjugation_practice_stats", JSON.stringify(this.inMemoryConjugationStats));
+    } catch (e) {}
+  }
+
+  // ----------------------------------------------------
+  // Conjugation Practice Sessions History
+  // ----------------------------------------------------
+  private normalizeSessionRecord(s: any): PracticeSession {
+    const startedAt = s.startedAt || s.date || Date.now();
+    const completedAt = s.completedAt !== undefined ? s.completedAt : (s.date || startedAt);
+    const verbInfinitives = Array.isArray(s.verbInfinitives)
+      ? s.verbInfinitives
+      : Array.isArray(s.verbList)
+      ? s.verbList
+      : [];
+    const tenses = Array.isArray(s.tenses)
+      ? s.tenses
+      : Array.isArray(s.selectedTenses)
+      ? s.selectedTenses
+      : (["PRASENS"] as PracticeTense[]);
+    const correctCount = typeof s.correctCount === "number" ? s.correctCount : 0;
+    const wrongCount = typeof s.wrongCount === "number" ? s.wrongCount : 0;
+    const totalCells = typeof s.totalCells === "number"
+      ? s.totalCells
+      : typeof s.totalChecked === "number"
+      ? s.totalChecked
+      : correctCount + wrongCount;
+
+    return {
+      id: s.id || `session_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      startedAt,
+      completedAt,
+      verbInfinitives,
+      tenses,
+      totalCells,
+      correctCount,
+      wrongCount,
+      isFavorite: !!s.isFavorite,
+      date: s.date || startedAt,
+      verbList: verbInfinitives,
+      selectedTenses: tenses,
+      totalChecked: totalCells,
+    };
+  }
+
+  public async savePracticeSession(session: PracticeSession): Promise<void> {
+    if (!session || !session.id) return;
+    const normalized = this.normalizeSessionRecord(session);
+    try {
+      await db.open();
+      await db.practiceSessions.put(normalized);
+    } catch (e) {
+      console.warn("Failed to put practice session in IndexedDB, using fallback", e);
+    }
+
+    this.inMemoryPracticeSessions = [
+      normalized,
+      ...this.inMemoryPracticeSessions.filter((s) => s.id !== normalized.id),
+    ].sort((a, b) => (b.completedAt || b.startedAt) - (a.completedAt || a.startedAt));
+
+    try {
+      localStorage.setItem("g_conjugation_practice_sessions", JSON.stringify(this.inMemoryPracticeSessions));
+    } catch (e) {}
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("practice-sessions-changed"));
+    }
+  }
+
+  public async getAllPracticeSessions(): Promise<PracticeSession[]> {
+    try {
+      await db.open();
+      const rawSessions = await db.practiceSessions.toArray();
+      if (rawSessions && rawSessions.length > 0) {
+        const sessions = rawSessions.map((s) => this.normalizeSessionRecord(s));
+        sessions.sort((a, b) => (b.completedAt || b.startedAt) - (a.completedAt || a.startedAt));
+        this.inMemoryPracticeSessions = sessions;
+        return sessions;
+      }
+    } catch (e) {
+      console.warn("Could not read practice sessions from IndexedDB, using fallback", e);
+    }
+    const raw = typeof window !== "undefined" ? localStorage.getItem("g_conjugation_practice_sessions") : null;
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const sessions = parsed.map((s) => this.normalizeSessionRecord(s));
+          sessions.sort((a, b) => (b.completedAt || b.startedAt) - (a.completedAt || a.startedAt));
+          this.inMemoryPracticeSessions = sessions;
+          return sessions;
+        }
+      } catch (e) {}
+    }
+    return this.inMemoryPracticeSessions;
+  }
+
+  public async togglePracticeSessionFavorite(id: string): Promise<void> {
+    if (!id) return;
+    const all = await this.getAllPracticeSessions();
+    const target = all.find((s) => s.id === id);
+    if (!target) return;
+    const updated: PracticeSession = {
+      ...target,
+      isFavorite: !target.isFavorite,
+    };
+    await this.savePracticeSession(updated);
+  }
+
+  public async deletePracticeSession(id: string): Promise<void> {
+    if (!id) return;
+    try {
+      await db.open();
+      await db.practiceSessions.delete(id);
+    } catch (e) {
+      console.warn("Failed to delete practice session from IndexedDB, using fallback", e);
+    }
+    this.inMemoryPracticeSessions = this.inMemoryPracticeSessions.filter((s) => s.id !== id);
+    try {
+      localStorage.setItem("g_conjugation_practice_sessions", JSON.stringify(this.inMemoryPracticeSessions));
+    } catch (e) {}
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("practice-sessions-changed"));
+    }
+  }
+
+  // ----------------------------------------------------
   // Full Application Data Export & Import (Backup & Sync)
   // ----------------------------------------------------
   public async exportFullBackupJSON(): Promise<string> {
@@ -1856,39 +2408,82 @@ export class DatabaseService {
     let vocabCategories: VocabularyCategory[] = [];
     let synonymAntonymGroups: SynonymAntonymGroup[] = [];
     let savedStories: SavedStory[] = [];
+    let conjugationPracticeStats: ConjugationPracticeStat[] = [];
+    let practiceSessions: PracticeSession[] = [];
     let settings: Array<{ key: string; value: any }> = [];
 
-    try {
-      await db.open();
-      overrides = await db.overrides.toArray();
-      categories = await db.categories.toArray();
-      vocabularies = await db.vocabularies.toArray();
-      vocabCategories = await db.vocabCategories.toArray();
-      synonymAntonymGroups = await db.synonymAntonymGroups.toArray();
-      savedStories = await db.savedStories.toArray();
-      settings = await db.settings.toArray();
-    } catch (e) {
-      console.warn("Error reading IndexedDB for full export, using memory/fallback", e);
+    // Retrieve authoritative snapshot from active storage layer
+    if (this.useInMemoryFallback) {
       overrides = Object.values(this.inMemoryOverrides);
-      categories = this.inMemoryCategories;
+      categories = [...this.inMemoryCategories];
       vocabularies = await this.getVocabularies();
       vocabCategories = await this.getVocabCategories();
       synonymAntonymGroups = await this.getSynonymAntonymGroups();
       savedStories = await this.getSavedStories();
-    }
+      conjugationPracticeStats = await this.getAllConjugationStats();
 
-    // Ensure fallback data is pulled if IndexedDB was empty for vocab / groups / stories
-    if (vocabularies.length === 0) {
-      vocabularies = await this.getVocabularies();
-    }
-    if (vocabCategories.length === 0) {
-      vocabCategories = await this.getVocabCategories();
-    }
-    if (synonymAntonymGroups.length === 0) {
-      synonymAntonymGroups = await this.getSynonymAntonymGroups();
-    }
-    if (savedStories.length === 0) {
-      savedStories = await this.getSavedStories();
+      // Reconstruct settings from inMemorySettings and localStorage fallbacks
+      const settingsMap = new Map<string, any>();
+      for (const [k, v] of Object.entries(this.inMemorySettings)) {
+        if (v !== undefined && v !== null) {
+          settingsMap.set(k, v);
+        }
+      }
+      try {
+        if (typeof window !== "undefined" && window.localStorage) {
+          for (let i = 0; i < window.localStorage.length; i++) {
+            const lsKey = window.localStorage.key(i);
+            if (lsKey && lsKey.startsWith("g_verb_setting_")) {
+              const settingKey = lsKey.substring("g_verb_setting_".length);
+              if (!settingsMap.has(settingKey)) {
+                try {
+                  const val = JSON.parse(window.localStorage.getItem(lsKey) || "null");
+                  if (val !== null) settingsMap.set(settingKey, val);
+                } catch (e) {}
+              }
+            }
+          }
+        }
+      } catch (e) {}
+
+      settings = Array.from(settingsMap.entries()).map(([key, value]) => ({ key, value }));
+    } else {
+      try {
+        await db.open();
+        overrides = await db.overrides.toArray();
+        categories = await db.categories.toArray();
+        vocabularies = await db.vocabularies.toArray();
+        vocabCategories = await db.vocabCategories.toArray();
+        synonymAntonymGroups = await db.synonymAntonymGroups.toArray();
+        savedStories = await db.savedStories.toArray();
+        settings = await db.settings.toArray();
+
+        // Overlay any in-memory settings that might be newer
+        const settingsMap = new Map<string, any>(settings.map(s => [s.key, s.value]));
+        for (const [k, v] of Object.entries(this.inMemorySettings)) {
+          if (v !== undefined && v !== null) {
+            settingsMap.set(k, v);
+          }
+        }
+        settings = Array.from(settingsMap.entries()).map(([key, value]) => ({ key, value }));
+      } catch (e) {
+        console.warn("Error reading IndexedDB for full export, using memory/fallback", e);
+        this.useInMemoryFallback = true;
+        overrides = Object.values(this.inMemoryOverrides);
+        categories = [...this.inMemoryCategories];
+        vocabularies = await this.getVocabularies();
+        vocabCategories = await this.getVocabCategories();
+        synonymAntonymGroups = await this.getSynonymAntonymGroups();
+        savedStories = await this.getSavedStories();
+
+        const settingsMap = new Map<string, any>();
+        for (const [k, v] of Object.entries(this.inMemorySettings)) {
+          if (v !== undefined && v !== null) {
+            settingsMap.set(k, v);
+          }
+        }
+        settings = Array.from(settingsMap.entries()).map(([key, value]) => ({ key, value }));
+      }
     }
 
     let allVerbs: VerbItem[] = [];
@@ -1898,14 +2493,39 @@ export class DatabaseService {
       console.warn("Failed to get all verbs for backup:", e);
     }
 
-    let appHistory: any[] = [];
-    let vocabHistory: any[] = [];
     try {
-      const ah = localStorage.getItem("g_verb_app_history");
-      if (ah) appHistory = JSON.parse(ah);
-      const vh = localStorage.getItem("g_verb_vocab_history");
-      if (vh) vocabHistory = JSON.parse(vh);
-    } catch (e) {}
+      conjugationPracticeStats = await this.getAllConjugationStats();
+    } catch (e) {
+      console.warn("Failed to get conjugation practice stats for backup:", e);
+    }
+
+    try {
+      practiceSessions = await this.getAllPracticeSessions();
+    } catch (e) {
+      console.warn("Failed to get practice sessions for backup:", e);
+    }
+
+    // Retrieve authoritative change histories through their actual service APIs
+    const appHistory = await this.getChangeLogs();
+    const vocabHistory = await this.getVocabChangeLogs();
+
+    // Ensure settings snapshot includes history entries
+    const ensureSetting = (k: string, val: any) => {
+      const idx = settings.findIndex(s => s.key === k);
+      if (idx >= 0) {
+        settings[idx] = { key: k, value: val };
+      } else {
+        settings.push({ key: k, value: val });
+      }
+    };
+    ensureSetting("change_history_log", appHistory);
+    ensureSetting("vocab_change_history_log", vocabHistory);
+
+    // Normalize overrides infinitives to canonical lowercase
+    const canonicalOverrides = overrides.map(o => ({
+      ...o,
+      infinitive: canonicalVerbKey(o.infinitive)
+    }));
 
     const backupPayload = {
       metadata: {
@@ -1920,18 +2540,22 @@ export class DatabaseService {
         totalVerbCategories: categories.length,
         totalVocabCategories: vocabCategories.length,
         totalLexicalNetworkGroups: synonymAntonymGroups.length,
-        totalSavedStories: savedStories.length
+        totalSavedStories: savedStories.length,
+        totalPracticeStats: conjugationPracticeStats.length,
+        totalPracticeSessions: practiceSessions.length
       },
       data: {
         verbs: allVerbs,
         verbsCache: this.verbsCache,
         verbCategories: categories,
-        overrides,
+        overrides: canonicalOverrides,
         vocabularies,
         vocabCategories,
         lexicalNetworkGroups: synonymAntonymGroups,
         synonymAntonymGroups,
         savedStories,
+        conjugationPracticeStats,
+        practiceSessions,
         customVerbOrder: await this.getCustomOrder(),
         customVocabOrder: await this.getCustomVocabOrder(),
         settings,
@@ -1947,14 +2571,23 @@ export class DatabaseService {
     try {
       const parsed = JSON.parse(jsonString);
 
-      // Support direct raw array of vocabulary items or verb items
+      // Support direct raw array of vocabulary items
       if (Array.isArray(parsed)) {
         if (parsed.length > 0 && parsed[0].word !== undefined) {
-          await db.open();
-          await db.vocabularies.clear();
-          await db.vocabularies.bulkPut(parsed);
-          this.inMemoryVocabularies = parsed;
-          localStorage.setItem("g_verb_vocabularies", JSON.stringify(parsed));
+          const validVocabs: VocabularyItem[] = parsed.filter(item => item && typeof item === "object" && item.id && item.word);
+          if (!this.useInMemoryFallback) {
+            await db.open();
+            await db.transaction("rw", db.vocabularies, async () => {
+              await db.vocabularies.clear();
+              if (validVocabs.length > 0) {
+                await db.vocabularies.bulkPut(validVocabs);
+              }
+            });
+          }
+          this.inMemoryVocabularies = validVocabs;
+          try {
+            localStorage.setItem("g_verb_vocabularies", JSON.stringify(validVocabs));
+          } catch (e) {}
           if (typeof window !== "undefined") {
             window.dispatchEvent(new CustomEvent("vocab-data-changed"));
           }
@@ -1963,12 +2596,252 @@ export class DatabaseService {
       }
 
       const data = parsed.data || parsed; // Support both wrapped and direct json
+      if (!data || typeof data !== "object") {
+        throw new Error("Invalid backup JSON structure.");
+      }
 
-      if (!data) throw new Error("Invalid backup JSON structure.");
+      // Pre-validation and normalization before making any state mutations
+      let overridesToPut: UserOverride[] | null = null;
+      if (Array.isArray(data.overrides)) {
+        overridesToPut = data.overrides.map((o: any) => ({
+          ...o,
+          infinitive: canonicalVerbKey(o.infinitive || "")
+        })).filter((o: any) => !!o.infinitive);
+      }
 
-      await db.open();
+      const categoriesToPut: Category[] | null = data.verbCategories !== undefined
+        ? (Array.isArray(data.verbCategories) ? data.verbCategories : [])
+        : data.categories !== undefined
+        ? (Array.isArray(data.categories) ? data.categories : [])
+        : null;
 
-      // 1. Verbs Cache / Raw Conjugations
+      const vocabulariesToPut: VocabularyItem[] | null = data.vocabularies !== undefined
+        ? (Array.isArray(data.vocabularies) ? data.vocabularies : [])
+        : null;
+
+      const vocabCategoriesToPut: VocabularyCategory[] | null = data.vocabCategories !== undefined
+        ? (Array.isArray(data.vocabCategories) ? data.vocabCategories : [])
+        : null;
+
+      const synAntToPut: SynonymAntonymGroup[] | null = data.lexicalNetworkGroups !== undefined
+        ? (Array.isArray(data.lexicalNetworkGroups) ? data.lexicalNetworkGroups : [])
+        : data.synonymAntonymGroups !== undefined
+        ? (Array.isArray(data.synonymAntonymGroups) ? data.synonymAntonymGroups : [])
+        : null;
+
+      const storiesToPut: SavedStory[] | null = data.savedStories !== undefined
+        ? (Array.isArray(data.savedStories) ? data.savedStories : [])
+        : null;
+
+      const practiceStatsToPut: ConjugationPracticeStat[] | null = data.conjugationPracticeStats !== undefined
+        ? (Array.isArray(data.conjugationPracticeStats) ? data.conjugationPracticeStats : [])
+        : null;
+
+      const practiceSessionsToPut: PracticeSession[] | null = data.practiceSessions !== undefined
+        ? (Array.isArray(data.practiceSessions) ? data.practiceSessions : [])
+        : null;
+
+      // Settings normalization: harmonize history and custom orders into settings table records
+      let settingsToPut: Array<{ key: string; value: any }> | null = null;
+      if (Array.isArray(data.settings)) {
+        const sMap = new Map<string, any>();
+        for (const s of data.settings) {
+          if (s && s.key) sMap.set(s.key, s.value);
+        }
+        if (Array.isArray(data.appHistory) && !sMap.has("change_history_log")) {
+          sMap.set("change_history_log", data.appHistory);
+        }
+        if (Array.isArray(data.vocabHistory) && !sMap.has("vocab_change_history_log")) {
+          sMap.set("vocab_change_history_log", data.vocabHistory);
+        }
+        if (Array.isArray(data.customVerbOrder) && !sMap.has("verbs_custom_order")) {
+          sMap.set("verbs_custom_order", data.customVerbOrder.map(canonicalVerbKey));
+        }
+        if (Array.isArray(data.customVocabOrder) && !sMap.has("vocabularies_custom_order")) {
+          sMap.set("vocabularies_custom_order", data.customVocabOrder);
+        }
+        sMap.set("db_initialized", true);
+        settingsToPut = Array.from(sMap.entries()).map(([key, value]) => ({ key, value }));
+      } else {
+        const sMap = new Map<string, any>();
+        if (Array.isArray(data.appHistory)) {
+          sMap.set("change_history_log", data.appHistory);
+        }
+        if (Array.isArray(data.vocabHistory)) {
+          sMap.set("vocab_change_history_log", data.vocabHistory);
+        }
+        if (Array.isArray(data.customVerbOrder)) {
+          sMap.set("verbs_custom_order", data.customVerbOrder.map(canonicalVerbKey));
+        }
+        if (Array.isArray(data.customVocabOrder)) {
+          sMap.set("vocabularies_custom_order", data.customVocabOrder);
+        }
+        sMap.set("db_initialized", true);
+        settingsToPut = Array.from(sMap.entries()).map(([key, value]) => ({ key, value }));
+      }
+
+      // Execute single atomic multi-table transaction across all persistent IndexedDB tables
+      if (!this.useInMemoryFallback) {
+        await db.open();
+        await db.transaction(
+          "rw",
+          [
+            db.overrides,
+            db.categories,
+            db.vocabularies,
+            db.vocabCategories,
+            db.synonymAntonymGroups,
+            db.settings,
+            db.savedStories,
+            db.conjugationPracticeStats,
+            db.practiceSessions
+          ],
+          async () => {
+            if (overridesToPut !== null) {
+              await db.overrides.clear();
+              if (overridesToPut.length > 0) {
+                await db.overrides.bulkPut(overridesToPut);
+              }
+            }
+            if (categoriesToPut !== null) {
+              await db.categories.clear();
+              if (categoriesToPut.length > 0) {
+                await db.categories.bulkPut(categoriesToPut);
+              }
+            }
+            if (vocabulariesToPut !== null) {
+              await db.vocabularies.clear();
+              if (vocabulariesToPut.length > 0) {
+                await db.vocabularies.bulkPut(vocabulariesToPut);
+              }
+            }
+            if (vocabCategoriesToPut !== null) {
+              await db.vocabCategories.clear();
+              if (vocabCategoriesToPut.length > 0) {
+                await db.vocabCategories.bulkPut(vocabCategoriesToPut);
+              }
+            }
+            if (synAntToPut !== null) {
+              await db.synonymAntonymGroups.clear();
+              if (synAntToPut.length > 0) {
+                await db.synonymAntonymGroups.bulkPut(synAntToPut);
+              }
+            }
+            if (settingsToPut !== null) {
+              await db.settings.clear();
+              if (settingsToPut.length > 0) {
+                await db.settings.bulkPut(settingsToPut);
+              }
+            }
+            if (storiesToPut !== null) {
+              await db.savedStories.clear();
+              if (storiesToPut.length > 0) {
+                await db.savedStories.bulkPut(storiesToPut);
+              }
+            }
+            if (practiceStatsToPut !== null) {
+              await db.conjugationPracticeStats.clear();
+              if (practiceStatsToPut.length > 0) {
+                await db.conjugationPracticeStats.bulkPut(practiceStatsToPut);
+              }
+            }
+            if (practiceSessionsToPut !== null) {
+              await db.practiceSessions.clear();
+              if (practiceSessionsToPut.length > 0) {
+                await db.practiceSessions.bulkPut(practiceSessionsToPut);
+              }
+            }
+          }
+        );
+      }
+
+      // ONLY after atomic transaction succeeds: synchronize memory caches & localStorage
+      if (overridesToPut !== null) {
+        this.inMemoryOverrides = {};
+        for (const o of overridesToPut) {
+          if (o.infinitive) {
+            this.inMemoryOverrides[canonicalVerbKey(o.infinitive)] = o;
+          }
+        }
+      }
+
+      if (categoriesToPut !== null) {
+        this.inMemoryCategories = categoriesToPut;
+      }
+
+      if (vocabulariesToPut !== null) {
+        this.inMemoryVocabularies = vocabulariesToPut;
+        try {
+          localStorage.setItem("g_verb_vocabularies", JSON.stringify(vocabulariesToPut));
+        } catch (e) {}
+      }
+
+      if (vocabCategoriesToPut !== null) {
+        try {
+          localStorage.setItem("g_verb_vocab_categories", JSON.stringify(vocabCategoriesToPut));
+        } catch (e) {}
+      }
+
+      if (synAntToPut !== null) {
+        try {
+          localStorage.setItem("g_verb_syn_ant_groups", JSON.stringify(synAntToPut));
+        } catch (e) {}
+      }
+
+      if (storiesToPut !== null) {
+        this.inMemorySavedStories = storiesToPut;
+        try {
+          localStorage.setItem("g_saved_stories", JSON.stringify(storiesToPut));
+        } catch (e) {}
+      }
+
+      if (practiceStatsToPut !== null) {
+        this.inMemoryConjugationStats = practiceStatsToPut;
+        try {
+          localStorage.setItem("g_conjugation_practice_stats", JSON.stringify(practiceStatsToPut));
+        } catch (e) {}
+      }
+
+      if (practiceSessionsToPut !== null) {
+        this.inMemoryPracticeSessions = practiceSessionsToPut;
+        try {
+          localStorage.setItem("g_conjugation_practice_sessions", JSON.stringify(practiceSessionsToPut));
+        } catch (e) {}
+      }
+
+      // Synchronize settings memory and localStorage to prevent old cached settings from shadowing
+      if (settingsToPut !== null) {
+        // 1. Wipe inMemorySettings
+        this.inMemorySettings = {};
+
+        // 2. Clear stale localStorage settings keys
+        try {
+          if (typeof window !== "undefined" && window.localStorage) {
+            const keysToRemove: string[] = [];
+            for (let i = 0; i < window.localStorage.length; i++) {
+              const k = window.localStorage.key(i);
+              if (k && k.startsWith("g_verb_setting_")) {
+                keysToRemove.push(k);
+              }
+            }
+            for (const k of keysToRemove) {
+              window.localStorage.removeItem(k);
+            }
+          }
+        } catch (e) {}
+
+        // 3. Populate new settings
+        for (const s of settingsToPut) {
+          this.inMemorySettings[s.key] = s.value;
+          try {
+            if (typeof window !== "undefined" && window.localStorage) {
+              window.localStorage.setItem(`g_verb_setting_${s.key}`, JSON.stringify(s.value));
+            }
+          } catch (e) {}
+        }
+      }
+
+      // Verbs Cache / Raw Conjugations
       if (data.verbsCache && typeof data.verbsCache === "object" && Object.keys(data.verbsCache).length > 0) {
         this.cacheJsonDatabase(data.verbsCache);
         await this.saveSetting("cached_base_json", JSON.stringify(data.verbsCache));
@@ -1976,7 +2849,7 @@ export class DatabaseService {
         const constructedCache: Record<string, TenseConjugations> = {};
         for (const verb of data.verbs) {
           if (verb.infinitive) {
-            constructedCache[verb.infinitive.toLowerCase().trim()] = verb.conjugations || {};
+            constructedCache[canonicalVerbKey(verb.infinitive)] = verb.conjugations || {};
           }
         }
         if (Object.keys(constructedCache).length > 0) {
@@ -1985,91 +2858,7 @@ export class DatabaseService {
         }
       }
 
-      // 2. Overrides
-      if (Array.isArray(data.overrides)) {
-        await db.overrides.clear();
-        if (data.overrides.length > 0) {
-          await db.overrides.bulkPut(data.overrides);
-        }
-        this.inMemoryOverrides = {};
-        data.overrides.forEach((o: UserOverride) => {
-          if (o.infinitive) this.inMemoryOverrides[o.infinitive.toLowerCase()] = o;
-        });
-      }
-
-      // 3. Verb Categories
-      const catList = data.verbCategories || data.categories;
-      if (Array.isArray(catList) && catList.length > 0) {
-        await db.categories.clear();
-        await db.categories.bulkPut(catList);
-        this.inMemoryCategories = catList;
-      }
-
-      // 4. Vocabularies
-      if (Array.isArray(data.vocabularies)) {
-        await db.vocabularies.clear();
-        if (data.vocabularies.length > 0) {
-          await db.vocabularies.bulkPut(data.vocabularies);
-        }
-        this.inMemoryVocabularies = data.vocabularies;
-        localStorage.setItem("g_verb_vocabularies", JSON.stringify(data.vocabularies));
-      }
-
-      // 5. Vocab Categories
-      if (Array.isArray(data.vocabCategories)) {
-        await db.vocabCategories.clear();
-        if (data.vocabCategories.length > 0) {
-          await db.vocabCategories.bulkPut(data.vocabCategories);
-        }
-        localStorage.setItem("g_verb_vocab_categories", JSON.stringify(data.vocabCategories));
-      }
-
-      // 6. Lexical Networks Groups (Synonyms, Antonyms, Word Families, Semantic Fields, Idioms)
-      const lexGroups = data.lexicalNetworkGroups || data.synonymAntonymGroups;
-      if (Array.isArray(lexGroups)) {
-        await db.synonymAntonymGroups.clear();
-        if (lexGroups.length > 0) {
-          await db.synonymAntonymGroups.bulkPut(lexGroups);
-        }
-        localStorage.setItem("g_verb_syn_ant_groups", JSON.stringify(lexGroups));
-      }
-
-      // 7. Settings
-      if (Array.isArray(data.settings)) {
-        await db.settings.clear();
-        if (data.settings.length > 0) {
-          await db.settings.bulkPut(data.settings);
-        }
-      }
-
-      // 8. Custom verb order
-      if (Array.isArray(data.customVerbOrder)) {
-        await this.saveCustomOrder(data.customVerbOrder);
-      }
-
-      // 9. Custom vocab order
-      if (Array.isArray(data.customVocabOrder)) {
-        await this.saveCustomVocabOrder(data.customVocabOrder);
-      }
-
-      // 10. History logs
-      if (Array.isArray(data.appHistory)) {
-        localStorage.setItem("g_verb_app_history", JSON.stringify(data.appHistory));
-      }
-      if (Array.isArray(data.vocabHistory)) {
-        localStorage.setItem("g_verb_vocab_history", JSON.stringify(data.vocabHistory));
-      }
-
-      // 11. Saved Stories
-      if (Array.isArray(data.savedStories)) {
-        await db.savedStories.clear();
-        if (data.savedStories.length > 0) {
-          await db.savedStories.bulkPut(data.savedStories);
-        }
-        this.inMemorySavedStories = data.savedStories;
-        localStorage.setItem("g_saved_stories", JSON.stringify(data.savedStories));
-      }
-
+      // Dispatch global change events
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("vocab-data-changed"));
         window.dispatchEvent(new CustomEvent("app-data-changed"));

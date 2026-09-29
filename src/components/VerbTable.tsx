@@ -716,15 +716,18 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       const existingVerbSet = new Set(verbs.map(v => v.infinitive.toLowerCase().trim()));
       const newCandidates: any[] = [];
       const duplicateVerbs: string[] = [];
+      let totalRecognizedCount = 0;
 
       for (const raw of itemsArray) {
         let inf = "";
         if (typeof raw === "string") {
           inf = raw.trim();
-        } else if (raw && typeof raw === "object" && raw.infinitive) {
-          inf = String(raw.infinitive).trim();
+        } else if (raw && typeof raw === "object") {
+          inf = String(raw.infinitive || raw.word || raw.verb || "").trim();
         }
         if (!inf) continue;
+
+        totalRecognizedCount++;
 
         if (existingVerbSet.has(inf.toLowerCase())) {
           duplicateVerbs.push(inf);
@@ -735,6 +738,15 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       }
 
       if (newCandidates.length === 0) {
+        // Distinguish zero recognized items from all items being duplicates (BUG-33 fix)
+        if (totalRecognizedCount === 0) {
+          setVerbJsonImportError(
+            locale === "fa"
+              ? "هیچ فعل معتبری در فایل یا ورودی JSON شناسایی نشد. لطفاً ساختار داده‌ها را بررسی کنید."
+              : "No valid verbs found in JSON input. Please check the data format."
+          );
+          return;
+        }
         const dupStr = duplicateVerbs.slice(0, 10).join(", ") + (duplicateVerbs.length > 10 ? "..." : "");
         setVerbJsonImportError(
           locale === "fa"
@@ -794,10 +806,22 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       }
 
       let countSuccess = 0;
+      let postEnrichDuplicates = 0;
+
+      // Re-verify against fresh DB records and within the batch to prevent AI collisions (BUG-35 fix)
+      const freshVerbs = await dbService.getAllVerbs();
+      const committedVerbs = new Set(freshVerbs.map(v => v.infinitive.toLowerCase().trim()));
 
       for (const raw of itemsArray) {
-        const inf = raw.infinitive || raw.word;
+        const inf = String(raw.infinitive || raw.word || raw.verb || "").trim();
         if (!inf) continue;
+
+        const infKey = inf.toLowerCase();
+        if (committedVerbs.has(infKey)) {
+          postEnrichDuplicates++;
+          continue;
+        }
+        committedVerbs.add(infKey);
 
         const cellOverrides: Record<string, string> = { ...raw.cellOverrides };
 
@@ -837,11 +861,12 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         ? `تعداد ${countSuccess} فعل جدید با موفقیت به جدول اضافه شد!`
         : `${countSuccess} new verbs imported successfully!`;
 
-      if (duplicateVerbs.length > 0) {
+      const totalSkipped = duplicateVerbs.length + postEnrichDuplicates;
+      if (totalSkipped > 0) {
         const dupStr = duplicateVerbs.slice(0, 5).join(", ") + (duplicateVerbs.length > 5 ? "..." : "");
         msg += locale === "fa"
-          ? ` (${duplicateVerbs.length} فعل تکراری نادیده گرفته شدند: ${dupStr})`
-          : ` (${duplicateVerbs.length} duplicate verbs skipped: ${dupStr})`;
+          ? ` (${totalSkipped} فعل به دلیل تکراری بودن نادیده گرفته شدند${dupStr ? ": " + dupStr : ""})`
+          : ` (${totalSkipped} duplicate verbs skipped${dupStr ? ": " + dupStr : ""})`;
       }
 
       setVerbJsonImportSuccess(msg);
@@ -876,7 +901,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       const conjugationsList = Array.from(wordsSet);
       return {
         verb: v,
-        infinitiveLower: v.infinitive.toLowerCase().trim(),
+        infinitiveLower: (v.infinitive || "").toLowerCase().trim(),
         bedeutungLower: (v.bedeutung || "").toLowerCase().trim(),
         conjugationsList,
         conjugationsLower: conjugationsList.join(" ")
@@ -895,29 +920,31 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
   const categoriesLookupMap = useMemo(() => {
     const map = new Map<string, string>();
     for (const cat of allCategories) {
-      map.set(cat.id, cat.name.toLowerCase());
+      if (cat && cat.id) {
+        map.set(cat.id, (cat.name || "").toLowerCase());
+      }
     }
     return map;
   }, [allCategories]);
 
   // Filter verbs
   const filteredVerbs = useMemo(() => {
-    const query = searchQuery.toLowerCase().trim();
+    const query = (searchQuery || "").toLowerCase().trim();
     if (!query) {
       return activeFilterIds.length > 0
         ? verbs.filter((v) => activeFilterIds.every((id) => v.categories.includes(id)))
         : verbs;
     }
 
-    const isExactMatch = selectedVerb && selectedVerb.toLowerCase().trim() === query;
+    const isExactMatch = selectedVerb && (selectedVerb || "").toLowerCase().trim() === query;
 
     return verbs.filter((v) => {
       let matchesSearch = false;
 
       if (isExactMatch) {
-        matchesSearch = v.infinitive.toLowerCase() === query;
+        matchesSearch = (v.infinitive || "").toLowerCase() === query;
       } else {
-        const matchesInfinitive = v.infinitive.toLowerCase().includes(query);
+        const matchesInfinitive = (v.infinitive || "").toLowerCase().includes(query);
         const matchesBedeutung = (v.bedeutung || "").toLowerCase().includes(query);
         
         // Check if any of the verb's categories matches the search query (O(1) lookup map)
@@ -927,7 +954,7 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         });
 
         // Check if any of the verb's conjugations matches the search query
-        const iv = indexedVerbsMap.get(v.infinitive.toLowerCase().trim());
+        const iv = indexedVerbsMap.get((v.infinitive || "").toLowerCase().trim());
         const matchesConjugation = iv ? iv.conjugationsLower.includes(query) : false;
 
         matchesSearch = matchesInfinitive || matchesBedeutung || matchesCategoryName || matchesConjugation;
@@ -955,16 +982,17 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
 
     const currentVerb = filteredVerbs[index];
     const targetVerb = filteredVerbs[targetIndex];
+    if (!currentVerb || !targetVerb) return;
 
-    const currentKey = currentVerb.infinitive.toLowerCase().trim();
-    const targetKey = targetVerb.infinitive.toLowerCase().trim();
+    const currentKey = (currentVerb.infinitive || "").toLowerCase().trim();
+    const targetKey = (targetVerb.infinitive || "").toLowerCase().trim();
 
     // Get current custom order
     let customOrder = await dbService.getCustomOrder();
 
     // If custom order is empty, initialize it first with current verbs sequence
     if (customOrder.length === 0) {
-      customOrder = verbs.map((v) => v.infinitive.toLowerCase().trim());
+      customOrder = verbs.map((v) => (v.infinitive || "").toLowerCase().trim());
     }
 
     // Find the positions of these two verbs in the global custom order list

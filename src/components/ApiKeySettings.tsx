@@ -48,6 +48,7 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
   const [showNewKey, setShowNewKey] = useState(false);
   const [isAdding, setIsAdding] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
+  const [storageError, setStorageError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [revealedKeys, setRevealedKeys] = useState<Record<string, boolean>>({});
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
@@ -78,9 +79,18 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
       refreshKeys();
     };
 
+    const handleStorageError = (e: any) => {
+      const msg = e?.detail?.message || "خطا در ذخیره‌سازی داده‌ها در حافظه مرورگر";
+      setStorageError(msg);
+      // Synchronize UI immediately with real persisted storage
+      refreshKeys();
+    };
+
     window.addEventListener("custom-api-keys-updated", handleUpdate);
+    window.addEventListener("custom-api-keys-storage-error", handleStorageError);
     return () => {
       window.removeEventListener("custom-api-keys-updated", handleUpdate);
+      window.removeEventListener("custom-api-keys-storage-error", handleStorageError);
     };
   }, []);
 
@@ -145,12 +155,24 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
   };
 
   const handleToggle = (id: string) => {
-    apiKeyService.toggleKey(id);
+    try {
+      setStorageError(null);
+      apiKeyService.toggleKey(id);
+    } catch (err: any) {
+      setStorageError(err.message || "خطا در ذخیره وضعیت کلید");
+      setKeys(apiKeyService.getKeys());
+    }
   };
 
   const handleDelete = (id: string) => {
-    apiKeyService.deleteKey(id);
-    setDeleteConfirmId(null);
+    try {
+      setStorageError(null);
+      apiKeyService.deleteKey(id);
+      setDeleteConfirmId(null);
+    } catch (err: any) {
+      setStorageError(err.message || "خطا در حذف کلید از حافظه");
+      setKeys(apiKeyService.getKeys());
+    }
   };
 
   const handleTestKey = async (id: string) => {
@@ -167,7 +189,13 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
   };
 
   const handleResetUsage = (id: string) => {
-    apiKeyService.resetTokenUsage(id);
+    try {
+      setStorageError(null);
+      apiKeyService.resetTokenUsage(id);
+    } catch (err: any) {
+      setStorageError(err.message || "خطا در پاکسازی آمار توکن");
+      setKeys(apiKeyService.getKeys());
+    }
   };
 
   const handleCopy = (id: string, text: string) => {
@@ -186,8 +214,14 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
   };
 
   const saveEditModel = (id: string) => {
-    apiKeyService.updateKeyModel(id, editingModelValue.trim());
-    setEditingModelKeyId(null);
+    try {
+      setStorageError(null);
+      apiKeyService.updateKeyModel(id, editingModelValue.trim());
+      setEditingModelKeyId(null);
+    } catch (err: any) {
+      setStorageError(err.message || "خطا در به‌روزرسانی مدل کلید");
+      setKeys(apiKeyService.getKeys());
+    }
   };
 
   const cancelEditModel = () => {
@@ -246,8 +280,8 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
             </h2>
             <p className="text-xs sm:text-sm text-indigo-200/90 max-w-2xl leading-relaxed">
               {locale === "fa"
-                ? "هیچ اجباری به استفاده از گوگل یا شرکت خاصی نیست! شما می‌توانید از کلید هر شرکت یا پلتفرمی در دنیا استفاده کنید و نام دقیق مدل دلخواهتان را تایپ کنید تا درخواست مستقیماً با همان ارسال شود."
-                : "No provider lock-in. Use API keys from any company worldwide, specify exact model names, or let the app automatically select working models."}
+                ? "ارائه‌دهنده و کلیدهای شخصی فعال شما با بالاترین اولویت (Primary) پردازش می‌شوند و هرگز توسط اکانت‌های جمینای محیطی سرور جایگزین نمی‌گردند؛ اکانت‌های سرور فقط در صورت نبود کلید شخصی یا خطای کامل به عنوان پشتیبان اضطراری عمل می‌کنند."
+                : "Your active personal API keys and selected providers are always processed with highest priority. Environment Gemini accounts never override your explicit choice and only act as an emergency failover."}
             </p>
           </div>
 
@@ -331,6 +365,24 @@ export default function ApiKeySettings({ locale, isRtl }: ApiKeySettingsProps) {
           </div>
         </div>
       </div>
+
+      {/* Storage Error Alert Banner */}
+      {storageError && (
+        <div className="p-4 bg-rose-50 border border-rose-300 text-rose-900 rounded-2xl text-xs sm:text-sm flex items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-center gap-2.5">
+            <AlertCircle className="w-5 h-5 text-rose-600 shrink-0" />
+            <span className="font-semibold leading-relaxed">{storageError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setStorageError(null)}
+            className="p-1.5 hover:bg-rose-100 rounded-xl text-rose-700 transition-colors shrink-0"
+            title={locale === "fa" ? "بستن هشدار" : "Dismiss"}
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Add New Key Form */}
       <div className="bg-white border border-slate-200/90 rounded-3xl p-5 sm:p-6 shadow-xs space-y-4">

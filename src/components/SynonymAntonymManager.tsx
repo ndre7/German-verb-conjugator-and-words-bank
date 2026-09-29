@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import { dbService } from "../DatabaseService";
 import { geminiFetch } from "../services/apiKeyService";
-import { SynonymAntonymGroup, SynonymAntonymItem, ArticleType, SynonymAntonymType, PartOfSpeech, VocabularyItem } from "../types";
+import { SynonymAntonymGroup, SynonymAntonymItem, ArticleType, SynonymAntonymType, PartOfSpeech, VocabularyItem, getVocabLexicalKey } from "../types";
 import { Locale } from "../translations";
 
 interface SynonymAntonymManagerProps {
@@ -312,8 +312,9 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
       if (!cleanWord) return;
 
       const existingVocabs = await dbService.getVocabularies();
+      const targetKey = getVocabLexicalKey(cleanWord, item.article || "none", item.partOfSpeech || "noun");
       const duplicate = existingVocabs.find(
-        v => v.word.trim().toLowerCase() === cleanWord.toLowerCase()
+        v => getVocabLexicalKey(v.word, v.article, v.partOfSpeech) === targetKey
       );
 
       if (duplicate) {
@@ -443,12 +444,12 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
   // Filtering
   const filteredGroups = groups.filter(g => {
     if (typeFilter !== "all" && g.type !== typeFilter) return false;
-    if (searchQuery.trim()) {
+    if (searchQuery && searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
-      const matchTitle = g.title.toLowerCase().includes(q);
+      const matchTitle = (g.title || "").toLowerCase().includes(q);
       const matchNotes = (g.notes || "").toLowerCase().includes(q);
-      const matchItem = g.items.some(
-        i => i.word.toLowerCase().includes(q) || (i.meaning || "").toLowerCase().includes(q) || (i.comparative || "").toLowerCase().includes(q) || (i.superlative || "").toLowerCase().includes(q)
+      const matchItem = Array.isArray(g.items) && g.items.some(
+        i => (i.word || "").toLowerCase().includes(q) || ((i.meaning || "").toLowerCase().includes(q)) || ((i.comparative || "").toLowerCase().includes(q)) || ((i.superlative || "").toLowerCase().includes(q))
       );
       return matchTitle || matchNotes || matchItem;
     }

@@ -29,10 +29,44 @@ import {
 } from "lucide-react";
 import { dbService } from "../DatabaseService";
 import { geminiFetch } from "../services/apiKeyService";
-import { VocabularyItem, ArticleType, PartOfSpeech, VocabularyCategory } from "../types";
+import { VocabularyItem, ArticleType, PartOfSpeech, VocabularyCategory, getVocabLexicalKey } from "../types";
 import { translations, Locale } from "../translations";
 import VocabularyCategoryManager from "./VocabularyCategoryManager";
 import SynonymAntonymManager from "./SynonymAntonymManager";
+
+export function normalizePluralField(p: string | undefined | null): string {
+  const trimmed = (p || "").trim().toLowerCase();
+  if (
+    !trimmed ||
+    [
+      "none",
+      "null",
+      "-",
+      "–",
+      "n/a",
+      "no plural",
+      "بدون جمع",
+      "ohne plural",
+      "ohne plural / nur singular",
+      "nur singular",
+    ].includes(trimmed)
+  ) {
+    return "–";
+  }
+  return (p || "").trim();
+}
+
+function extractItemsFromAIResponse(parsed: any): any[] {
+  if (!parsed) return [];
+  if (Array.isArray(parsed)) return parsed;
+  if (Array.isArray(parsed.items)) return parsed.items;
+  if (Array.isArray(parsed.data)) return parsed.data;
+  if (Array.isArray(parsed.results)) return parsed.results;
+  if (Array.isArray(parsed.words)) return parsed.words;
+  if (Array.isArray(parsed.vocabularies)) return parsed.vocabularies;
+  if (parsed && typeof parsed === "object" && (parsed.word || parsed.german || parsed.infinitive)) return [parsed];
+  return [];
+}
 
 export function cleanGermanExample(text: string): string {
   if (!text) return "";
@@ -155,12 +189,85 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
   const [activeAiVocabId, setActiveAiVocabId] = useState<string | null>(null);
   const [enableAiJsonImport, setEnableAiJsonImport] = useState(true);
 
+  // Guards & Idempotency Refs (BUG-IMP-03)
+  const isImportingRef = useRef(false);
+  const processedBatchKeys = useRef<Set<string>>(new Set());
+
+  // Auto-transfer Verbs Setting (BUG-IMP-06)
+  const [autoTransferVerbs, setAutoTransferVerbs] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem("g_verb_auto_transfer_verbs");
+      return saved !== null ? saved === "true" : true;
+    } catch {
+      return true;
+    }
+  });
+
+  const handleToggleAutoTransferVerbs = (checked: boolean) => {
+    setAutoTransferVerbs(checked);
+    try {
+      localStorage.setItem("g_verb_auto_transfer_verbs", String(checked));
+    } catch {}
+  };
+
+  const checkAndTransferVerbs = async (items: VocabularyItem[]) => {
+    const isEnabled = (() => {
+      try {
+        const saved = localStorage.getItem("g_verb_auto_transfer_verbs");
+        return saved !== null ? saved === "true" : true;
+      } catch {
+        return true;
+      }
+    })();
+    if (!isEnabled || items.length === 0) return;
+
+    let transferredCount = 0;
+    let skippedCount = 0;
+
+    for (const item of items) {
+      const rawWord = (item.word || "").trim();
+      const cleanWord = rawWord.replace(/^(der|die|das)\s+/i, "").trim();
+      const isCandidate =
+        item.partOfSpeech === "verb_phrase" ||
+        (/^(.*)(en|eln|ern)$/i.test(cleanWord) && (item.article === "none" || !item.article) && item.partOfSpeech !== "noun");
+
+      if (isCandidate && cleanWord) {
+        const added = await dbService.transferVocabVerbToVerbTable(item);
+        if (added) {
+          transferredCount++;
+        } else {
+          skippedCount++;
+        }
+      }
+    }
+
+    if (transferredCount > 0 || skippedCount > 0) {
+      if (skippedCount > 0) {
+        const template =
+          translations[locale]?.autoVerbTransferSkipped ||
+          (locale === "fa"
+            ? "{transferred} فعل به بخش افعال منتقل شد، {skipped} فعل تکراری رد شد."
+            : "{transferred} verb(s) transferred to the verbs table, {skipped} duplicate(s) skipped.");
+        showToast(
+          template.replace("{transferred}", String(transferredCount)).replace("{skipped}", String(skippedCount))
+        );
+      } else {
+        const template =
+          translations[locale]?.autoVerbTransferToast ||
+          (locale === "fa"
+            ? "{transferred} فعل به بخش افعال منتقل شد."
+            : "{transferred} verb(s) transferred to the verbs table.");
+        showToast(template.replace("{transferred}", String(transferredCount)));
+      }
+    }
+  };
+
   // Custom Tag Helper for Form
   const handleAddCustomTagToForm = async () => {
     const tagName = newCustomTagInput.trim();
     if (!tagName) return;
 
-    let cat = vocabCategories.find(c => c.name.toLowerCase() === tagName.toLowerCase() || c.id.toLowerCase() === tagName.toLowerCase());
+    let cat = vocabCategories.find(c => (c.name || "").toLowerCase() === tagName.toLowerCase() || (c.id || "").toLowerCase() === tagName.toLowerCase());
     let tagId = cat ? cat.id : "";
 
     if (!cat) {
@@ -185,7 +292,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     const tagName = jsonImportCustomTag.trim();
     if (!tagName) return;
 
-    let cat = vocabCategories.find(c => c.name.toLowerCase() === tagName.toLowerCase() || c.id.toLowerCase() === tagName.toLowerCase());
+    let cat = vocabCategories.find(c => (c.name || "").toLowerCase() === tagName.toLowerCase() || (c.id || "").toLowerCase() === tagName.toLowerCase());
     let tagId = cat ? cat.id : "";
 
     if (!cat) {
@@ -216,14 +323,6 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       }
       return next;
     });
-  };
-
-  const toggleSelectAllVocabs = () => {
-    if (selectedVocabIds.size === paginatedItems.length && paginatedItems.length > 0) {
-      setSelectedVocabIds(new Set());
-    } else {
-      setSelectedVocabIds(new Set(paginatedItems.map(item => item.id)));
-    }
   };
 
   const handleBulkDeleteVocabs = async () => {
@@ -275,16 +374,18 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
         if (res.ok) {
           const data = await res.json();
-          if (data.success && Array.isArray(data.items)) {
-            for (const enriched of data.items) {
-              const orig = chunk.find(c => c.word.toLowerCase() === (enriched.word || "").toLowerCase() || c.id === enriched.id);
+          const items = extractItemsFromAIResponse(data.items !== undefined ? data.items : data);
+          if (data.success && items.length > 0) {
+            for (const enriched of items) {
+              const enrichedWord = enriched.word || enriched.german || enriched.infinitive || "";
+              const orig = chunk.find(c => (c.word || "").toLowerCase() === (enrichedWord || "").toLowerCase() || c.id === enriched.id);
               if (orig) {
                 const updatedItem: VocabularyItem = {
                   ...orig,
                   article: (enriched.article && ["der","die","das","none"].includes(enriched.article)) ? enriched.article : orig.article,
-                  word: enriched.word || orig.word,
+                  word: enrichedWord || orig.word,
                   meaning: enriched.meaning || orig.meaning,
-                  plural: enriched.plural !== undefined ? enriched.plural : orig.plural,
+                  plural: normalizePluralField(enriched.plural !== undefined ? enriched.plural : orig.plural),
                   partOfSpeech: enriched.partOfSpeech || orig.partOfSpeech,
                   example: enriched.example ? cleanGermanExample(enriched.example) : orig.example,
                   notes: enriched.notes || orig.notes,
@@ -341,9 +442,9 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         if (d.article && ["der", "die", "das", "none"].includes(d.article)) {
           setFormArticle(d.article as ArticleType);
         }
-        if (d.word) setFormWord(d.word);
+        if (d.word || d.german || d.infinitive) setFormWord(d.word || d.german || d.infinitive);
         if (d.meaning) setFormMeaning(d.meaning);
-        if (d.plural !== undefined) setFormPlural(d.plural);
+        if (d.plural !== undefined) setFormPlural(normalizePluralField(d.plural));
         if (d.partOfSpeech) setFormPos(d.partOfSpeech as PartOfSpeech);
         if (d.example) setFormExample(cleanGermanExample(d.example));
         if (d.notes) setFormNotes(d.notes);
@@ -382,9 +483,9 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         const updated: VocabularyItem = {
           ...item,
           article: (d.article && ["der", "die", "das", "none"].includes(d.article)) ? (d.article as ArticleType) : item.article,
-          word: d.word || item.word,
+          word: d.word || d.german || d.infinitive || item.word,
           meaning: d.meaning || item.meaning,
-          plural: d.plural !== undefined ? d.plural : (item.plural || ""),
+          plural: normalizePluralField(d.plural !== undefined ? d.plural : (item.plural || "")),
           partOfSpeech: (d.partOfSpeech as PartOfSpeech) || item.partOfSpeech,
           example: cleanGermanExample(d.example || item.example || ""),
           notes: d.notes || item.notes || "",
@@ -436,6 +537,13 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
   useEffect(() => {
     loadData();
+    const handleVocabChanged = () => {
+      loadData();
+    };
+    window.addEventListener("vocab-data-changed", handleVocabChanged);
+    return () => {
+      window.removeEventListener("vocab-data-changed", handleVocabChanged);
+    };
   }, []);
 
   const loadData = async () => {
@@ -531,11 +639,12 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
     // Check duplicate if adding new item
     if (!editingItem) {
-      const exists = vocabularies.some(v => v.word.toLowerCase().trim() === rawWord.toLowerCase());
+      const targetKey = getVocabLexicalKey(rawWord, formArticle, formPos);
+      const exists = vocabularies.some(v => getVocabLexicalKey(v.word, v.article, v.partOfSpeech) === targetKey);
       if (exists) {
         showToast(
           locale === "fa"
-            ? `واژه "${rawWord}" از قبل در بانک واژگان وجود دارد و اضافه نشد.`
+            ? `واژه "${rawWord}" (${formArticle !== "none" ? formArticle + " " : ""}${rawWord}) از قبل در بانک واژگان وجود دارد و اضافه نشد.`
             : `Word "${rawWord}" already exists in database.`
         );
         return;
@@ -547,7 +656,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       article: formArticle,
       word: rawWord,
       meaning: formMeaning.trim(),
-      plural: formPlural.trim(),
+      plural: normalizePluralField(formPlural),
       partOfSpeech: formPos,
       example: cleanGermanExample(formExample),
       notes: formNotes.trim(),
@@ -559,6 +668,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     await dbService.saveVocabulary(newItem);
     setShowModal(false);
     await loadData();
+    await checkAndTransferVerbs([newItem]);
 
     if (editingItem) {
       showToast(locale === "fa" ? `واژه "${rawWord}" بروزرسانی شد.` : `Word "${rawWord}" updated.`);
@@ -575,7 +685,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     if (bulkTagCustomInput.trim()) {
       const rawTag = bulkTagCustomInput.trim();
       const existing = vocabCategories.find(
-        c => c.name.toLowerCase() === rawTag.toLowerCase() || c.id.toLowerCase() === rawTag.toLowerCase()
+        c => (c.name || "").toLowerCase() === (rawTag || "").toLowerCase() || (c.id || "").toLowerCase() === (rawTag || "").toLowerCase()
       );
       if (existing) {
         if (!tagIdsToApply.includes(existing.id)) tagIdsToApply.push(existing.id);
@@ -636,13 +746,15 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     }
 
     const cleanWordTrimmed = cleanWord.trim();
+    const quickPos = article !== "none" ? "noun" : "expression";
 
     // Check duplicate
-    const exists = vocabularies.some(v => v.word.toLowerCase().trim() === cleanWordTrimmed.toLowerCase());
+    const targetKey = getVocabLexicalKey(cleanWordTrimmed, article, quickPos);
+    const exists = vocabularies.some(v => getVocabLexicalKey(v.word, v.article, v.partOfSpeech) === targetKey);
     if (exists) {
       showToast(
         locale === "fa"
-          ? `واژه "${cleanWordTrimmed}" از قبل در بانک واژگان وجود دارد و اضافه نشد.`
+          ? `واژه "${cleanWordTrimmed}" (${article !== "none" ? article + " " : ""}${cleanWordTrimmed}) از قبل در بانک واژگان وجود دارد و اضافه نشد.`
           : `Word "${cleanWordTrimmed}" already exists.`
       );
       return;
@@ -653,7 +765,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       article,
       word: cleanWordTrimmed,
       meaning,
-      plural: "",
+      plural: "–",
       partOfSpeech: article !== "none" ? "noun" : "expression",
       createdAt: Date.now(),
       updatedAt: Date.now()
@@ -662,6 +774,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     await dbService.saveVocabulary(newItem);
     setQuickInput("");
     await loadData();
+    await checkAndTransferVerbs([newItem]);
     showToast(locale === "fa" ? `واژه "${cleanWordTrimmed}" اضافه شد!` : `Word "${cleanWordTrimmed}" added!`);
   };
 
@@ -760,6 +873,8 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
   // Bulk JSON File / Code Import Processing
   const processJsonImport = async (jsonText: string) => {
+    if (isImportingRef.current) return;
+    isImportingRef.current = true;
     setJsonImportError(null);
     setJsonImportSuccess(null);
 
@@ -782,18 +897,25 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         return;
       }
 
-      // Existing word set for fast duplicate check (normalized without article prefix)
-      const existingWordSet = new Set(
-        vocabularies
-          .map(v => (v.word || "").replace(/^(der|die|das)\s+/i, "").toLowerCase().trim())
-          .filter(Boolean)
+      // Existing vocabulary keys for canonical duplicate check (BUG-IMP-02)
+      const existingWordKeys = new Set(
+        vocabularies.map(
+          (v) =>
+            `${(v.word || "").replace(/^(der|die|das)\s+/i, "").toLowerCase().trim()}|${(v.article || "none").toLowerCase()}|${(v.partOfSpeech || "noun").toLowerCase()}`
+        )
       );
 
       const newCandidates: any[] = [];
       const duplicateWords: string[] = [];
+      const invalidRecords: { item: string; reason: string }[] = [];
+      let recognizedCount = 0;
 
       for (const raw of itemsArray) {
-        if (!raw) continue;
+        recognizedCount++;
+        if (!raw) {
+          invalidRecords.push({ item: "empty", reason: locale === "fa" ? "رکورد خالی" : "Empty record" });
+          continue;
+        }
 
         let rawWord = "";
         let rawMeaning = "";
@@ -806,20 +928,18 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
 
         if (typeof raw === "string") {
           const trimmed = raw.trim();
-          if (trimmed.includes("-")) {
-            const parts = trimmed.split("-");
-            rawWord = parts[0].trim();
-            rawMeaning = parts.slice(1).join("-").trim();
-          } else if (trimmed.includes(":")) {
-            const parts = trimmed.split(":");
-            rawWord = parts[0].trim();
-            rawMeaning = parts.slice(1).join(":").trim();
+          // Use whitespace-padded separators so hyphenated words like "E-Mail" or "U-Bahn" are NOT truncated! (BUG-32 fix)
+          const delimiterMatch = trimmed.match(/^(.+?)\s*(?::|=|\s+[-–—]\s+)\s*(.+)$/);
+          if (delimiterMatch) {
+            rawWord = delimiterMatch[1].trim();
+            rawMeaning = delimiterMatch[2].trim();
           } else {
             rawWord = trimmed;
+            rawMeaning = "";
           }
         } else if (typeof raw === "object") {
           rawWord = String(
-            raw.word || raw.german || raw.term || raw.wort || raw.expression || raw.title || raw.text || raw.w || ""
+            raw.word || raw.german || raw.term || raw.wort || raw.infinitive || raw.expression || raw.title || raw.text || raw.w || ""
           ).trim();
           rawMeaning = String(raw.meaning || raw.persian || raw.translation || raw.bedeutung || "").trim();
           if (raw.article === "der" || raw.article === "die" || raw.article === "das") {
@@ -830,9 +950,18 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
           if (raw.example) rawExample = String(raw.example).trim();
           if (raw.notes) rawNotes = String(raw.notes).trim();
           if (Array.isArray(raw.tags)) rawTags = raw.tags;
+        } else {
+          invalidRecords.push({ item: String(raw), reason: locale === "fa" ? "فرمت داده نامعتبر" : "Invalid data format" });
+          continue;
         }
 
-        if (!rawWord) continue;
+        if (!rawWord) {
+          invalidRecords.push({
+            item: typeof raw === "object" ? JSON.stringify(raw).slice(0, 30) : String(raw),
+            reason: locale === "fa" ? "فاقد فیلد واژه" : "Missing word field",
+          });
+          continue;
+        }
 
         let art: ArticleType = rawArticle;
         if (art === "none") {
@@ -842,22 +971,29 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         }
 
         const cleanWord = rawWord.replace(/^(der|die|das)\s+/i, "").trim();
-        if (!cleanWord) continue;
+        if (!cleanWord) {
+          invalidRecords.push({
+            item: rawWord,
+            reason: locale === "fa" ? "واژه پس از پالایش خالی شد" : "Empty word after cleaning",
+          });
+          continue;
+        }
 
-        const normKey = cleanWord.toLowerCase();
+        const candidatePos = rawPartOfSpeech || (art !== "none" ? "noun" : "expression");
+        const normKey = `${cleanWord.toLowerCase()}|${art.toLowerCase()}|${(rawPartOfSpeech || "noun").toLowerCase()}`;
 
-        if (existingWordSet.has(normKey)) {
-          duplicateWords.push(cleanWord);
+        if (existingWordKeys.has(normKey)) {
+          duplicateWords.push(art !== "none" ? `${art} ${cleanWord}` : cleanWord);
         } else {
           // Avoid duplicates within the input list itself
-          existingWordSet.add(normKey);
+          existingWordKeys.add(normKey);
           const mergedTags = Array.from(new Set([...(Array.isArray(rawTags) ? rawTags : []), ...jsonImportTags]));
           newCandidates.push({
             word: cleanWord,
             article: art,
             meaning: rawMeaning,
-            plural: rawPlural,
-            partOfSpeech: rawPartOfSpeech,
+            plural: normalizePluralField(rawPlural),
+            partOfSpeech: candidatePos,
             example: rawExample,
             notes: rawNotes,
             tags: mergedTags,
@@ -865,13 +1001,29 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
         }
       }
 
+      const newCount = newCandidates.length;
+
+      const dupListStr = duplicateWords.length > 0 ? `: [${duplicateWords.join(", ")}]` : "";
+      const invListStr =
+        invalidRecords.length > 0
+          ? `: [${invalidRecords.map((r) => `${r.item} (${r.reason})`).join(", ")}]`
+          : "";
+
+      const summaryMsg =
+        locale === "fa"
+          ? `${recognizedCount} واژه شناسایی شد / ${newCount} جدید / ${duplicateWords.length} تکراری${dupListStr} / ${invalidRecords.length} نامعتبر${invListStr}`
+          : `${recognizedCount} words recognized / ${newCount} new / ${duplicateWords.length} duplicates${dupListStr} / ${invalidRecords.length} invalid${invListStr}`;
+
       if (newCandidates.length === 0) {
-        const dupStr = duplicateWords.slice(0, 10).join(", ") + (duplicateWords.length > 10 ? "..." : "");
-        setJsonImportError(
-          locale === "fa"
-            ? `تمام واژگان موجود در فایل از قبل در بانک واژگان وجود دارند (${duplicateWords.length} واژه تکراری: ${dupStr}). هیچ واژه جدیدی اضافه نشد.`
-            : `All imported words already exist (${duplicateWords.length} duplicates: ${dupStr}). No new words added.`
-        );
+        if (recognizedCount === 0) {
+          setJsonImportError(
+            locale === "fa"
+              ? "هیچ واژه معتبری در فایل یا متن JSON شناسایی نشد. لطفاً ساختار داده‌ها را بررسی کنید."
+              : "No valid vocabulary items found in JSON input. Please check the data format."
+          );
+          return;
+        }
+        setJsonImportError(summaryMsg);
         return;
       }
 
@@ -881,8 +1033,8 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       if (enableAiJsonImport && itemsArray.length > 0) {
         setJsonImportSuccess(
           locale === "fa"
-            ? `در حال تحلیل و تکمیل ${itemsArray.length} واژه جدید با هوش مصنوعی... (لطفاً چند لحظه شکیبا باشید)`
-            : "Enriching new vocabulary items with AI..."
+            ? `${summaryMsg}\nدر حال تحلیل و تکمیل ${itemsArray.length} واژه جدید با هوش مصنوعی... (لطفاً چند لحظه شکیبا باشید)`
+            : `${summaryMsg}\nEnriching ${itemsArray.length} new vocabulary items with AI...`
         );
 
         const enrichedList: any[] = [];
@@ -895,16 +1047,24 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
             await delayMs(BATCH_REQUEST_DELAY_MS);
           }
           const chunk = itemsArray.slice(i, i + CHUNK_SIZE);
+          const batchKey = chunk.map((c) => (c.word || c.id || "").toLowerCase().trim()).sort().join("|");
+          if (processedBatchKeys.current.has(batchKey)) {
+            console.log("[Batch] already processed, skipping:", batchKey.slice(0, 40));
+            continue;
+          }
+
           try {
             const aiRes = await geminiFetch("/api/gemini/batch-vocab-fill", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ items: chunk })
+              body: JSON.stringify({ items: chunk }),
             });
             if (aiRes.ok) {
               const aiData = await aiRes.json();
-              if (aiData.success && Array.isArray(aiData.items) && aiData.items.length > 0) {
-                enrichedList.push(...aiData.items);
+              const extractedItems = extractItemsFromAIResponse(aiData.items !== undefined ? aiData.items : aiData);
+              if (aiData.success && extractedItems.length > 0) {
+                processedBatchKeys.current.add(batchKey);
+                enrichedList.push(...extractedItems);
                 continue;
               }
             } else {
@@ -916,6 +1076,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
           } catch (err) {
             console.warn("Batch AI chunk error during JSON import, falling back to raw chunk items:", err);
           }
+          // On failure: do NOT add to the set (so fallback path can still process it)
           enrichedList.push(...chunk);
         }
 
@@ -925,52 +1086,92 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       }
 
       let countSuccess = 0;
+      let postEnrichDuplicates = 0;
 
-      for (const raw of itemsArray) {
-        if (!raw || typeof raw !== "object" || !raw.word) continue;
+      // Re-verify against fresh DB records and within the batch to prevent AI collisions (BUG-35 fix)
+      const freshVocabs = await dbService.getVocabularies();
+      const committedKeys = new Set(
+        freshVocabs.map(
+          (v) =>
+            `${(v.word || "").replace(/^(der|die|das)\s+/i, "").toLowerCase().trim()}|${(v.article || "none").toLowerCase()}|${(v.partOfSpeech || "noun").toLowerCase()}`
+        )
+      );
+
+      const newlySavedItems: VocabularyItem[] = [];
+
+      for (let idx = 0; idx < itemsArray.length; idx++) {
+        const raw = itemsArray[idx];
+        if (!raw || typeof raw !== "object") continue;
+
+        const wordCandidate = String(
+          raw.word || raw.german || raw.term || raw.wort || raw.infinitive || ""
+        ).trim();
+        if (!wordCandidate) continue;
 
         let art: ArticleType = "none";
         if (raw.article === "der" || raw.article === "die" || raw.article === "das") {
           art = raw.article;
-        } else if (/^der\s+/i.test(raw.word)) {
+        } else if (/^der\s+/i.test(wordCandidate)) {
           art = "der";
-        } else if (/^die\s+/i.test(raw.word)) {
+        } else if (/^die\s+/i.test(wordCandidate)) {
           art = "die";
-        } else if (/^das\s+/i.test(raw.word)) {
+        } else if (/^das\s+/i.test(wordCandidate)) {
           art = "das";
         }
 
-        const cleanWord = raw.word.replace(/^(der|die|das)\s+/i, "").trim();
+        const cleanWord = wordCandidate.replace(/^(der|die|das)\s+/i, "").trim();
+        if (!cleanWord) continue;
+
+        const pos = raw.partOfSpeech || (art !== "none" ? "noun" : "expression");
+        const canonicalKey = `${cleanWord.toLowerCase()}|${art.toLowerCase()}|${(pos || "noun").toLowerCase()}`;
+
+        if (committedKeys.has(canonicalKey)) {
+          postEnrichDuplicates++;
+          continue;
+        }
+        committedKeys.add(canonicalKey);
+
+        const itemId =
+          raw.id ||
+          `vocab_${Date.now()}_${Math.random().toString(36).substring(2, 7)}_${Math.random().toString(36).substring(2, 5)}`;
+        console.log(`[Persist ${idx + 1}/${itemsArray.length}] word="${cleanWord}" id="${itemId}"`);
 
         const item: VocabularyItem = {
-          id: raw.id || `vocab_${Date.now()}_${Math.random().toString(36).substring(2, 7)}_${Math.random().toString(36).substring(2, 5)}`,
+          id: itemId,
           article: art,
           word: cleanWord,
           meaning: raw.meaning ? String(raw.meaning).trim() : "",
-          plural: raw.plural ? String(raw.plural).trim() : "",
-          partOfSpeech: raw.partOfSpeech || (art !== "none" ? "noun" : "expression"),
+          plural: normalizePluralField(raw.plural ? String(raw.plural) : ""),
+          partOfSpeech: pos,
           example: cleanGermanExample(raw.example ? String(raw.example) : ""),
           notes: raw.notes ? String(raw.notes).trim() : "",
           tags: Array.from(new Set([...(Array.isArray(raw.tags) ? raw.tags : []), ...jsonImportTags])),
           createdAt: raw.createdAt || Date.now(),
-          updatedAt: Date.now()
+          updatedAt: Date.now(),
         };
 
         await dbService.saveVocabulary(item);
+        newlySavedItems.push(item);
         countSuccess++;
       }
 
+      console.log("[Import] persisted total:", countSuccess);
+
       await loadData();
+      await checkAndTransferVerbs(newlySavedItems);
 
-      let msg = locale === "fa"
-        ? `تعداد ${countSuccess} واژه جدید با موفقیت اضافه شد!`
-        : `${countSuccess} new words imported successfully!`;
+      let msg =
+        locale === "fa"
+          ? `تعداد ${countSuccess} واژه جدید با موفقیت اضافه شد!`
+          : `${countSuccess} new words imported successfully!`;
 
-      if (duplicateWords.length > 0) {
+      const totalSkipped = duplicateWords.length + postEnrichDuplicates;
+      if (totalSkipped > 0) {
         const dupStr = duplicateWords.slice(0, 5).join(", ") + (duplicateWords.length > 5 ? "..." : "");
-        msg += locale === "fa"
-          ? ` (${duplicateWords.length} واژه به دلیل تکراری بودن نادیده گرفته شدند: ${dupStr})`
-          : ` (${duplicateWords.length} duplicate words skipped: ${dupStr})`;
+        msg +=
+          locale === "fa"
+            ? ` (${totalSkipped} واژه به دلیل تکراری بودن نادیده گرفته شدند${dupStr ? ": " + dupStr : ""})`
+            : ` (${totalSkipped} duplicate words skipped${dupStr ? ": " + dupStr : ""})`;
       }
 
       setJsonImportSuccess(msg);
@@ -983,6 +1184,8 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
           ? `فرمت فایل JSON نامعتبر است. ساختار باید آرایه‌ای از اشیاء واژه باشد.\nخطا: ${err.message}`
           : `Invalid JSON format. Should be an array of word objects.\nError: ${err.message}`
       );
+    } finally {
+      isImportingRef.current = false;
     }
   };
 
@@ -1023,10 +1226,10 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
       if (!hasAllTags) return false;
     }
 
-    if (searchQuery.trim()) {
+    if (searchQuery && searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
-      const matchWord = item.word.toLowerCase().includes(q);
-      const matchMeaning = item.meaning.toLowerCase().includes(q);
+      const matchWord = (item.word || "").toLowerCase().includes(q);
+      const matchMeaning = (item.meaning || "").toLowerCase().includes(q);
       const matchPlural = (item.plural || "").toLowerCase().includes(q);
       const matchExample = (item.example || "").toLowerCase().includes(q);
       return matchWord || matchMeaning || matchPlural || matchExample;
@@ -1041,15 +1244,38 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     currentPage * itemsPerPage
   );
 
+  // Identity-based Selection Calculations for Current Page (BUG-14 fix)
+  const visibleItemIds = useMemo(() => paginatedItems.map(item => item.id), [paginatedItems]);
+  const selectedVisibleCount = useMemo(() => visibleItemIds.filter(id => selectedVocabIds.has(id)).length, [visibleItemIds, selectedVocabIds]);
+  const isAllVisibleSelected = visibleItemIds.length > 0 && selectedVisibleCount === visibleItemIds.length;
+  const isPartialVisibleSelected = selectedVisibleCount > 0 && selectedVisibleCount < visibleItemIds.length;
+  const offPageSelectedCount = selectedVocabIds.size - selectedVisibleCount;
+
+  const toggleSelectAllVocabs = () => {
+    setSelectedVocabIds(prev => {
+      const next = new Set(prev);
+      if (isAllVisibleSelected) {
+        for (const id of visibleItemIds) {
+          next.delete(id);
+        }
+      } else {
+        for (const id of visibleItemIds) {
+          next.add(id);
+        }
+      }
+      return next;
+    });
+  };
+
   // Live Suggestions for Search Input
   const suggestedVocabs = useMemo(() => {
-    if (!localSearchQuery.trim()) return [];
+    if (!localSearchQuery || !localSearchQuery.trim()) return [];
     const q = localSearchQuery.toLowerCase().trim();
     return vocabularies
       .filter((v) =>
-        v.word.toLowerCase().includes(q) ||
-        v.meaning.toLowerCase().includes(q) ||
-        (v.plural && v.plural.toLowerCase().includes(q))
+        (v.word || "").toLowerCase().includes(q) ||
+        (v.meaning || "").toLowerCase().includes(q) ||
+        (v.plural && (v.plural || "").toLowerCase().includes(q))
       )
       .slice(0, 7);
   }, [vocabularies, localSearchQuery]);
@@ -1058,7 +1284,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
     if (!query || !query.trim() || !text) return text;
     const parts = text.split(new RegExp(`(${query.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi"));
     return parts.map((part, i) =>
-      part.toLowerCase() === query.trim().toLowerCase() ? (
+      (part || "").toLowerCase() === (query.trim() || "").toLowerCase() ? (
         <mark key={i} className="bg-amber-200 text-amber-950 font-bold rounded-xs px-0.5">
           {part}
         </mark>
@@ -1083,26 +1309,12 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
   };
 
   const formatPluralDisplay = (pluralStr: string | undefined): string => {
-    if (!pluralStr) return "–";
-    const trimmed = pluralStr.trim();
-    const lower = trimmed.toLowerCase();
-    if (
-      !trimmed ||
-      trimmed === "-" ||
-      trimmed === "–" ||
-      lower === "ohne plural" ||
-      lower === "nur singular" ||
-      lower === "ohne plural/nur singular" ||
-      lower === "ohne plural / nur singular" ||
-      lower === "بدون جمع" ||
-      lower === "no plural"
-    ) {
-      return "–";
+    const normalized = normalizePluralField(pluralStr);
+    if (normalized === "–") return "–";
+    if (/^die\s+/i.test(normalized)) {
+      return normalized.replace(/^die\s+/i, "").trim();
     }
-    if (/^die\s+/i.test(trimmed)) {
-      return trimmed.replace(/^die\s+/i, "").trim();
-    }
-    return trimmed;
+    return normalized;
   };
 
   const getPosLabel = (pos: PartOfSpeech) => {
@@ -1487,6 +1699,13 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                   {selectedVocabIds.size}
                 </span>
                 <span>{locale === "fa" ? "واژه انتخاب شده است" : "word(s) selected"}</span>
+                {offPageSelectedCount > 0 && (
+                  <span className="text-[11px] text-indigo-200 font-normal">
+                    {locale === "fa"
+                      ? `(${selectedVisibleCount} در این صفحه، ${offPageSelectedCount} در صفحات دیگر)`
+                      : `(${selectedVisibleCount} on this page, ${offPageSelectedCount} on other pages)`}
+                  </span>
+                )}
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
@@ -1551,7 +1770,10 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                       <th className="py-3 px-3 text-center font-bold w-10 bg-slate-50 sticky top-0 z-20">
                         <input
                           type="checkbox"
-                          checked={paginatedItems.length > 0 && selectedVocabIds.size === paginatedItems.length}
+                          checked={isAllVisibleSelected}
+                          ref={el => {
+                            if (el) el.indeterminate = isPartialVisibleSelected;
+                          }}
                           onChange={toggleSelectAllVocabs}
                           className="w-4 h-4 text-indigo-600 rounded cursor-pointer accent-indigo-600"
                           title={locale === "fa" ? "انتخاب همه واژگان این صفحه" : "Select all on page"}
@@ -1650,7 +1872,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                             <div className="flex flex-wrap gap-1">
                               {item.tags && item.tags.length > 0 ? (
                                 item.tags.map(tagId => {
-                                  const tagObj = vocabCategories.find(c => c.id === tagId || c.name.toLowerCase() === String(tagId).toLowerCase());
+                                  const tagObj = vocabCategories.find(c => c.id === tagId || (c.name || "").toLowerCase() === String(tagId || "").toLowerCase());
                                   return (
                                     <span
                                       key={tagId}
@@ -1708,18 +1930,44 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
               </div>
             </div>
           ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-              {paginatedItems.map((item) => (
-                <div
-                  key={item.id}
-                  className="bg-white border border-slate-200 rounded-3xl p-5 shadow-xs space-y-3 flex flex-col justify-between hover:border-indigo-300 transition-all"
-                >
-                  <div className="space-y-2">
-                    <div className="flex justify-between items-start">
-                      <div className="flex items-center gap-2">
-                        {getArticleBadge(item.article)}
-                        <span className="text-base font-extrabold text-slate-900 font-sans">{item.word}</span>
-                      </div>
+            <div className="space-y-4">
+              <div className="bg-white border border-slate-200/80 rounded-2xl p-3 flex items-center justify-between gap-3 shadow-2xs font-vazir">
+                <label className="flex items-center gap-2 text-xs font-bold text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={isAllVisibleSelected}
+                    ref={el => {
+                      if (el) el.indeterminate = isPartialVisibleSelected;
+                    }}
+                    onChange={toggleSelectAllVocabs}
+                    className="w-4 h-4 text-indigo-600 rounded cursor-pointer accent-indigo-600"
+                  />
+                  <span>{locale === "fa" ? "انتخاب همه واژگان این صفحه" : "Select all on this page"}</span>
+                </label>
+                <span className="text-xs text-slate-400 font-mono">
+                  {selectedVisibleCount} / {visibleItemIds.length}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                {paginatedItems.map((item) => (
+                  <div
+                    key={item.id}
+                    className={`bg-white border ${selectedVocabIds.has(item.id) ? "border-indigo-400 ring-2 ring-indigo-100" : "border-slate-200"} rounded-3xl p-5 shadow-xs space-y-3 flex flex-col justify-between hover:border-indigo-300 transition-all`}
+                  >
+                    <div className="space-y-2">
+                      <div className="flex justify-between items-start">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={selectedVocabIds.has(item.id)}
+                            onChange={() => toggleSelectVocab(item.id)}
+                            className="w-4 h-4 text-indigo-600 rounded cursor-pointer accent-indigo-600"
+                            title={locale === "fa" ? "انتخاب واژه" : "Select word"}
+                          />
+                          {getArticleBadge(item.article)}
+                          <span className="text-base font-extrabold text-slate-900 font-sans">{item.word}</span>
+                        </div>
                       <div className="flex items-center gap-1">
                         <button onClick={() => handleOpenEditModal(item)} className="p-1 text-slate-400 hover:text-indigo-600 rounded-lg">
                           <Edit2 className="w-3.5 h-3.5" />
@@ -1755,6 +2003,7 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
                   </div>
                 </div>
               ))}
+            </div>
             </div>
           )}
 
@@ -2010,6 +2259,19 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
               <div className="flex items-center gap-1.5 text-xs font-bold text-purple-900 font-vazir">
                 <Sparkles className="w-4 h-4 text-purple-600 shrink-0" />
                 <span>تکمیل و غنی‌سازی تمامی فیلدهای واژگان با هوش مصنوعی (آرتیکل، جمع، معنی، جمله نمونه و توضیحات)</span>
+              </div>
+            </label>
+
+            {/* Auto Transfer Verbs Toggle (BUG-IMP-06) */}
+            <label className="flex items-center gap-2 p-3 bg-emerald-50/80 border border-emerald-200 rounded-2xl cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoTransferVerbs}
+                onChange={(e) => handleToggleAutoTransferVerbs(e.target.checked)}
+                className="w-4 h-4 text-emerald-600 rounded focus:ring-emerald-500 accent-emerald-600 cursor-pointer"
+              />
+              <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-900 font-vazir">
+                <span>{translations[locale]?.enableVerbTransferToggle || "انتقال خودکار فعل‌ها به بخش افعال"}</span>
               </div>
             </label>
 

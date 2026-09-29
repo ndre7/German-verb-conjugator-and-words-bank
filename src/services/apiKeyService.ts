@@ -167,8 +167,22 @@ export const apiKeyService = {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(keys));
       window.dispatchEvent(new CustomEvent("custom-api-keys-updated", { detail: keys }));
-    } catch (e) {
+    } catch (e: any) {
       console.error("Failed to save custom api keys to storage:", e);
+      const isQuota =
+        e?.name === "QuotaExceededError" ||
+        e?.code === 22 ||
+        /quota|storage\s*full/i.test(String(e?.message || ""));
+      const errorMsg = isQuota
+        ? "حافظه مرورگر پر شده است (Storage Quota Exceeded). امکان ذخیره کلید جدید وجود ندارد."
+        : `خطا در ذخیره‌سازی کلیدها در حافظه مرورگر: ${e?.message || "دسترسی مسدود است"}`;
+
+      window.dispatchEvent(
+        new CustomEvent("custom-api-keys-storage-error", {
+          detail: { message: errorMsg, rawError: e?.message },
+        })
+      );
+      throw new Error(errorMsg);
     }
   },
 
@@ -251,12 +265,16 @@ export const apiKeyService = {
 
   recordUsage(keyId: string, tokens: number): void {
     if (!keyId || tokens <= 0) return;
-    const keys = this.getKeys();
-    const idx = keys.findIndex((k) => k.id === keyId);
-    if (idx !== -1) {
-      keys[idx].tokenUsage = (keys[idx].tokenUsage || 0) + tokens;
-      keys[idx].lastUsed = Date.now();
-      this.saveKeys(keys);
+    try {
+      const keys = this.getKeys();
+      const idx = keys.findIndex((k) => k.id === keyId);
+      if (idx !== -1) {
+        keys[idx].tokenUsage = (keys[idx].tokenUsage || 0) + tokens;
+        keys[idx].lastUsed = Date.now();
+        this.saveKeys(keys);
+      }
+    } catch (e) {
+      console.warn("Failed to record token usage in storage:", e);
     }
   },
 

@@ -32,7 +32,8 @@ import {
   Bookmark,
   KeyRound,
   Sliders,
-  AlertCircle
+  AlertCircle,
+  Dumbbell
 } from "lucide-react";
 import { dbService, db } from "./DatabaseService";
 import { unzipSync } from "fflate";
@@ -42,13 +43,14 @@ import VerbDbSettings from "./components/VerbDbSettings";
 import ApiKeySettings from "./components/ApiKeySettings";
 import LanguageSettings from "./components/LanguageSettings";
 import { StoryPractice } from "./components/StoryPractice";
+import { ConjugationPractice } from "./components/ConjugationPractice";
 import { translations, Locale } from "./translations";
 import { type AppChangeLog, type VocabChangeLog } from "./types";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"conjugator" | "vocabulary" | "practice" | "settings" | "history">("conjugator");
   const [vocabSubTab, setVocabSubTab] = useState<"bank" | "synonym_antonym" | "categories">("bank");
-  const [practiceSubTab, setPracticeSubTab] = useState<"story" | "saved_stories">("story");
+  const [practiceSubTab, setPracticeSubTab] = useState<"conjugation" | "story" | "saved_stories">("conjugation");
   const [settingsSubTab, setSettingsSubTab] = useState<"verb_db" | "api_key" | "language">("verb_db");
   const [historySection, setHistorySection] = useState<"verbs" | "vocab">("verbs");
 
@@ -768,6 +770,22 @@ export default function App() {
                       <button
                         onClick={() => {
                           setActiveTab("practice");
+                          setPracticeSubTab("conjugation");
+                          setIsDrawerOpen(false);
+                        }}
+                        className={`w-full p-2.5 rounded-xl ${isRtl ? "text-right" : "text-left"} font-bold transition-all flex items-center gap-2.5 cursor-pointer ${
+                          activeTab === "practice" && practiceSubTab === "conjugation"
+                            ? "bg-amber-600 text-white shadow-xs"
+                            : "text-slate-700 hover:bg-amber-50"
+                        }`}
+                      >
+                        <Dumbbell className="w-4 h-4" />
+                        <span>{t.practiceConjugationTab || (locale === "fa" ? "تمرین صرف افعال" : locale === "de" ? "Konjugationsübung" : "Verb Conjugation Practice")}</span>
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          setActiveTab("practice");
                           setPracticeSubTab("story");
                           setIsDrawerOpen(false);
                         }}
@@ -969,14 +987,14 @@ export default function App() {
             </button>
 
             <button
-              onClick={() => { setActiveTab("practice"); setPracticeSubTab("story"); }}
+              onClick={() => { setActiveTab("practice"); setPracticeSubTab("conjugation"); }}
               className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl transition-all cursor-pointer ${
                 activeTab === "practice"
                   ? "bg-amber-600 text-white shadow-xs"
                   : "text-slate-600 hover:text-slate-900"
               }`}
             >
-              <BookOpen className="w-3.5 h-3.5" />
+              <Dumbbell className="w-3.5 h-3.5" />
               <span>{locale === "fa" ? "بخش تمرینات" : "Practice"}</span>
             </button>
 
@@ -1017,12 +1035,58 @@ export default function App() {
         )}
 
         {activeTab === "practice" && (
-          <div key={practiceSubTab} className="space-y-6">
-            <StoryPractice
-              locale={locale}
-              isRtl={isRtl}
-              initialSubTab={practiceSubTab === "saved_stories" ? "saved" : "generate"}
-            />
+          <div className="space-y-6">
+            {/* Practice Sub-tab Switcher */}
+            <div className="flex flex-wrap items-center gap-2 bg-slate-100 p-1.5 rounded-2xl w-fit font-vazir text-xs font-bold no-print">
+              <button
+                type="button"
+                onClick={() => setPracticeSubTab("conjugation")}
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-xl transition-all cursor-pointer ${
+                  practiceSubTab === "conjugation"
+                    ? "bg-amber-600 text-white shadow-xs"
+                    : "text-slate-600 hover:text-slate-900 hover:bg-slate-200/60"
+                }`}
+              >
+                <Dumbbell className="w-4 h-4" />
+                <span>{t.practiceConjugationTab || (locale === "fa" ? "تمرین صرف افعال" : locale === "de" ? "Konjugationsübung" : "Conjugation Practice")}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setPracticeSubTab("story")}
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-xl transition-all cursor-pointer ${
+                  practiceSubTab === "story"
+                    ? "bg-amber-600 text-white shadow-xs"
+                    : "text-slate-600 hover:text-slate-900 hover:bg-slate-200/60"
+                }`}
+              >
+                <Sparkles className="w-4 h-4" />
+                <span>{locale === "fa" ? "داستان‌خوانی هوشمند" : locale === "de" ? "KI-Geschichten" : "Story Generator"}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setPracticeSubTab("saved_stories")}
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-xl transition-all cursor-pointer ${
+                  practiceSubTab === "saved_stories"
+                    ? "bg-amber-600 text-white shadow-xs"
+                    : "text-slate-600 hover:text-slate-900 hover:bg-slate-200/60"
+                }`}
+              >
+                <Bookmark className="w-4 h-4" />
+                <span>{locale === "fa" ? "داستان‌های ذخیره شده" : locale === "de" ? "Gespeicherte Geschichten" : "Saved Stories"}</span>
+              </button>
+            </div>
+
+            <div key={practiceSubTab}>
+              {practiceSubTab === "conjugation" ? (
+                <ConjugationPractice locale={locale} isRtl={isRtl} />
+              ) : (
+                <StoryPractice
+                  locale={locale}
+                  isRtl={isRtl}
+                  initialSubTab={practiceSubTab === "saved_stories" ? "saved" : "generate"}
+                />
+              )}
+            </div>
           </div>
         )}
 

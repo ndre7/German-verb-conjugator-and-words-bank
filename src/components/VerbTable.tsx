@@ -28,7 +28,7 @@ import { dbService, db } from "../DatabaseService";
 import { geminiFetch } from "../services/apiKeyService";
 import { aiFillJob } from "../services/aiFillJob";
 import { Tense, TENSE_ORDER, type VerbItem, type Category } from "../types";
-import { sortBySearchRank } from "../utils/searchRanking";
+import { sortBySearchRank, rankByExactFirst } from "../utils/searchRanking";
 import CategoryManager from "./CategoryManager";
 
 interface VerbTableProps {
@@ -368,15 +368,24 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
               await dbService.renameVerbInfinitive(orig.infinitive, correctedInfinitive);
             }
 
+            const SYSTEM_CATEGORIES = new Set([
+              "regular", "irregular", "separable", "reflexive", "akkusativ", "dativ", "favorites"
+            ]);
+            const userCats = (orig.categories || []).filter((c) => !SYSTEM_CATEGORIES.has(c));
+            const aiCats = (Array.isArray(enriched.categories) ? enriched.categories : []).filter((c: any) => typeof c === "string");
+            const newSystemCats = aiCats.filter((c: string) => SYSTEM_CATEGORIES.has(c));
+            let finalBulkCats = Array.from(new Set([...newSystemCats, ...userCats]));
+            if (newSystemCats.length === 0) {
+              const prevSystem = (orig.categories || []).filter((c) => SYSTEM_CATEGORIES.has(c));
+              finalBulkCats = Array.from(new Set([...prevSystem, ...userCats]));
+            }
+
             // B2: updateVerb preserves position in verbs_custom_order!
             await dbService.updateVerb({
               infinitive: correctedInfinitive,
               bedeutung: enriched.bedeutung || orig.bedeutung,
               hilfsverb: enriched.hilfsverb === "sein" ? "sein" : (orig.hilfsverb || "haben"),
-              categories:
-                Array.isArray(enriched.categories) && enriched.categories.length > 0
-                  ? enriched.categories
-                  : orig.categories,
+              categories: finalBulkCats,
               cellOverrides,
             });
           }
@@ -477,9 +486,17 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
           }
         }
 
-        let newCats = verbItem.categories;
-        if (Array.isArray(d.categories) && d.categories.length > 0) {
-          newCats = d.categories;
+        // B3: Merge categories instead of wiping user custom categories
+        const SYSTEM_CATEGORIES = new Set([
+          "regular", "irregular", "separable", "reflexive", "akkusativ", "dativ", "favorites"
+        ]);
+        const userCats = (verbItem.categories || []).filter((c: string) => !SYSTEM_CATEGORIES.has(c));
+        const aiCats = (Array.isArray(d.categories) ? d.categories : []).filter((c: any) => typeof c === "string");
+        const newSystemCats = aiCats.filter((c: string) => SYSTEM_CATEGORIES.has(c));
+        let newCats = Array.from(new Set([...newSystemCats, ...userCats]));
+        if (newSystemCats.length === 0) {
+          const prevSystem = (verbItem.categories || []).filter((c: string) => SYSTEM_CATEGORIES.has(c));
+          newCats = Array.from(new Set([...prevSystem, ...userCats]));
         }
 
         const correctedInfinitive = (d.infinitive && typeof d.infinitive === "string" && d.infinitive.trim()) ? d.infinitive.trim() : verbItem.infinitive;
@@ -828,16 +845,23 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                 }
               }
 
-              const existsInDb = verbs.some(v => v.infinitive.toLowerCase().trim() === inf.toLowerCase().trim());
+              const existingVerb = verbs.find(v => v.infinitive.toLowerCase().trim() === inf.toLowerCase().trim());
+              const SYSTEM_CATEGORIES = new Set([
+                "regular", "irregular", "separable", "reflexive", "akkusativ", "dativ", "favorites"
+              ]);
+              const userCats = existingVerb ? (existingVerb.categories || []).filter(c => !SYSTEM_CATEGORIES.has(c)) : [];
+              const rawCats = Array.isArray(raw.categories) ? raw.categories : ["regular"];
+              const mergedCats = Array.from(new Set([...rawCats, ...verbJsonImportTags, ...userCats]));
+
               const verbPayload = {
                 infinitive: inf,
                 bedeutung: raw.bedeutung || raw.meaning || "",
                 hilfsverb: raw.hilfsverb === "sein" ? "sein" : "haben",
-                categories: Array.from(new Set([...(Array.isArray(raw.categories) ? raw.categories : ["regular"]), ...verbJsonImportTags])),
+                categories: mergedCats,
                 cellOverrides
               };
 
-              if (existsInDb) {
+              if (existingVerb) {
                 await dbService.updateVerb(verbPayload);
               } else {
                 await dbService.addVerb(verbPayload);
@@ -1676,7 +1700,10 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
       }
     }
 
-    return suggestions;
+    return sortBySearchRank(suggestions, query, (s) => ({
+      primary: s.displayText,
+      secondary: s.verb.bedeutung,
+    })).slice(0, 10);
   }, [localSearchQuery, indexedVerbs]);
 
   const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -2595,10 +2622,20 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         /* TRADITIONAL WIDE TABLE VIEW WITH EXCELLENT ALT COLORING */
         <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-visible">
           <div className="overflow-x-auto overflow-y-visible rounded-2xl scrollbar-thin">
-            <table ref={tableRef} id="verb-conjugation-main-table" dir="ltr" className={`w-full border-collapse text-sm text-slate-600 ${isRtl ? "text-right" : "text-left"}`}>
+            <table
+              ref={tableRef}
+              id="verb-conjugation-main-table"
+              dir="ltr"
+              style={{
+                borderCollapse: "separate",
+                borderSpacing: 0,
+                scrollMarginTop: "calc(var(--header-h, 64px) + 8px)",
+              }}
+              className={`w-full text-sm text-slate-600 ${isRtl ? "text-right" : "text-left"}`}
+            >
               <thead>
                 <tr className="bg-slate-900 text-white border-b border-slate-800 text-xs tracking-wider uppercase font-sans">
-                  <th className="py-4 px-3 font-semibold text-center w-10 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 no-print">
+                  <th className="py-4 px-3 font-semibold text-center w-10 font-vazir sticky top-[var(--header-h,64px)] z-10 bg-slate-900 shadow-2xs border-b border-slate-800 no-print">
                     <input
                       type="checkbox"
                       checked={paginatedVerbs.length > 0 && selectedVerbIds.size === paginatedVerbs.length}

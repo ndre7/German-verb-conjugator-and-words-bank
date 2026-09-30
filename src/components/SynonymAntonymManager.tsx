@@ -19,6 +19,7 @@ import {
 import { dbService } from "../DatabaseService";
 import { geminiFetch } from "../services/apiKeyService";
 import { SynonymAntonymGroup, SynonymAntonymItem, ArticleType, SynonymAntonymType, PartOfSpeech, VocabularyItem, getVocabLexicalKey } from "../types";
+import { sortBySearchRank } from "../utils/searchRanking";
 import { Locale } from "../translations";
 
 interface SynonymAntonymManagerProps {
@@ -442,19 +443,35 @@ export default function SynonymAntonymManager({ locale }: SynonymAntonymManagerP
   };
 
   // Filtering
-  const filteredGroups = groups.filter(g => {
-    if (typeFilter !== "all" && g.type !== typeFilter) return false;
-    if (searchQuery && searchQuery.trim()) {
-      const q = searchQuery.toLowerCase().trim();
-      const matchTitle = (g.title || "").toLowerCase().includes(q);
-      const matchNotes = (g.notes || "").toLowerCase().includes(q);
-      const matchItem = Array.isArray(g.items) && g.items.some(
-        i => (i.word || "").toLowerCase().includes(q) || ((i.meaning || "").toLowerCase().includes(q)) || ((i.comparative || "").toLowerCase().includes(q)) || ((i.superlative || "").toLowerCase().includes(q))
-      );
-      return matchTitle || matchNotes || matchItem;
+  const filteredGroups = (() => {
+    const filtered = groups.filter(g => {
+      if (typeFilter !== "all" && g.type !== typeFilter) return false;
+      if (searchQuery && searchQuery.trim()) {
+        const q = searchQuery.toLowerCase().trim();
+        const matchTitle = (g.title || "").toLowerCase().includes(q);
+        const matchNotes = (g.notes || "").toLowerCase().includes(q);
+        const matchItem = Array.isArray(g.items) && g.items.some(
+          i => (i.word || "").toLowerCase().includes(q) || ((i.meaning || "").toLowerCase().includes(q)) || ((i.comparative || "").toLowerCase().includes(q)) || ((i.superlative || "").toLowerCase().includes(q))
+        );
+        return matchTitle || matchNotes || matchItem;
+      }
+      return true;
+    });
+
+    if (!searchQuery || !searchQuery.trim()) {
+      return filtered;
     }
-    return true;
-  });
+
+    return sortBySearchRank(filtered, searchQuery, (g) => {
+      const itemWords = (g.items || []).map((i) => i.word || "");
+      const itemMeanings = (g.items || []).map((i) => i.meaning || "").join(" ");
+      return {
+        primary: g.title || "",
+        secondary: itemMeanings,
+        extras: [...itemWords, g.notes || ""],
+      };
+    });
+  })();
 
   const synonymCount = groups.filter(g => g.type === "synonym").length;
   const antonymCount = groups.filter(g => g.type === "antonym").length;

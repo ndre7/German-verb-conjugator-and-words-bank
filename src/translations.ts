@@ -204,6 +204,9 @@ export const translations = {
     jobPartialComplete: "{succeeded} of {total} completed, {failed} failed",
     jobRetryFailedBtn: "Retry Failed Items",
     jobStoppedGlobal: "Job stopped:",
+    checkAllAnswers: "Check All Answers",
+    showCorrectAnswer: "Show correct answer",
+    sessionSummaryToast: "{correct} correct, {wrong} wrong out of {total}",
   },
   fa: {
     title: "مدیریت زبان آلمانی",
@@ -408,6 +411,9 @@ export const translations = {
     jobPartialComplete: "{succeeded} از {total} کامل شد، {failed} ناموفق",
     jobRetryFailedBtn: "تلاش مجدد ناموفق‌ها",
     jobStoppedGlobal: "عملیات متوقف شد:",
+    checkAllAnswers: "بررسی کل تمرین",
+    showCorrectAnswer: "نمایش جواب درست",
+    sessionSummaryToast: "{correct} خانه درست، {wrong} خانه غلط از مجموع {total}",
   },
   de: {
     title: "Deutscher Sprachmanager",
@@ -612,5 +618,8 @@ export const translations = {
     jobPartialComplete: "{succeeded} von {total} abgeschlossen, {failed} fehlgeschlagen",
     jobRetryFailedBtn: "Fehlgeschlagene wiederholen",
     jobStoppedGlobal: "Auftrag gestoppt:",
+    checkAllAnswers: "Alle Antworten prüfen",
+    showCorrectAnswer: "Richtige Antwort zeigen",
+    sessionSummaryToast: "{correct} richtig, {wrong} falsch von insgesamt {total}",
   }
 };

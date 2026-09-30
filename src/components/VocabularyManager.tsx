@@ -1309,13 +1309,17 @@ export default function VocabularyManager({ locale, defaultSubTab = "bank" }: Vo
   const suggestedVocabs = useMemo(() => {
     if (!localSearchQuery || !localSearchQuery.trim()) return [];
     const q = localSearchQuery.toLowerCase().trim();
-    return vocabularies
+    const matched = vocabularies
       .filter((v) =>
         (v.word || "").toLowerCase().includes(q) ||
         (v.meaning || "").toLowerCase().includes(q) ||
         (v.plural && (v.plural || "").toLowerCase().includes(q))
-      )
-      .slice(0, 7);
+      );
+    return sortBySearchRank(matched, q, (v) => ({
+      primary: v.word || "",
+      secondary: v.meaning || "",
+      extras: [v.plural || "", v.example || ""],
+    })).slice(0, 7);
   }, [vocabularies, localSearchQuery]);
 
   const highlightMatch = (text: string, query: string) => {

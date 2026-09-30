@@ -1,59 +1,57 @@
 // searchRanking.ts
-// Pure utility for rank-based search ordering
-// Exact match > Starts with > Contains (infinitive/word) > Meaning match > Conjugation match
+// Pure utility for rank-based search ordering with exact-match-first ranking.
+// Exact match > Starts with > Word boundary > Contains (word) > Meaning/Secondary match > Extras
 
-export interface RankedItem<T> {
-  item: T;
-  score: number;
-}
-
-export function rankItem(
-  primaryText: string,
-  secondaryText: string | undefined,
-  extraTexts: string[] | undefined,
+export function rankByExactFirst<T>(
+  items: T[],
+  getTextField: (item: T) => string,
   query: string
-): number {
+): T[] {
   const q = (query || "").toLowerCase().trim();
-  if (!q) return 0;
+  if (!q) return items;
 
-  const prim = (primaryText || "").toLowerCase().trim();
-  const sec = (secondaryText || "").toLowerCase().trim();
+  const scored: Array<{ item: T; score: number; index: number }> = [];
 
-  // Tier 1: Exact match on primary
-  if (prim === q) return 1000;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const text = (getTextField(item) || "").toLowerCase().trim();
+    let score = 4;
 
-  // Tier 2: Starts-with on primary
-  if (prim.startsWith(q)) return 800 - prim.length; // shorter primary ranks higher
+    if (text === q) {
+      score = 0;
+    } else if (text.startsWith(q)) {
+      score = 1;
+    } else if (new RegExp(`(?:^|[\\s.,;!?()/\\[\\]-])${q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(text)) {
+      score = 2;
+    } else if (text.includes(q)) {
+      score = 3;
+    } else {
+      score = 4;
+    }
 
-  // Tier 3: Contains on primary
-  if (prim.includes(q)) return 600 - prim.indexOf(q);
-
-  // Tier 4: Exact match on secondary (meaning)
-  if (sec === q) return 500;
-
-  // Tier 5: Starts-with on secondary
-  if (sec.startsWith(q)) return 400;
-
-  // Tier 6: Contains on secondary
-  if (sec.includes(q)) return 300;
-
-  // Tier 7: Extra texts (e.g. conjugations, category names, tags, examples)
-  if (extraTexts && extraTexts.length > 0) {
-    for (const extra of extraTexts) {
-      const e = (extra || "").toLowerCase();
-      if (e.includes(q)) {
-        return 100;
-      }
+    if (score <= 3) {
+      scored.push({ item, score, index: i });
     }
   }
 
-  return -1; // No match
+  return scored
+    .sort((a, b) => {
+      if (a.score !== b.score) return a.score - b.score;
+      return a.index - b.index;
+    })
+    .map((s) => s.item);
+}
+
+export interface SearchRankFields {
+  primary: string;
+  secondary?: string;
+  extras?: string[];
 }
 
 export function sortBySearchRank<T>(
   items: T[],
   query: string,
-  getFields: (item: T) => { primary: string; secondary?: string; extras?: string[] }
+  getFields: (item: T) => SearchRankFields
 ): T[] {
   const q = (query || "").toLowerCase().trim();
   if (!q) return items;
@@ -63,15 +61,53 @@ export function sortBySearchRank<T>(
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const { primary, secondary, extras } = getFields(item);
-    const score = rankItem(primary, secondary, extras, q);
+    const prim = (primary || "").toLowerCase().trim();
+    const sec = (secondary || "").toLowerCase().trim();
+
+    let score = -1;
+
+    // Primary (word/infinitive/title) matching
+    if (prim === q) {
+      score = 0; // Exact primary match
+    } else if (prim.startsWith(q)) {
+      score = 10; // Prefix primary match
+    } else if (new RegExp(`(?:^|[\\s.,;!?()/\\[\\]-])${q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(prim)) {
+      score = 20; // Word-boundary primary match
+    } else if (prim.includes(q)) {
+      score = 30; // Substring primary match
+    } else if (sec === q) {
+      score = 40; // Exact secondary (meaning) match
+    } else if (sec.startsWith(q)) {
+      score = 50; // Prefix secondary match
+    } else if (new RegExp(`(?:^|[\\s.,;!?()/\\[\\]-])${q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(sec)) {
+      score = 60; // Word-boundary secondary match
+    } else if (sec.includes(q)) {
+      score = 70; // Substring secondary match
+    } else if (extras && extras.length > 0) {
+      for (const extra of extras) {
+        const e = (extra || "").toLowerCase();
+        if (e === q) {
+          score = 80;
+          break;
+        } else if (e.startsWith(q)) {
+          score = 85;
+          break;
+        } else if (e.includes(q)) {
+          score = 90;
+          break;
+        }
+      }
+    }
+
     if (score >= 0) {
       scored.push({ item, score, originalIndex: i });
     }
   }
 
+  // Stable sort: primary score ascending (lower is better rank), then original order
   scored.sort((a, b) => {
-    if (b.score !== a.score) {
-      return b.score - a.score;
+    if (a.score !== b.score) {
+      return a.score - b.score;
     }
     return a.originalIndex - b.originalIndex;
   });

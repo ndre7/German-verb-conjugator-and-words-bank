@@ -120,6 +120,16 @@ export function ConjugationPractice({ locale, isRtl }: ConjugationPracticeProps)
   const [verbResultsSummary, setVerbResultsSummary] = useState<
     Record<string, { correct: number; wrong: number; totalChecked: number }>
   >({});
+  // B7: Spoiler revealed cells state: Set of `${infinitive}|${tense}|${person}`
+  const [revealedCells, setRevealedCells] = useState<Set<string>>(new Set());
+
+  const revealCell = (cellKey: string) => {
+    setRevealedCells((prev) => {
+      const next = new Set(prev);
+      next.add(cellKey);
+      return next;
+    });
+  };
 
   // Focused cell ref for Umlaut buttons
   const focusedInputRef = useRef<{ verbKey: string; cellKey: string; inputEl: HTMLInputElement } | null>(null);
@@ -436,6 +446,7 @@ export function ConjugationPractice({ locale, isRtl }: ConjugationPracticeProps)
     setUserAnswers({});
     setCellResults({});
     setVerbResultsSummary({});
+    setRevealedCells(new Set());
     setShowPreFlightModal(false);
 
     // Calculate total valid cells for this session
@@ -631,6 +642,128 @@ export function ConjugationPractice({ locale, isRtl }: ConjugationPracticeProps)
     showToast(toastTpl.replace("{correct}", String(correctCount)).replace("{wrong}", String(wrongCount)));
   };
 
+  // B6: Global check across ALL verbs in the current practice session
+  const handleCheckAllAnswers = async () => {
+    let globalCorrect = 0;
+    let globalWrong = 0;
+    let globalTotalChecked = 0;
+
+    const nextCellResults = { ...cellResults };
+    const nextVerbSummaries = { ...verbResultsSummary };
+
+    for (const inf of practiceVerbList) {
+      const verbKey = (inf || "").toLowerCase().trim();
+      const verb = verbsMap.get(verbKey);
+      if (!verb) continue;
+
+      const currentVerbAnswers = userAnswers[verbKey] || {};
+      const currentResults = { ...(nextCellResults[verbKey] || {}) };
+
+      let verbCorrect = 0;
+      let verbWrong = 0;
+      let verbTotal = 0;
+
+      for (const tense of orderedSelectedTenses) {
+        for (const p of PERSON_KEYS) {
+          const cellId = `${verbKey}|${tense}|${p}`;
+          if (excludedCells.has(cellId)) continue; // locked empty cell
+
+          const cellKey = `${tense}_${p}`;
+          // If already answered correctly, keep correct and do not re-evaluate or record
+          if (currentResults[cellKey]?.isCorrect) {
+            verbCorrect++;
+            verbTotal++;
+            globalCorrect++;
+            globalTotalChecked++;
+            continue;
+          }
+
+          const rawCandidates = verb.conjugations?.[tense]?.[p];
+          const candidates = extractCandidatesFromCell(rawCandidates);
+          if (candidates.length === 0) continue;
+
+          const userInput = (currentVerbAnswers[cellKey] || "").trim();
+          const isCorrect = isAnswerCorrect(userInput, candidates);
+
+          const prevChecked = currentResults[cellKey]?.checked;
+          const prevAnswer = currentResults[cellKey]?.lastCheckedAnswer;
+          const isUnchangedAttempt = prevChecked && prevAnswer === userInput;
+
+          if (isCorrect) {
+            verbCorrect++;
+            globalCorrect++;
+            currentResults[cellKey] = {
+              isCorrect: true,
+              checked: true,
+              locked: true,
+              lastCheckedAnswer: userInput,
+            };
+          } else {
+            verbWrong++;
+            globalWrong++;
+            currentResults[cellKey] = {
+              isCorrect: false,
+              checked: true,
+              locked: false,
+              lastCheckedAnswer: userInput,
+            };
+            if (!isUnchangedAttempt) {
+              await dbService.recordConjugationWrong(
+                verb.infinitive,
+                tense,
+                p,
+                userInput,
+                candidates.join(" / ")
+              );
+            }
+          }
+
+          // First-check session semantics: only first check of cell in session counts
+          if (!firstCheckMapRef.current.has(cellId)) {
+            firstCheckMapRef.current.set(cellId, isCorrect);
+          }
+
+          verbTotal++;
+          globalTotalChecked++;
+        }
+      }
+
+      nextCellResults[verbKey] = currentResults;
+      nextVerbSummaries[verbKey] = { correct: verbCorrect, wrong: verbWrong, totalChecked: verbTotal };
+    }
+
+    setCellResults(nextCellResults);
+    setVerbResultsSummary(nextVerbSummaries);
+
+    // Update PracticeSession record
+    let sessionFirstCorrect = 0;
+    let sessionFirstWrong = 0;
+    for (const corr of firstCheckMapRef.current.values()) {
+      if (corr) sessionFirstCorrect++;
+      else sessionFirstWrong++;
+    }
+
+    if (currentSessionRef.current) {
+      currentSessionRef.current.correctCount = sessionFirstCorrect;
+      currentSessionRef.current.wrongCount = sessionFirstWrong;
+      if (
+        currentSessionRef.current.totalCells > 0 &&
+        firstCheckMapRef.current.size >= currentSessionRef.current.totalCells
+      ) {
+        currentSessionRef.current.completedAt = Date.now();
+      }
+      await dbService.savePracticeSession({ ...currentSessionRef.current });
+    }
+
+    const toastTpl = t.sessionSummaryToast || "{correct} خانه درست، {wrong} خانه غلط از مجموع {total}";
+    showToast(
+      toastTpl
+        .replace("{correct}", String(globalCorrect))
+        .replace("{wrong}", String(globalWrong))
+        .replace("{total}", String(globalTotalChecked))
+    );
+  };
+
   // Retry mistakes for a verb: clear wrong cells, keep correct cells locked
   const handleRetryMistakes = (verb: VerbItem) => {
     const verbKey = (verb?.infinitive || "").toLowerCase().trim();
@@ -638,12 +771,30 @@ export function ConjugationPractice({ locale, isRtl }: ConjugationPracticeProps)
     const currentResults = cellResults[verbKey] || {};
     const updatedAnswers = { ...(userAnswers[verbKey] || {}) };
     const updatedResults = { ...currentResults };
+    const cellsToUnreveal: string[] = [];
 
     for (const [cellKey, res] of Object.entries(currentResults)) {
       if (!res.isCorrect) {
         updatedAnswers[cellKey] = "";
         delete updatedResults[cellKey];
+        // cellKey is e.g. "PRASENS_S1" -> full tuple is `${verbKey}|${tense}|${person}`
+        const parts = cellKey.split("_");
+        if (parts.length >= 2) {
+          const tense = parts.slice(0, -1).join("_");
+          const person = parts[parts.length - 1];
+          cellsToUnreveal.push(`${verbKey}|${tense}|${person}`);
+        }
       }
+    }
+
+    if (cellsToUnreveal.length > 0) {
+      setRevealedCells((prev) => {
+        const next = new Set(prev);
+        for (const k of cellsToUnreveal) {
+          next.delete(k);
+        }
+        return next;
+      });
     }
 
     setUserAnswers((prev) => ({ ...prev, [verbKey]: updatedAnswers }));
@@ -1058,24 +1209,35 @@ export function ConjugationPractice({ locale, isRtl }: ConjugationPracticeProps)
                   </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={async () => {
-                    if (currentSessionRef.current) {
-                      if (!currentSessionRef.current.completedAt) {
-                        currentSessionRef.current.completedAt = Date.now();
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={handleCheckAllAnswers}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer shrink-0"
+                  >
+                    <Check className="w-4 h-4" />
+                    <span>{t.checkAllAnswers || "بررسی کل تمرین"}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (currentSessionRef.current) {
+                        if (!currentSessionRef.current.completedAt) {
+                          currentSessionRef.current.completedAt = Date.now();
+                        }
+                        await dbService.savePracticeSession({ ...currentSessionRef.current });
+                        currentSessionRef.current = null;
                       }
-                      await dbService.savePracticeSession({ ...currentSessionRef.current });
-                      currentSessionRef.current = null;
-                    }
-                    currentSessionIdRef.current = "";
-                    setPracticePhase("setup");
-                  }}
-                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shrink-0"
-                >
-                  <RotateCcw className="w-4 h-4 text-slate-500" />
-                  <span>{t.stopPractice}</span>
-                </button>
+                      currentSessionIdRef.current = "";
+                      setPracticePhase("setup");
+                    }}
+                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shrink-0"
+                  >
+                    <RotateCcw className="w-4 h-4 text-slate-500" />
+                    <span>{t.stopPractice}</span>
+                  </button>
+                </div>
               </div>
 
               {/* Stack of Verb Table Blocks */}
@@ -1207,8 +1369,21 @@ export function ConjugationPractice({ locale, isRtl }: ConjugationPracticeProps)
                                             }`}
                                           />
                                           {res?.checked && !res.isCorrect && candidates.length > 0 && (
-                                            <div className="text-[11px] text-rose-700 font-mono text-center leading-tight">
-                                              {t.correctAnswer || "Correct"}: {candidates.join(" / ")}
+                                            <div className="text-center">
+                                              {!revealedCells.has(cellId) ? (
+                                                <button
+                                                  type="button"
+                                                  onClick={() => revealCell(cellId)}
+                                                  className="mt-1 px-2 py-0.5 text-[11px] rounded-lg bg-slate-100 border border-slate-200 text-slate-600 hover:bg-slate-200 transition-colors cursor-pointer font-vazir"
+                                                >
+                                                  {t.showCorrectAnswer || "نمایش جواب درست"}
+                                                </button>
+                                              ) : (
+                                                <div className="mt-1 text-[11px] text-rose-700 leading-tight">
+                                                  <span className="font-bold">{t.correctAnswer || "Correct"}: </span>
+                                                  <span className="font-mono font-bold">{candidates.join(" / ")}</span>
+                                                </div>
+                                              )}
                                             </div>
                                           )}
                                         </div>

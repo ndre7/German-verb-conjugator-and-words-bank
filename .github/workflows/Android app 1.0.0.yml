@@ -35,6 +35,17 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
+      - name: Accept Android SDK licenses
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          mkdir -p $ANDROID_HOME/licenses
+          echo "8933bad161af4178b1185d1a37fbf41ea5269c55" > $ANDROID_HOME/licenses/android-sdk-license
+          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" > $ANDROID_HOME/licenses/android-sdk-license
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > $ANDROID_HOME/licenses/android-sdk-license
+          echo "84831b9409646a918e30573bab4c9c91346d8abd" > $ANDROID_HOME/licenses/android-preview-license
+          echo "e6acf54c5b34a97b1b04a4ff9e7f887e3b2f4a6a" > $ANDROID_HOME/licenses/android-googletv-license
+          echo "4d25795cbba0cb3376d587bd09008c6e" > $ANDROID_HOME/licenses/android-sdk-arm-dbt-license
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
@@ -128,13 +139,11 @@ jobs:
           mkdir -p android/app/src/main/assets/nodejs-project
           cp -r nodejs-project/. android/app/src/main/assets/nodejs-project/
 
-      - name: Configure Android manifest for cleartext + NodeJS
+      - name: Configure Android manifest
         shell: bash
         run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
-          # Add INTERNET permission and usesCleartextTraffic
           sed -i 's|<application|<application android:usesCleartextTraffic="true"|' $MANIFEST
-          # Ensure INTERNET permission exists
           if ! grep -q "android.permission.INTERNET" $MANIFEST; then
             sed -i 's|</application>|<uses-permission android:name="android.permission.INTERNET" /></application>|' $MANIFEST
           fi
@@ -151,15 +160,13 @@ jobs:
         working-directory: android
         run: ./gradlew assembleRelease
 
-      - name: Sign Release APK (debug keystore for now)
+      - name: Sign Release APK (debug keystore)
         shell: bash
         run: |
-          # Sign release APK with debug keystore (for personal use; replace with real keystore for Play Store)
           KEYSTORE=$HOME/.android/debug.keystore
           if [ ! -f "$KEYSTORE" ]; then
             keytool -genkeypair -v -keystore $KEYSTORE -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
-          # Sign and align APK
           ${ANDROID_HOME}/build-tools/34.0.0/zipalign -v -p 4 \
             android/app/build/outputs/apk/release/app-release-unsigned.apk \
             android/app/build/outputs/apk/release/app-release-aligned.apk
@@ -167,7 +174,6 @@ jobs:
             --ks $KEYSTORE --ks-pass pass:android --key-pass pass:android \
             --out android/app/build/outputs/apk/release/app-release-signed.apk \
             android/app/build/outputs/apk/release/app-release-aligned.apk
-          # Sign AAB
           ${ANDROID_HOME}/build-tools/34.0.0/apksigner sign \
             --ks $KEYSTORE --ks-pass pass:android --key-pass pass:android \
             --out android/app/build/outputs/bundle/release/app-release-signed.aab \

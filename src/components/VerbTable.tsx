@@ -2620,8 +2620,8 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
         </div>
       ) : (
         /* TRADITIONAL WIDE TABLE VIEW WITH EXCELLENT ALT COLORING */
-        <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-visible">
-          <div className="overflow-x-auto overflow-y-visible rounded-2xl scrollbar-thin">
+        <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+          <div className="verb-table-scroll-wrapper rounded-2xl scrollbar-thin">
             <table
               ref={tableRef}
               id="verb-conjugation-main-table"
@@ -2629,13 +2629,12 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
               style={{
                 borderCollapse: "separate",
                 borderSpacing: 0,
-                scrollMarginTop: "calc(var(--header-h, 64px) + 8px)",
               }}
               className={`w-full text-sm text-slate-600 ${isRtl ? "text-right" : "text-left"}`}
             >
               <thead>
                 <tr className="bg-slate-900 text-white border-b border-slate-800 text-xs tracking-wider uppercase font-sans">
-                  <th className="py-4 px-3 font-semibold text-center w-10 font-vazir sticky top-[var(--header-h,64px)] z-10 bg-slate-900 shadow-2xs border-b border-slate-800 no-print">
+                  <th className="py-4 px-3 font-semibold text-center w-10 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 no-print">
                     <input
                       type="checkbox"
                       checked={paginatedVerbs.length > 0 && selectedVerbIds.size === paginatedVerbs.length}
@@ -2644,22 +2643,22 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                       title={locale === "fa" ? "انتخاب همه افعال این صفحه" : "Select all verbs on page"}
                     />
                   </th>
-                  <th className="py-4 px-4 font-semibold text-center w-14 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800">{t.numberCol}</th>
-                  <th className="py-4 px-5 font-semibold text-slate-200 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.verbCol}</th>
-                  <th className="py-4 px-4 font-semibold font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.auxCol}</th>
-                  <th className="py-4 px-4 font-semibold font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.meaningCol}</th>
-                  <th className="py-4 px-4 font-semibold text-indigo-400 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">
+                  <th className="py-4 px-4 font-semibold text-center w-14 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800">{t.numberCol}</th>
+                  <th className="py-4 px-5 font-semibold text-slate-200 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.verbCol}</th>
+                  <th className="py-4 px-4 font-semibold font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.auxCol}</th>
+                  <th className="py-4 px-4 font-semibold font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.meaningCol}</th>
+                  <th className="py-4 px-4 font-semibold text-indigo-400 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">
                     {showImperativ ? (locale === "fa" ? "حالت" : locale === "de" ? "Modus" : "Mode") : t.tenseCol}
                   </th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.ichCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.duCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.erCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.wirCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.ihrCol}</th>
-                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-[var(--header-h,64px)] z-20 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.sieCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.ichCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.duCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.erCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.wirCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.ihrCol}</th>
+                  <th className="py-4 px-3 font-semibold text-slate-300 font-vazir sticky top-0 z-10 bg-slate-900 shadow-2xs border-b border-slate-800 text-center">{t.sieCol}</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100">
+              <tbody>
                 {filteredVerbs.length === 0 ? (
                   <tr>
                     <td colSpan={12} className="py-12 text-center text-slate-400 text-sm italic font-vazir">
@@ -2696,15 +2695,16 @@ export default function VerbTable({ locale, t }: VerbTableProps) {
                       };
 
                       const globalNummer = globalVerbIdx + 1;
+                      const isLastTense = tenseIdx === displayedTenses.length - 1;
 
                       // Thicker bottom border for the last tense of each verb to form a robust visual partition!
-                      const borderClass = tenseIdx === displayedTenses.length - 1 ? "border-b-4 border-slate-300/80" : "border-b border-slate-100";
+                      const verbBlockClass = isLastTense ? "verb-block-end" : "";
 
                       return (
                         <tr
                           key={`${v.infinitive}_${tense}`}
                           id={verbIdx === paginatedVerbs.length - 1 && tenseIdx === 0 ? "last-verb-first-row" : undefined}
-                          className={`group ${borderClass} transition-colors duration-150 ${verbBgClass} hover:bg-indigo-50/30`}
+                          className={`group ${verbBlockClass} transition-colors duration-150 ${verbBgClass} hover:bg-indigo-50/30`}
                         >
                           {/* Checkbox Column */}
                           {tenseIdx === 0 && (

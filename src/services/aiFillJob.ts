@@ -7,6 +7,7 @@ export type JobStatus = "idle" | "running" | "complete" | "partial" | "stopped" 
 export interface FailedJobItem {
   id: string;
   word: string;
+  originalItem?: any;
 }
 
 export interface JobStartOptions<T> {
@@ -108,6 +109,7 @@ class AiFillJob {
     for (let i = 0; i < options.items.length; i += BATCH_SIZE) {
       chunks.push(options.items.slice(i, i + BATCH_SIZE));
     }
+    console.log("[aiFillJob] batches:", chunks.map((b) => b.length));
     this.totalBatches = chunks.length;
     this.estimatedRemainingSeconds = this.totalBatches * 3; // Initial heuristic: ~3s per batch
 
@@ -161,21 +163,59 @@ class AiFillJob {
         this.emit();
       }
 
+      // BUG-3: Automatic Retry Pass for failed items
+      if (this.failedItems.length > 0 && !signal.aborted && this.status !== "stopped") {
+        console.log(`[aiFillJob] Retrying ${this.failedItems.length} failed items...`);
+        const itemsToRetry = [...this.failedItems];
+        this.failed = [];
+        this.failedItems = [];
+
+        // 1 item per retry batch for maximum success rate
+        for (let rIdx = 0; rIdx < itemsToRetry.length; rIdx++) {
+          if (signal.aborted) {
+            this.status = "cancelled";
+            break;
+          }
+
+          const singleItem = itemsToRetry[rIdx];
+          await this.pauseMs(500, signal);
+          if (signal.aborted) {
+            this.status = "cancelled";
+            break;
+          }
+
+          try {
+            const res = await options.processBatch([singleItem], signal);
+            if (!res || !Array.isArray(res) || res.length === 0) {
+              throw new Error("Empty response on retry");
+            }
+            await options.onBatchDone(res, [singleItem]);
+            this.succeededCount += 1;
+          } catch (retryErr: any) {
+            if (retryErr?.isGlobalFailure) {
+              this.status = "stopped";
+              this.errorMessage = retryErr.message;
+              this.markItemFailed(singleItem, options);
+              break;
+            }
+            this.markItemFailed(singleItem, options);
+          }
+          this.emit();
+        }
+      }
+
       if (signal.aborted) {
         this.status = "cancelled";
       } else if (this.status !== "stopped") {
-        if (this.failed.length === 0) {
-          this.status = "complete";
-        } else {
-          this.status = "partial";
-        }
+        // BUG-2: Status derived honestly from failed.length
+        this.status = this.failed.length === 0 ? "complete" : "partial";
       }
     } catch (e: any) {
       if (signal.aborted) {
         this.status = "cancelled";
       } else {
         console.error("[AiFillJob error]", e);
-        this.status = "partial";
+        this.status = this.failed.length === 0 ? "complete" : "partial";
       }
     } finally {
       if (typeof window !== "undefined") {
@@ -247,7 +287,7 @@ class AiFillJob {
   private markItemFailed<T>(item: T, options: JobStartOptions<T>): void {
     const id = options.getItemId(item);
     const word = options.getItemWord(item);
-    this.failed.push({ id, word });
+    this.failed.push({ id, word, originalItem: item });
     this.failedItems.push(item);
     this.emit();
   }

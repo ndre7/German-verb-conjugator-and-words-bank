@@ -164,6 +164,12 @@ export default function App() {
           message: `${currentT.jobStoppedGlobal || "عملیات متوقف شد:"} ${jobState.errorMessage || ""}`,
           canRetry: true,
         });
+      } else if (jobState.status === "cancelled") {
+        setJobFinishNotice({
+          type: "warning",
+          message: currentT.jobCancelled || "عملیات لغو شد",
+          canRetry: jobState.failedCount > 0,
+        });
       }
     }
   }, [jobState.status, jobState.succeededCount, jobState.totalItems, jobState.failedCount, jobState.errorMessage, locale]);

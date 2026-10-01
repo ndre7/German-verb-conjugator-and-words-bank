@@ -207,6 +207,7 @@ export const translations = {
     checkAllAnswers: "Check All Answers",
     showCorrectAnswer: "Show correct answer",
     sessionSummaryToast: "{correct} correct, {wrong} wrong out of {total}",
+    jobCancelled: "Job cancelled",
   },
   fa: {
     title: "مدیریت زبان آلمانی",
@@ -414,6 +415,7 @@ export const translations = {
     checkAllAnswers: "بررسی کل تمرین",
     showCorrectAnswer: "نمایش جواب درست",
     sessionSummaryToast: "{correct} خانه درست، {wrong} خانه غلط از مجموع {total}",
+    jobCancelled: "عملیات لغو شد",
   },
   de: {
     title: "Deutscher Sprachmanager",
@@ -598,7 +600,7 @@ export const translations = {
     practiceHistoryTab: "Übungsverlauf",
     sessionDateLabel: "Datum",
     sessionCorrectLabel: "Richtig",
-    sessionTotalCells: "Gesamt",
+    sessionTotalCells: "Gesamtzellen",
     sessionWrongLabel: "Falsch",
     sessionVerbsLabel: "Verben",
     sessionRePractice: "Wiederholen",
@@ -621,5 +623,6 @@ export const translations = {
     checkAllAnswers: "Alle Antworten prüfen",
     showCorrectAnswer: "Richtige Antwort zeigen",
     sessionSummaryToast: "{correct} richtig, {wrong} falsch von insgesamt {total}",
+    jobCancelled: "Auftrag abgebrochen",
   }
 };

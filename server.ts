@@ -252,12 +252,12 @@ async function withTimeoutPromise<T>(
 const retiredModels = new Set<string>();
 
 interface StructuredGeminiError extends Error {
-  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "unknown";
+  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "empty_response" | "unknown";
   userMessage: string;
 }
 
 function createGeminiError(
-  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "unknown",
+  reason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "empty_response" | "unknown",
   message: string
 ): StructuredGeminiError {
   let userMessage = "خطایی در برقراری ارتباط با سرویس هوش مصنوعی رخ داد. لطفاً دوباره تلاش کنید.";
@@ -269,6 +269,8 @@ function createGeminiError(
     userMessage = "خطا در احراز هویت کلیدهای هوش مصنوعی. لطفاً تنظیمات حساب‌ها را بررسی کنید.";
   } else if (reason === "timeout") {
     userMessage = "پاسخ مدل در زمان مجاز آماده نشد (مدل کند یا در صف است). لطفاً مدل دیگری انتخاب کنید یا دوباره تلاش کنید.";
+  } else if (reason === "empty_response") {
+    userMessage = "مدل پاسخ خالی برگرداند. لطفاً مدل دیگری امتحان کنید یا دوباره تلاش کنید.";
   }
 
   const err = new Error(message) as StructuredGeminiError;
@@ -1063,6 +1065,7 @@ async function callGeminiWithFallback(params: {
   let encounteredModelUnavailable = false;
   let encounteredAuth = false;
   let encounteredTimeout = false;
+  let encounteredEmptyResponse = false;
 
   // PRIORITY 1: Explicit user-configured custom API keys (BUG-24, BUG-25, BUG-IMP-03)
   // When the user specifies custom providers/keys, honor that explicit selection first.
@@ -1119,12 +1122,13 @@ async function callGeminiWithFallback(params: {
         }
       } catch (err: any) {
         lastError = err;
+        const errStr = String(err.message || "").toLowerCase();
         const isAuth = !!err.isAuth;
         const isQuota = !!err.isQuota;
         const isTimeout =
           err.name === "AbortError" ||
           err.name === "TimeoutError" ||
-          /timeout|aborted/i.test(String(err.message || ""));
+          /timeout|aborted/i.test(errStr);
 
         if (isAuth) {
           encounteredAuth = true;
@@ -1146,6 +1150,14 @@ async function callGeminiWithFallback(params: {
           encounteredTimeout = true;
           console.warn(
             `[AI Explicit Provider Timeout] Key "${customKey.name || customKey.id}" (${provider}) timed out after ${remainingTime}ms.`
+          );
+          continue;
+        }
+
+        if (errStr.includes("empty response")) {
+          encounteredEmptyResponse = true;
+          console.warn(
+            `[AI Explicit Provider Empty Response] Key "${customKey.name || customKey.id}" (${provider}) returned empty response. Trying next candidate...`
           );
           continue;
         }
@@ -1392,6 +1404,15 @@ async function callGeminiWithFallback(params: {
           continue; // Try next model for same account
         }
 
+        // 4.5. Empty response from model
+        if (errStr.includes("empty response")) {
+          encounteredEmptyResponse = true;
+          console.warn(
+            `[Gemini Empty Response] Account "${label}", Model "${model}" returned empty response. Trying next fallback...`
+          );
+          continue;
+        }
+
         // 5. Non-recoverable client error (e.g. 400 Bad Request, invalid argument) -> do not burn other accounts
         const isBadRequest =
           errStatus === 400 ||
@@ -1416,9 +1437,11 @@ async function callGeminiWithFallback(params: {
   }
 
   // Determine primary failure reason across all attempts
-  let primaryReason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "unknown" = "unknown";
+  let primaryReason: "quota_exhausted" | "model_unavailable" | "auth_error" | "timeout" | "empty_response" | "unknown" = "unknown";
   if (encounteredTimeout || Date.now() >= overallDeadline) {
     primaryReason = "timeout";
+  } else if (encounteredEmptyResponse) {
+    primaryReason = "empty_response";
   } else if (encounteredQuota) {
     primaryReason = "quota_exhausted";
   } else if (encounteredModelUnavailable) {
